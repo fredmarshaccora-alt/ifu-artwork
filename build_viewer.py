@@ -43,8 +43,10 @@ SOURCES = [
      HERE / "contesa_top_level.step",
      # 61MB STEP - coarser tessellation to keep mesh memory reasonable
      {"mesh_defl": 3.0, "sample_defl": 1.5},
-     # Pre-rotation TBD from bbox inspection
-     None),
+     # Native bbox: X=2153 (length), Y=1448 (height incl. headboard),
+     # Z=1016 (width).  Contesa STEP is Y-up; rotate +90deg about X to
+     # put height on world Z so the iso view comes out upright.
+     ((1, 0, 0), 90)),
 ]
 
 # Three good IFU view dirs.  Defined for the bed convention (X=length, Z=up).
