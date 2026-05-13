@@ -1,0 +1,25 @@
+# Generated outputs
+out/
+build_log.txt
+progression.png
+
+# Source STEP files (large binaries, sourced externally)
+*.step
+*.STEP
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Claude / agent scratch
+.claude/
