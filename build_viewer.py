@@ -528,6 +528,15 @@ HTML_TEMPLATE = r"""<!doctype html>
   <h1>ACCORA IFU viewer</h1>
   <label>File: <select id="file-sel"></select></label>
   <label>View: <select id="view-sel"></select></label>
+  <label title="Override what axis is 'up' in the imported model. 3D-side preview only - paste the resulting tuple into SOURCES and rebuild to bake it in.">Up: <select id="up-axis-sel">
+    <option value="Z" selected>Z (model native)</option>
+    <option value="Y">Y &rarr; Z (rotate 90 about X)</option>
+    <option value="X">X &rarr; Z (rotate -90 about Y)</option>
+    <option value="-Z">-Z &rarr; Z (rotate 180 about X)</option>
+    <option value="-Y">-Y &rarr; Z (rotate -90 about X)</option>
+    <option value="-X">-X &rarr; Z (rotate 90 about Y)</option>
+  </select></label>
+  <button id="btn-copy-orient" title="Copy pre_rotate tuple to clipboard">&#9112; pre_rotate</button>
   <span class="mode-pill" id="mode-pill">smart</span>
   <button id="btn-smart"    class="active">smart</button>
   <button id="btn-detailed">+ smooth</button>
@@ -608,17 +617,53 @@ const selectionInfo = $('selection-info');
 const tooltip = $('tooltip');
 const calloutCount = $('callout-count');
 
-// state per (file,view): pan/zoom/highlight/annotations
+// state per (file,view): pan/zoom/highlights(Set)/annotations
 const state = {{}};
 
 function paneKey(f, v) {{ return f + '/' + v; }}
 function getState(f, v) {{
   const k = paneKey(f, v);
   if (!state[k]) state[k] = {{
-    tx: 0, ty: 0, scale: 1, highlight: null, annotations: []
+    tx: 0, ty: 0, scale: 1, highlights: new Set(), annotations: []
   }};
   return state[k];
 }}
+
+// Up-axis override table: maps a "what axis is up in the model" choice
+// to the rotation that brings that axis onto world Z (our pipeline's
+// canonical up). The 3D viewer applies this live; the Python side
+// reads the same tuple from SOURCES (pre_rotate) and bakes it into HLR.
+const UP_AXIS_ROT = {{
+  'Z':  {{ axis: [0,0,1], angle:    0 }},   // identity
+  'Y':  {{ axis: [1,0,0], angle:   90 }},   // Y -> Z
+  'X':  {{ axis: [0,1,0], angle:  -90 }},   // X -> Z
+  '-Z': {{ axis: [1,0,0], angle:  180 }},   // -Z -> Z
+  '-Y': {{ axis: [1,0,0], angle:  -90 }},   // -Y -> Z
+  '-X': {{ axis: [0,1,0], angle:   90 }},   // -X -> Z
+}};
+
+const upAxisSel = $('up-axis-sel');
+function _upAxisKey(fid) {{ return 'upAxis_' + fid; }}
+function loadUpAxisFor(fid) {{
+  const v = localStorage.getItem(_upAxisKey(fid)) || 'Z';
+  upAxisSel.value = v;
+  return v;
+}}
+upAxisSel.addEventListener('change', () => {{
+  localStorage.setItem(_upAxisKey(fileSel.value), upAxisSel.value);
+  window.IFU_VIEWER?.applyUpAxisOverride?.(UP_AXIS_ROT[upAxisSel.value]);
+}});
+$('btn-copy-orient').addEventListener('click', () => {{
+  const r = UP_AXIS_ROT[upAxisSel.value];
+  const line = (r.angle === 0)
+    ? 'None,  # no pre_rotation needed'
+    : `((${{r.axis.join(', ')}}), ${{r.angle}}),`;
+  navigator.clipboard?.writeText(line);
+  const btn = $('btn-copy-orient');
+  const orig = btn.textContent;
+  btn.textContent = 'copied!';
+  setTimeout(() => {{ btn.textContent = orig; }}, 1500);
+}});
 
 // Populate selectors
 CATALOGUE.forEach(fe => {{
@@ -637,6 +682,8 @@ function refreshViews() {{
 }}
 fileSel.addEventListener('change', () => {{
   refreshViews(); refreshPane();
+  const upStored = loadUpAxisFor(fileSel.value);
+  window.IFU_VIEWER?.applyUpAxisOverride?.(UP_AXIS_ROT[upStored]);
 }});
 viewSel.addEventListener('change', refreshPane);
 refreshViews();
@@ -654,46 +701,84 @@ function refreshPartList() {{
     const li = document.createElement('li');
     li.textContent = `[${{String(p.idx).padStart(3, '0')}}] ${{p.label}}`;
     li.dataset.part = p.idx;
-    li.addEventListener('click', () => togglePartHighlight(p.idx));
+    li.addEventListener('click', (ev) =>
+      togglePartHighlight(p.idx, {{append: ev.ctrlKey || ev.metaKey}}));
     partList.appendChild(li);
   }});
 }}
 
-function togglePartHighlight(idx) {{
-  const svg = activeSvg();
+// Multi-select highlight: state.highlights is a Set of part idx.
+//   - plain click   = replace selection with just this part
+//                     (or clear if it was already the only one selected)
+//   - Ctrl/Cmd-click = toggle this part in/out of the current selection
+//   - Esc            = clear all
+function togglePartHighlight(idx, opts) {{
+  opts = opts || {{}};
+  const append = !!opts.append;
   const st = getState(fileSel.value, viewSel.value);
-  if (st.highlight === idx) {{
-    st.highlight = null;
-    if (svg) {{
-      svg.querySelectorAll('.part').forEach(p => {{
-        p.classList.remove('highlight'); p.classList.remove('dim');
-      }});
-    }}
-    partList.querySelectorAll('li').forEach(li => li.classList.remove('highlighted'));
-    treeRoot?.querySelectorAll('.tree-row.highlighted')
-      .forEach(r => r.classList.remove('highlighted'));
-    selectionInfo.textContent = 'Nothing selected';
-    window.IFU_VIEWER?.clearHighlight3D?.();
+  if (!st.highlights) st.highlights = new Set();
+  if (append) {{
+    if (st.highlights.has(idx)) st.highlights.delete(idx);
+    else st.highlights.add(idx);
   }} else {{
-    st.highlight = idx;
-    if (svg) {{
-      svg.querySelectorAll('.part').forEach(p => {{
-        if (p.classList.contains('part-' + String(idx).padStart(3, '0'))) {{
-          p.classList.add('highlight'); p.classList.remove('dim');
-        }} else {{
-          p.classList.remove('highlight'); p.classList.add('dim');
-        }}
-      }});
+    if (st.highlights.size === 1 && st.highlights.has(idx)) {{
+      st.highlights.clear();
+    }} else {{
+      st.highlights.clear();
+      st.highlights.add(idx);
     }}
-    partList.querySelectorAll('li').forEach(li => {{
-      li.classList.toggle('highlighted', parseInt(li.dataset.part) === idx);
+  }}
+  applyHighlights();
+}}
+
+function clearHighlights() {{
+  const st = getState(fileSel.value, viewSel.value);
+  if (st.highlights) st.highlights.clear();
+  applyHighlights();
+}}
+
+function applyHighlights() {{
+  const st = getState(fileSel.value, viewSel.value);
+  const set = st.highlights || new Set();
+  const any = set.size > 0;
+  const svg = activeSvg();
+  if (svg) {{
+    svg.querySelectorAll('.part').forEach(p => {{
+      const idx = parseInt(p.dataset.part);
+      const hit = set.has(idx);
+      p.classList.toggle('highlight', hit);
+      p.classList.toggle('dim', any && !hit);
     }});
+  }}
+  partList.querySelectorAll('li').forEach(li => {{
+    li.classList.toggle('highlighted', set.has(parseInt(li.dataset.part)));
+  }});
+  if (treeRoot) {{
+    treeRoot.querySelectorAll('.tree-row').forEach(r => {{
+      const idx = _tree_to_part_idx[r.dataset.treeId];
+      r.classList.toggle('highlighted', idx != null && set.has(idx));
+    }});
+  }}
+  if (set.size === 0) {{
+    selectionInfo.textContent = 'Nothing selected';
+  }} else if (set.size === 1) {{
+    const idx = [...set][0];
     const fe = CATALOGUE.find(x => x.file_id === fileSel.value);
     const p = fe.parts.find(x => x.idx === idx);
     selectionInfo.innerHTML = `<b>Part ${{idx}}</b><br>${{p ? p.label : ''}}`;
-    window.IFU_VIEWER?.highlight3DPart?.(idx);
+  }} else {{
+    const list = [...set].sort((a,b)=>a-b);
+    const preview = list.slice(0, 8).join(', ') + (list.length > 8 ? ', ...' : '');
+    selectionInfo.innerHTML = `<b>${{set.size}} parts</b> selected<br>` +
+      `<span style="font-family: ui-monospace, Consolas, monospace; font-size: 11px;">${{preview}}</span>`;
   }}
+  window.IFU_VIEWER?.applyHighlights3D?.(set);
 }}
+
+// Esc clears selection
+window.addEventListener('keydown', (e) => {{
+  if (e.key === 'Escape') clearHighlights();
+}});
 
 function applyTransform(pane) {{
   const svg = pane.querySelector('svg');
@@ -725,7 +810,8 @@ function attachInteractivity(pane) {{
   // make sure the transform wrapper exists
   applyTransform(pane);
 
-  // Click on a path -> walk up to .part -> highlight
+  // Click on a path -> walk up to .part -> highlight.
+  // Ctrl/Cmd-click toggles into a multi-selection.
   svg.addEventListener('click', e => {{
     if (svg.classList.contains('annotate-mode')) {{
       handleAnnotateClick(e, svg, pane); return;
@@ -733,7 +819,8 @@ function attachInteractivity(pane) {{
     let p = e.target;
     while (p && p !== svg && !p.classList?.contains('part')) p = p.parentElement;
     if (p && p.classList?.contains('part')) {{
-      togglePartHighlight(parseInt(p.dataset.part));
+      togglePartHighlight(parseInt(p.dataset.part),
+                          {{append: e.ctrlKey || e.metaKey}});
     }}
   }});
 
@@ -806,12 +893,8 @@ function refreshPane() {{
   attachInteractivity(pane);
   refreshPartList();
   applyMode();
-  // re-apply highlight if any
-  const st = getState(fileSel.value, viewSel.value);
-  if (st.highlight !== null && st.highlight !== undefined) {{
-    const idx = st.highlight; st.highlight = null;  // toggle will set it back
-    togglePartHighlight(idx);
-  }}
+  // re-apply highlights (Set) onto the new pane's DOM
+  applyHighlights();
   refreshAnnotations(pane);
   updateCalloutCount();
 }}
@@ -1075,13 +1158,10 @@ function refreshTree() {{
         twisty.textContent = collapsed ? '▾' : '▸';
       }});
     }}
-    row.addEventListener('click', () => {{
+    row.addEventListener('click', (ev) => {{
       const idx = _tree_to_part_idx[id];
       if (idx == null) return;
-      togglePartHighlight(idx);
-      treeRoot.querySelectorAll('.tree-row.highlighted')
-        .forEach(r => r.classList.remove('highlighted'));
-      row.classList.add('highlighted');
+      togglePartHighlight(idx, {{append: ev.ctrlKey || ev.metaKey}});
     }});
     return li;
   }}
@@ -1091,12 +1171,14 @@ function refreshTree() {{
 // Expose for the module script (cross-script comms)
 window.IFU_VIEWER = {{
   togglePartHighlight,
+  clearHighlights,
   getActiveFileId: () => fileSel.value,
   getActiveViewDir: () => {{
     const fe = CATALOGUE.find(x => x.file_id === fileSel.value);
     const ve = fe?.views.find(v => v.view_id === viewSel.value);
     return ve?.view_dir;
   }},
+  getActiveUpAxis: () => UP_AXIS_ROT[upAxisSel.value],
   onFileChange: (cb) => fileSel.addEventListener('change', cb),
   onViewChange: (cb) => viewSel.addEventListener('change', cb),
 }};
@@ -1108,6 +1190,7 @@ fileSel.addEventListener('change', refreshTree);
 setMode('smart');
 refreshPane();
 refreshTree();
+loadUpAxisFor(fileSel.value);  // restore per-source up-axis on load
 </script>
 
 <script type="module">
@@ -1167,10 +1250,50 @@ function init() {{
   controls.update();
 
   window.addEventListener('resize', resize);
-  canvas.addEventListener('mousedown', () => canvas.classList.add('dragging'));
-  window.addEventListener('mouseup', () => canvas.classList.remove('dragging'));
+
+  // Distinguish clicks from drag-orbits: only fire raycast on small motion
+  let downPos = null;
+  canvas.addEventListener('pointerdown', (e) => {{
+    canvas.classList.add('dragging');
+    downPos = [e.clientX, e.clientY];
+  }});
+  window.addEventListener('pointerup', (e) => {{
+    canvas.classList.remove('dragging');
+    if (!downPos) return;
+    const dx = e.clientX - downPos[0];
+    const dy = e.clientY - downPos[1];
+    downPos = null;
+    if (Math.hypot(dx, dy) > 4) return;       // it was a drag, not a click
+    if (e.target !== canvas) return;          // click landed off-canvas
+    handleCanvasClick(e);
+  }});
 
   animate();
+}}
+
+function handleCanvasClick(e) {{
+  if (!active || !camera) return;
+  const rect = canvas.getBoundingClientRect();
+  const ndc = new THREE.Vector2(
+    ((e.clientX - rect.left) / rect.width) * 2 - 1,
+    -((e.clientY - rect.top) / rect.height) * 2 + 1,
+  );
+  const raycaster = new THREE.Raycaster();
+  raycaster.setFromCamera(ndc, camera);
+  // only intersect actual meshes, not the LineSegments we attach for edges
+  const meshes = [];
+  active.traverse(o => {{ if (o.isMesh) meshes.push(o); }});
+  const hits = raycaster.intersectObjects(meshes, false);
+  if (hits.length === 0) {{
+    if (!e.ctrlKey && !e.metaKey) window.IFU_VIEWER?.clearHighlights?.();
+    return;
+  }}
+  const idx = _partIdxOf(hits[0].object);
+  if (idx != null) {{
+    window.IFU_VIEWER.togglePartHighlight(idx, {{
+      append: e.ctrlKey || e.metaKey,
+    }});
+  }}
 }}
 
 function resize() {{
@@ -1204,7 +1327,8 @@ function loadSource(file_id) {{
     active = loaded.get(file_id);
     active.visible = true;
     indexParts(active);
-    frame(active);
+    const upRot = window.IFU_VIEWER?.getActiveUpAxis?.();
+    if (upRot) applyUpAxisOverride(upRot); else frame(active);
     return;
   }}
   const b64 = GLB_B64[file_id];
@@ -1237,7 +1361,8 @@ function loadSource(file_id) {{
     scene.add(grp);
     active = grp;
     indexParts(grp);
-    frame(grp);
+    const upRot = window.IFU_VIEWER?.getActiveUpAxis?.();
+    if (upRot) applyUpAxisOverride(upRot); else frame(grp);
   }}, undefined, (err) => {{
     console.error('GLB load failed', err);
     readout.textContent = '(GLB load failed - see console)';
@@ -1279,36 +1404,53 @@ function frame(grp) {{
   controls.update();
 }}
 
-function highlightPart(idx) {{
-  if (!active) return;
-  const name = `part_${{String(idx).padStart(3, '0')}}`;
-  active.traverse(o => {{
-    if (!o.isMesh) return;
-    // walk up the chain - trimesh's GLB nests mesh inside a named node
-    let isMatch = false, cur = o;
-    while (cur && cur !== active) {{
-      if (cur.name === name) {{ isMatch = true; break; }}
-      cur = cur.parent;
-    }}
-    o.material.color.setHex(isMatch ? 0x00836a : 0xe8e8ea);
-    o.material.opacity = isMatch ? 1.0 : 0.25;
-    o.material.transparent = !isMatch;
-  }});
+function _partIdxOf(obj) {{
+  // walk up the chain looking for "part_NNN" - trimesh's GLB nests the
+  // mesh inside a named node a level or two up
+  let cur = obj;
+  while (cur && cur !== active) {{
+    const m = cur.name && cur.name.match(/^part_(\d+)$/);
+    if (m) return parseInt(m[1]);
+    cur = cur.parent;
+  }}
+  return null;
 }}
 
-function clearHighlight3D() {{
+function applyHighlights3D(set) {{
   if (!active) return;
+  const any = set && set.size > 0;
   active.traverse(o => {{
-    if (o.isMesh) {{
-      o.material.color.setHex(0xe8e8ea);
+    if (!o.isMesh) return;
+    const idx = _partIdxOf(o);
+    const hit = any && idx != null && set.has(idx);
+    o.material.color.setHex(hit ? 0x00836a : 0xe8e8ea);
+    if (any && !hit) {{
+      o.material.opacity = 0.18;
+      o.material.transparent = true;
+      o.material.depthWrite = false;
+    }} else {{
       o.material.opacity = 1.0;
       o.material.transparent = false;
+      o.material.depthWrite = true;
     }}
   }});
 }}
 
 function snapToPresetView() {{
   if (!active) return;
+  frame(active);
+}}
+
+// Up-axis override: rotate the loaded group so the user-picked axis lands
+// on world Z.  The rotation comes from the same {{axis, angle}} table the
+// classic script uses; the Python side reads the same tuple from SOURCES.
+function applyUpAxisOverride(rot) {{
+  if (!active || !rot) return;
+  const axis = new THREE.Vector3(rot.axis[0], rot.axis[1], rot.axis[2])
+    .normalize();
+  const q = new THREE.Quaternion()
+    .setFromAxisAngle(axis, (rot.angle || 0) * Math.PI / 180);
+  active.setRotationFromQuaternion(q);
   frame(active);
 }}
 
@@ -1354,9 +1496,11 @@ window.IFU_VIEWER.onViewChange(() => {{
   if (wrap3d.classList.contains('show')) snapToPresetView();
 }});
 
-// Expose for the classic script's tree-click handler.
-window.IFU_VIEWER.highlight3DPart = highlightPart;
-window.IFU_VIEWER.clearHighlight3D = clearHighlight3D;
+// Expose for the classic script's selection + orientation handlers.
+window.IFU_VIEWER.applyHighlights3D = applyHighlights3D;
+window.IFU_VIEWER.applyUpAxisOverride = (rot) => {{
+  applyUpAxisOverride(rot);
+}};
 </script>
 </body>
 </html>
