@@ -521,6 +521,34 @@ def write_svg_parts(parts, out_path: Path,
             lines.append('</g>')
         lines.append('</g>')
 
+    # Hit-area layer: invisible thick strokes per part for reliable clicking.
+    # Visible IFU strokes are 0.2-0.7 mm wide; clicking on hair-thin lines is
+    # near-impossible. This layer sits on top with stroke-opacity=0 and a
+    # 3 mm "fat" stroke so any click within ~1.5 mm of a part's outline still
+    # registers as that part. pointer-events="stroke" is needed because the
+    # default ("visiblePainted") ignores fully-transparent paint.
+    HIT_STROKE_MM = 3.0
+    lines.append(
+        f'<g class="layer layer-hit" pointer-events="stroke" '
+        f'stroke="#000" stroke-opacity="0" stroke-width="{HIT_STROKE_MM}" '
+        f'fill="none">'
+    )
+    for p in parts:
+        all_polys = []
+        for cat in active_cats:
+            all_polys.extend(p["polys"].get(cat, []))
+        if not all_polys:
+            continue
+        lines.append(
+            f'<g class="part part-{p["idx"]:03d}" '
+            f'data-part="{p["idx"]}" data-label="{p["label"]}">'
+        )
+        for pl in all_polys:
+            d = "M " + " L ".join(f"{fmt % x} {fmt % y}" for x, y in pl)
+            lines.append(f'<path d="{d}"/>')
+        lines.append('</g>')
+    lines.append('</g>')
+
     lines.append('</g></svg>')
     out_path.write_text("\n".join(lines), encoding="utf-8")
     return (x0, y0, x1, y1)
