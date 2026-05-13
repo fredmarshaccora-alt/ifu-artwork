@@ -5,18 +5,27 @@ emits part-tagged SVG, then assembles every SVG into one self-contained
 HTML page with:
 
   - file / view / mode pickers
-  - pan + zoom (wheel = zoom, drag = pan)
-  - click-to-highlight a part (all its paths go teal + heavy)
-  - click-to-add callout arrows with text labels
-  - layer toggles (silhouette / sharp / smooth / hidden)
-  - export annotated SVG button
+  - 2D mode (HLR vector): pan + zoom, click-to-highlight, callout arrows,
+    layer toggles (silhouette / sharp / smooth / hidden)
+  - 3D mode (three.js): Z-locked orbit view-finder over a triangulated
+    GLB of the same source.  Verticals always project vertical.  Camera
+    direction read out live; "lock view" copies a `view_dir` tuple to
+    the clipboard for pasting into ``STD_VIEWS``.
+  - Onshape feature tree (when ``onshape`` IDs are provided): live instance
+    tree pulled from the assembly endpoint; click a node to highlight the
+    matching solid in either mode (name-match against STEP solid labels).
 """
 from __future__ import annotations
+import base64
+import io
 import json
+import sys
 import time
 import re
 from pathlib import Path
 import cadquery as cq
+import numpy as np
+import trimesh
 
 from t5_hlr_vector import (run_hlr_per_solid, write_svg_parts,
                             split_solids, STD_VIEWS, rotate_shape)
@@ -25,20 +34,51 @@ from t5_hlr_vector import (run_hlr_per_solid, write_svg_parts,
 HERE = Path(__file__).parent
 OUT = HERE / "out"
 
+# Onshape client - shared with fetch_contesa_step.py.  Optional: viewer
+# still builds without it (the Onshape feature-tree sidebar just stays empty
+# for any source whose ``onshape`` entry is None or the import fails).
+_ONSHAPE_CLIENT_PATHS = [
+    Path(r"C:\Users\FredMarshAccora\Projects\onshape-analytics"),
+]
+for _p in _ONSHAPE_CLIENT_PATHS:
+    if _p.exists() and str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+    # Load that project's .env (Onshape API keys + base URL) since the
+    # client constructor only reads env vars, never loads dotenv itself.
+    _env = _p / ".env"
+    if _env.exists():
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(_env)
+        except Exception:
+            pass
+try:
+    from onshape_analytics.client import OnshapeClient as _OnshapeClient
+except Exception as _e:
+    _OnshapeClient = None
+    print(f"  (Onshape client unavailable: {_e}; feature trees will be empty)",
+          flush=True)
 
-# Each source: (id, label, STEP path, hlr kwargs, pre-rotation (axis, angle))
-# Pre-rotation re-orients the model so its longest axis lies along world X
-# (the convention our STD_VIEWS are built around).  Presto's long axis is
-# world Z by default - rotate -90deg about Y so Z -> X.
+
+# Each source: (id, label, STEP path, hlr kwargs, pre-rotation, onshape ids)
+#   pre_rotation: ((axis_x, axis_y, axis_z), angle_deg) or None.  Re-orients
+#     the model so its long axis is world X and "up" is world Z - the frame
+#     our STD_VIEWS are built around.
+#   onshape: {"did", "wid", "eid"} for the assembly; enables the feature-tree
+#     sidebar with click-to-highlight.  None = tree sidebar stays empty.
 SOURCES = [
     ("siderail",  "Folding siderail",
      Path(r"C:\Users\FredMarshAccora\Downloads\P194-03-00 Folding siderail ASSE.STEP"),
      {"mesh_defl": 0.4, "sample_defl": 0.4},
+     None,
      None),
     ("presto",    "Presto bed (top assembly)",
      HERE.parent / "step_lineart_test" / "presto_top_level.step",
      {"mesh_defl": 1.5, "sample_defl": 1.0},
-     ((0, 1, 0), -90)),
+     ((0, 1, 0), -90),
+     {"did": "835e6bd90b01779d102c6244",
+      "wid": "57594ac630641ef7dd431b7a",
+      "eid": "41130e2363641e1fb1763b3b"}),
     ("contesa",   "Contesa V2 / FL8 (top assembly)",
      HERE / "contesa_top_level.step",
      # 61MB STEP - coarser tessellation to keep mesh memory reasonable
@@ -46,7 +86,10 @@ SOURCES = [
      # Native bbox: X=2153 (length), Y=1448 (height incl. headboard),
      # Z=1016 (width).  Contesa STEP is Y-up; rotate +90deg about X to
      # put height on world Z so the iso view comes out upright.
-     ((1, 0, 0), 90)),
+     ((1, 0, 0), 90),
+     {"did": "b112cdaa5ec09a28f81ca7c7",
+      "wid": "0c1fa64d6ea5b9f87d9bdb3e",
+      "eid": "0a03a83f17a3c3550242614b"}),
 ]
 
 # Three good IFU view dirs.  Defined for the bed convention (X=length, Z=up).
@@ -75,13 +118,135 @@ def slugify(s: str) -> str:
     return re.sub(r"[^a-z0-9_-]+", "_", s.lower()).strip("_")
 
 
+def _solid_mesh_arrays(solid):
+    """Return (vertices Nx3, faces Mx3) numpy arrays for one TopoDS_Solid.
+
+    Caller must have already called BRepMesh_IncrementalMesh on the parent
+    shape (or this solid).  Vertices are in the solid's coordinate frame.
+    """
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_FACE
+    from OCP.BRep import BRep_Tool
+    from OCP.TopLoc import TopLoc_Location
+    from OCP.TopoDS import TopoDS
+
+    vs, ts = [], []
+    voff = 0
+    exp = TopExp_Explorer(solid, TopAbs_FACE)
+    while exp.More():
+        face = TopoDS.Face_s(exp.Current())
+        loc = TopLoc_Location()
+        tri = BRep_Tool.Triangulation_s(face, loc)
+        if tri is not None:
+            trsf = loc.Transformation()
+            for i in range(1, tri.NbNodes() + 1):
+                p = tri.Node(i).Transformed(trsf)
+                vs.append((p.X(), p.Y(), p.Z()))
+            reversed_face = face.Orientation() == 1
+            for i in range(1, tri.NbTriangles() + 1):
+                t = tri.Triangle(i)
+                a, b, c = t.Get()
+                if reversed_face:
+                    ts.append((voff + b - 1, voff + a - 1, voff + c - 1))
+                else:
+                    ts.append((voff + a - 1, voff + b - 1, voff + c - 1))
+            voff += tri.NbNodes()
+        exp.Next()
+    if not vs or not ts:
+        return None, None
+    return np.array(vs, dtype=np.float32), np.array(ts, dtype=np.uint32)
+
+
+def export_glb_b64(shape, mesh_defl):
+    """Mesh every solid and pack into a GLB; return base64 string + summary.
+
+    Each solid becomes a named scene node (``part_NNN``) so the WebGL
+    viewer can highlight individual parts by name.  Mesh deflection is
+    intentionally coarser than HLR's: the 3D view-finder only needs to be
+    navigable, not print-quality.
+    """
+    from OCP.BRepMesh import BRepMesh_IncrementalMesh
+    BRepMesh_IncrementalMesh(shape, mesh_defl, False, 0.5, True)
+
+    scene = trimesh.Scene()
+    n_parts = 0
+    n_tris = 0
+    for idx, label, solid in split_solids(shape):
+        v, t = _solid_mesh_arrays(solid)
+        if v is None or len(v) == 0 or len(t) == 0:
+            continue
+        m = trimesh.Trimesh(vertices=v, faces=t, process=False)
+        node_name = f"part_{idx:03d}"
+        scene.add_geometry(m, node_name=node_name, geom_name=label)
+        n_parts += 1
+        n_tris += len(t)
+    if n_parts == 0:
+        return None, {"parts": 0, "tris": 0, "kb": 0}
+    glb_bytes = scene.export(file_type="glb")
+    b64 = base64.b64encode(glb_bytes).decode("ascii")
+    return b64, {"parts": n_parts, "tris": n_tris,
+                 "kb": len(glb_bytes) // 1024}
+
+
+def fetch_onshape_tree(ids):
+    """Pull the assembly instance tree from Onshape.
+
+    Returns a nested list of dicts shaped like::
+
+      [{"name": "...", "type": "Part" or "Assembly",
+        "partId": "...", "children": [...]}, ...]
+
+    Returns None on any failure (network, auth, missing client).  The
+    viewer falls back to the empty tree gracefully.
+    """
+    if _OnshapeClient is None or ids is None:
+        return None
+    try:
+        c = _OnshapeClient()
+        did, wid, eid = ids["did"], ids["wid"], ids["eid"]
+        # /assemblies/d/{d}/w/{w}/e/{e} returns the full definition with
+        # instances + subAssemblies.  We don't recurse via the API; we
+        # just walk the returned definition.
+        asm = c.get(f"/assemblies/d/{did}/w/{wid}/e/{eid}",
+                    params={"includeMateFeatures": "false",
+                            "includeNonSolids": "false",
+                            "includeMateConnectors": "false"})
+        root = asm.get("rootAssembly") or {}
+        sub_asms = {sa.get("elementId", "") + "/" + sa.get("documentId", ""): sa
+                    for sa in (asm.get("subAssemblies") or [])}
+
+        def build(instances):
+            nodes = []
+            for inst in instances or []:
+                node = {
+                    "name": inst.get("name") or inst.get("partId") or "?",
+                    "type": inst.get("type", "Part"),
+                    "part_id": inst.get("partId") or "",
+                    "children": [],
+                }
+                if inst.get("type") == "Assembly":
+                    sa_key = inst.get("elementId", "") + "/" + inst.get("documentId", "")
+                    sa = sub_asms.get(sa_key)
+                    if sa is not None:
+                        node["children"] = build(sa.get("instances") or [])
+                nodes.append(node)
+            return nodes
+
+        return build(root.get("instances") or [])
+    except Exception as exc:
+        print(f"  Onshape tree fetch failed: {type(exc).__name__}: {exc}",
+              flush=True)
+        return None
+
+
 def generate_svgs():
     """Run per-solid HLR for every (file, view) pair, write tagged SVG.
 
-    Returns metadata list: [{file_id, file_label, views: [...], parts: [...]}]
+    Returns metadata list: [{file_id, file_label, views: [...], parts: [...],
+                              glb_b64, onshape_tree}]
     """
     catalogue = []
-    for file_id, file_label, sp, hlr_kw, pre_rotate in SOURCES:
+    for file_id, file_label, sp, hlr_kw, pre_rotate, onshape_ids in SOURCES:
         if not sp.exists():
             print(f"  missing: {sp}"); continue
         print(f"\n===== {file_label} =====", flush=True)
@@ -93,7 +258,6 @@ def generate_svgs():
             shape = rotate_shape(shape, axis, angle)
             print(f"  pre-rotated {angle} deg about {axis}", flush=True)
         # bbox snapshot
-        import cadquery as _cq
         from OCP.Bnd import Bnd_Box
         from OCP.BRepBndLib import BRepBndLib
         bb = Bnd_Box(); BRepBndLib.Add_s(shape, bb)
@@ -111,11 +275,31 @@ def generate_svgs():
             for idx, label, _solid in split_solids(shape)
         ]
 
+        # 3D view-finder GLB.  Coarser deflection than HLR's so the inline
+        # base64 blob stays manageable.
+        glb_defl = max(hlr_kw.get("mesh_defl", 1.0) * 2.5, 4.0)
+        t_glb = time.time()
+        glb_b64, glb_info = export_glb_b64(shape, glb_defl)
+        print(f"  glb defl={glb_defl}  parts={glb_info['parts']}  "
+              f"tris={glb_info['tris']}  size={glb_info['kb']}KB  "
+              f"({time.time()-t_glb:.1f}s)", flush=True)
+
+        # Onshape feature tree (optional).
+        tree = None
+        if onshape_ids is not None:
+            t_tree = time.time()
+            tree = fetch_onshape_tree(onshape_ids)
+            if tree is not None:
+                print(f"  onshape tree: {_count_tree(tree)} nodes "
+                      f"({time.time()-t_tree:.1f}s)", flush=True)
+
         file_entry = {
             "file_id": file_id,
             "file_label": file_label,
             "parts": solid_meta,
             "views": [],
+            "glb_b64": glb_b64,
+            "onshape_tree": tree,
         }
 
         view_filter = SOURCE_VIEW_SUBSET.get(file_id)
@@ -143,6 +327,12 @@ def generate_svgs():
     return catalogue
 
 
+def _count_tree(nodes):
+    if not nodes:
+        return 0
+    return sum(1 + _count_tree(n.get("children") or []) for n in nodes)
+
+
 def html_escape(s):
     return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
              .replace('"', "&quot;").replace("'", "&#39;"))
@@ -163,26 +353,31 @@ def build_html(catalogue):
                               f'data-view="{ve["view_id"]}" '
                               f'data-svg-id="{svg_id}">{content}</div>')
 
-    # Catalogue lookup as JS literal (avoid full JSON dep)
-    js_cat_lines = ["const CATALOGUE = ["]
+    # Catalogue: structural metadata as a JSON object (small);
+    # GLB blobs and Onshape trees are heavy, so each lives in its own
+    # JS table keyed by file_id to keep JSON.parse fast at load time.
+    catalogue_min = []
+    glbs = {}
+    trees = {}
     for fe in catalogue:
-        js_cat_lines.append(f"  {{ file_id: '{fe['file_id']}', "
-                             f"file_label: '{html_escape(fe['file_label'])}',")
-        js_cat_lines.append("    parts: [")
-        for p in fe["parts"]:
-            js_cat_lines.append(
-                f"      {{ idx: {p['idx']}, label: '{p['label']}' }},")
-        js_cat_lines.append("    ],")
-        js_cat_lines.append("    views: [")
-        for ve in fe["views"]:
-            vd = ", ".join(f"{v:.3f}" for v in ve["view_dir"])
-            js_cat_lines.append(
-                f"      {{ view_id: '{ve['view_id']}', "
-                f"label: '{html_escape(ve['view_label'])}', "
-                f"view_dir: [{vd}] }},")
-        js_cat_lines.append("    ] },")
-    js_cat_lines.append("];")
-    js_catalogue = "\n".join(js_cat_lines)
+        catalogue_min.append({
+            "file_id": fe["file_id"],
+            "file_label": fe["file_label"],
+            "parts": fe["parts"],
+            "views": [{"view_id": ve["view_id"], "label": ve["view_label"],
+                       "view_dir": [round(v, 4) for v in ve["view_dir"]]}
+                      for ve in fe["views"]],
+        })
+        if fe.get("glb_b64"):
+            glbs[fe["file_id"]] = fe["glb_b64"]
+        if fe.get("onshape_tree"):
+            trees[fe["file_id"]] = fe["onshape_tree"]
+
+    js_catalogue = (
+        "const CATALOGUE = " + json.dumps(catalogue_min) + ";\n"
+        "const GLB_B64 = " + json.dumps(glbs) + ";\n"
+        "const ONSHAPE_TREES = " + json.dumps(trees) + ";"
+    )
 
     html = HTML_TEMPLATE.format(
         svg_blocks="\n".join(svg_blocks),
@@ -199,6 +394,14 @@ HTML_TEMPLATE = r"""<!doctype html>
 <head>
 <meta charset="utf-8"/>
 <title>Accora IFU viewer  -  HLR vector</title>
+<script type="importmap">
+{{
+  "imports": {{
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }}
+}}
+</script>
 <style>
   :root {{
     --accora-teal: #00836a;
@@ -224,7 +427,11 @@ HTML_TEMPLATE = r"""<!doctype html>
                                    border-radius: 3px; cursor: pointer; }}
   header button.active {{ background: var(--accora-teal); color: white;
                           border-color: var(--accora-teal); }}
-  main {{ display: grid; grid-template-columns: 240px 1fr 260px; overflow: hidden; }}
+  main {{ display: grid; grid-template-columns: 240px 1fr 260px;
+           grid-template-areas: "left center right"; overflow: hidden; }}
+  aside.left {{ grid-area: left; }}
+  aside.right {{ grid-area: right; }}
+  .canvas-wrap, .webgl-wrap {{ grid-area: center; }}
   aside.left, aside.right {{ background: var(--panel);
                               border-right: 1px solid var(--line);
                               padding: 12px; overflow-y: auto; font-size: 13px; }}
@@ -249,6 +456,38 @@ HTML_TEMPLATE = r"""<!doctype html>
                 background: var(--accora-teal-pale); color: var(--accora-teal);
                 font-size: 11px; font-weight: bold; margin-right: 6px; }}
   .canvas-wrap {{ position: relative; overflow: hidden; background: white; }}
+  .canvas-wrap.hide {{ display: none; }}
+  .webgl-wrap {{ position: relative; overflow: hidden; background: white;
+                  display: none; }}
+  .webgl-wrap.show {{ display: block; }}
+  .webgl-wrap canvas {{ width: 100%; height: 100%; display: block;
+                         cursor: grab; }}
+  .webgl-wrap canvas.dragging {{ cursor: grabbing; }}
+  .three-toolbar {{ position: absolute; top: 10px; left: 50%;
+                     transform: translateX(-50%); background: rgba(255,255,255,0.95);
+                     padding: 6px 12px; border-radius: 14px;
+                     border: 1px solid var(--line); font-size: 12px;
+                     display: flex; gap: 12px; align-items: center;
+                     font-family: ui-monospace, Consolas, monospace; }}
+  .three-toolbar button {{ font-family: Arial, sans-serif; font-size: 12px;
+                            padding: 3px 10px; border: 1px solid var(--line);
+                            background: white; border-radius: 3px;
+                            cursor: pointer; }}
+  .three-toolbar button:hover {{ background: var(--accora-teal-pale); }}
+  /* Onshape tree */
+  .tree-root {{ list-style: none; padding: 0; margin: 0; font-size: 12px;
+                font-family: ui-monospace, Consolas, monospace; }}
+  .tree-root ul {{ list-style: none; padding-left: 14px; margin: 0;
+                    border-left: 1px solid #eee; }}
+  .tree-row {{ display: flex; align-items: center; gap: 4px;
+                padding: 2px 4px; cursor: pointer; border-radius: 2px; }}
+  .tree-row:hover {{ background: var(--accora-teal-pale); }}
+  .tree-row.matched {{ color: var(--accora-teal); }}
+  .tree-row.highlighted {{ background: var(--accora-teal); color: white; }}
+  .tree-row .twisty {{ display: inline-block; width: 10px;
+                        font-family: monospace; color: var(--muted); }}
+  .tree-row .icon {{ font-size: 10px; color: var(--muted); width: 10px; }}
+  .tree-row.is-assembly .icon {{ color: var(--accora-teal); }}
   .svg-pane {{ position: absolute; inset: 0; display: none; }}
   .svg-pane.active {{ display: block; }}
   .svg-pane svg {{ width: 100%; height: 100%; cursor: grab; }}
@@ -294,15 +533,20 @@ HTML_TEMPLATE = r"""<!doctype html>
   <button id="btn-detailed">+ smooth</button>
   <button id="btn-hidden">+ hidden</button>
   <span style="flex:1"></span>
+  <button id="btn-3d">3D view-finder</button>
   <button id="btn-annotate">+ callout</button>
   <button id="btn-clear">clear callouts</button>
   <button id="btn-export">export SVG</button>
 </header>
 <main>
   <aside class="left">
-    <h2>Parts</h2>
+    <h2>Onshape tree</h2>
+    <p style="font-size:11px; color: var(--muted); margin: 0 0 8px 0;"
+       id="tree-status">No tree for this source.</p>
+    <ul class="tree-root" id="tree-root"></ul>
+    <h2>Solids (STEP order)</h2>
     <p style="font-size:11px; color: var(--muted); margin: 0 0 8px 0;">
-      Click a row to highlight that part. Click again to clear.</p>
+      Click a row to highlight. Click again to clear.</p>
     <ul class="part-list" id="part-list"></ul>
     <h2>Selection</h2>
     <div id="selection-info" style="font-size: 12px; color: var(--muted);">
@@ -313,6 +557,14 @@ HTML_TEMPLATE = r"""<!doctype html>
     {svg_blocks}
     <footer>Wheel = zoom &nbsp;&middot;&nbsp; Drag = pan &nbsp;&middot;&nbsp; Click part to highlight &nbsp;&middot;&nbsp; Callout mode: drag to place arrow</footer>
     <div class="tooltip" id="tooltip"></div>
+  </div>
+  <div class="webgl-wrap" id="webgl-wrap">
+    <canvas id="webgl-canvas"></canvas>
+    <div class="three-toolbar">
+      <span id="viewdir-readout">view_dir = (—, —, —)</span>
+      <button id="btn-lock-view" title="Copy view_dir tuple to clipboard">copy view_dir</button>
+      <button id="btn-reset-3d">reset camera</button>
+    </div>
   </div>
   <aside class="right">
     <h2>Layers</h2>
@@ -409,31 +661,37 @@ function refreshPartList() {{
 
 function togglePartHighlight(idx) {{
   const svg = activeSvg();
-  if (!svg) return;
   const st = getState(fileSel.value, viewSel.value);
-  const sel = `.part-${{String(idx).padStart(3, '0')}}`;
   if (st.highlight === idx) {{
     st.highlight = null;
-    svg.querySelectorAll('.part').forEach(p => {{
-      p.classList.remove('highlight'); p.classList.remove('dim');
-    }});
+    if (svg) {{
+      svg.querySelectorAll('.part').forEach(p => {{
+        p.classList.remove('highlight'); p.classList.remove('dim');
+      }});
+    }}
     partList.querySelectorAll('li').forEach(li => li.classList.remove('highlighted'));
+    treeRoot?.querySelectorAll('.tree-row.highlighted')
+      .forEach(r => r.classList.remove('highlighted'));
     selectionInfo.textContent = 'Nothing selected';
+    window.IFU_VIEWER?.clearHighlight3D?.();
   }} else {{
     st.highlight = idx;
-    svg.querySelectorAll('.part').forEach(p => {{
-      if (p.classList.contains('part-' + String(idx).padStart(3, '0'))) {{
-        p.classList.add('highlight'); p.classList.remove('dim');
-      }} else {{
-        p.classList.remove('highlight'); p.classList.add('dim');
-      }}
-    }});
+    if (svg) {{
+      svg.querySelectorAll('.part').forEach(p => {{
+        if (p.classList.contains('part-' + String(idx).padStart(3, '0'))) {{
+          p.classList.add('highlight'); p.classList.remove('dim');
+        }} else {{
+          p.classList.remove('highlight'); p.classList.add('dim');
+        }}
+      }});
+    }}
     partList.querySelectorAll('li').forEach(li => {{
       li.classList.toggle('highlighted', parseInt(li.dataset.part) === idx);
     }});
     const fe = CATALOGUE.find(x => x.file_id === fileSel.value);
     const p = fe.parts.find(x => x.idx === idx);
     selectionInfo.innerHTML = `<b>Part ${{idx}}</b><br>${{p ? p.label : ''}}`;
+    window.IFU_VIEWER?.highlight3DPart?.(idx);
   }}
 }}
 
@@ -743,9 +1001,362 @@ $('btn-export').onclick = () => {{
   a.click();
 }};
 
+// --- Onshape feature tree sidebar -----------------------------------------
+// Renders the live instance tree pulled from Onshape into the left sidebar.
+// Click a leaf-Part to highlight the matching STEP solid (in both the 2D
+// SVG view and the 3D view-finder).  v1 mapping: i-th leaf Part in tree
+// order <-> i-th solid in STEP order (positional, since cadquery's STEP
+// importer drops Onshape part names).
+
+const treeRoot = $('tree-root');
+const treeStatus = $('tree-status');
+let _tree_id_counter = 0;
+let _tree_idmap = {{}};        // tree-node-id -> tree-node-object
+let _tree_to_part_idx = {{}};  // tree-node-id -> solid idx (or null)
+
+function _flattenLeaves(nodes, out) {{
+  for (const n of nodes || []) {{
+    if (n.type === 'Part') out.push(n);
+    else if (n.children && n.children.length) _flattenLeaves(n.children, out);
+  }}
+}}
+
+function refreshTree() {{
+  treeRoot.innerHTML = '';
+  _tree_idmap = {{}};
+  _tree_to_part_idx = {{}};
+  const fe = CATALOGUE.find(x => x.file_id === fileSel.value);
+  const tree = ONSHAPE_TREES[fileSel.value];
+  if (!tree || !tree.length) {{
+    treeStatus.textContent = 'No tree for this source.';
+    return;
+  }}
+  // positional leaf->solid map
+  const leaves = [];
+  _flattenLeaves(tree, leaves);
+  const partsById = new Map(fe.parts.map(p => [p.idx, p]));
+  leaves.forEach((leaf, i) => {{
+    leaf._mapped_idx = (i < fe.parts.length) ? fe.parts[i].idx : null;
+  }});
+  treeStatus.textContent = `${{leaves.length}} part instances, mapped to ` +
+    `${{Math.min(leaves.length, fe.parts.length)}} solids (positional).`;
+
+  function buildNode(n) {{
+    const id = String(++_tree_id_counter);
+    _tree_idmap[id] = n;
+    if (n.type === 'Part' && n._mapped_idx != null) {{
+      _tree_to_part_idx[id] = n._mapped_idx;
+    }}
+    const li = document.createElement('li');
+    const row = document.createElement('div');
+    row.className = 'tree-row' +
+      (n.type === 'Assembly' ? ' is-assembly' : '') +
+      (n._mapped_idx != null ? ' matched' : '');
+    row.dataset.treeId = id;
+    const hasKids = (n.children && n.children.length) > 0;
+    const twisty = document.createElement('span');
+    twisty.className = 'twisty';
+    twisty.textContent = hasKids ? '▾' : ' ';
+    const icon = document.createElement('span');
+    icon.className = 'icon';
+    icon.textContent = n.type === 'Assembly' ? '⊞' : '·';
+    const lbl = document.createElement('span');
+    lbl.textContent = n.name;
+    row.appendChild(twisty); row.appendChild(icon); row.appendChild(lbl);
+    li.appendChild(row);
+    if (hasKids) {{
+      const ul = document.createElement('ul');
+      n.children.forEach(c => ul.appendChild(buildNode(c)));
+      li.appendChild(ul);
+      twisty.addEventListener('click', ev => {{
+        ev.stopPropagation();
+        const collapsed = ul.style.display === 'none';
+        ul.style.display = collapsed ? '' : 'none';
+        twisty.textContent = collapsed ? '▾' : '▸';
+      }});
+    }}
+    row.addEventListener('click', () => {{
+      const idx = _tree_to_part_idx[id];
+      if (idx == null) return;
+      togglePartHighlight(idx);
+      treeRoot.querySelectorAll('.tree-row.highlighted')
+        .forEach(r => r.classList.remove('highlighted'));
+      row.classList.add('highlighted');
+    }});
+    return li;
+  }}
+  tree.forEach(n => treeRoot.appendChild(buildNode(n)));
+}}
+
+// Expose for the module script (cross-script comms)
+window.IFU_VIEWER = {{
+  togglePartHighlight,
+  getActiveFileId: () => fileSel.value,
+  getActiveViewDir: () => {{
+    const fe = CATALOGUE.find(x => x.file_id === fileSel.value);
+    const ve = fe?.views.find(v => v.view_id === viewSel.value);
+    return ve?.view_dir;
+  }},
+  onFileChange: (cb) => fileSel.addEventListener('change', cb),
+  onViewChange: (cb) => viewSel.addEventListener('change', cb),
+}};
+
+// Tree refresh on source change
+fileSel.addEventListener('change', refreshTree);
+
 // init
 setMode('smart');
 refreshPane();
+refreshTree();
+</script>
+
+<script type="module">
+// --- 3D view-finder (three.js) --------------------------------------------
+// Z-locked orbit: camera.up = world Z, so vertical edges in the model stay
+// vertical on screen no matter where you orbit to.  Loads the inlined GLB
+// for the active source, renders meshes with a Composer-ish look (light
+// face fill + heavy crease edges), reads out the live view_dir, and offers
+// a "copy view_dir" button to capture an angle for pasting into the
+// Python-side STD_VIEWS / VIEWS list.
+
+import * as THREE from 'three';
+import {{ OrbitControls }} from 'three/addons/controls/OrbitControls.js';
+import {{ GLTFLoader }} from 'three/addons/loaders/GLTFLoader.js';
+
+const canvas = document.getElementById('webgl-canvas');
+const wrap3d = document.getElementById('webgl-wrap');
+const wrap2d = document.getElementById('canvas-wrap');
+const btn3d = document.getElementById('btn-3d');
+const readout = document.getElementById('viewdir-readout');
+
+let scene, camera, renderer, controls;
+let loaded = new Map();      // file_id -> THREE.Group
+let active = null;           // currently visible group
+let partByName = new Map();  // "part_NNN" -> THREE.Object3D
+let inited = false;
+
+function init() {{
+  if (inited) return;
+  inited = true;
+
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0xffffff);
+
+  const r = canvas.getBoundingClientRect();
+  camera = new THREE.PerspectiveCamera(35, r.width / r.height || 1, 1, 200000);
+  camera.up.set(0, 0, 1);                // Z-up world: verticals stay vertical
+  camera.position.set(-2000, -4000, 3000);
+  camera.lookAt(0, 0, 0);
+
+  renderer = new THREE.WebGLRenderer({{ canvas, antialias: true }});
+  renderer.setSize(r.width, r.height, false);
+  renderer.setPixelRatio(window.devicePixelRatio || 1);
+
+  scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+  const sun = new THREE.DirectionalLight(0xffffff, 0.55);
+  sun.position.set(1, -1, 1.5);
+  scene.add(sun);
+  const fill = new THREE.DirectionalLight(0xffffff, 0.25);
+  fill.position.set(-1, 0.5, -0.5);
+  scene.add(fill);
+
+  controls = new OrbitControls(camera, canvas);
+  controls.target.set(0, 0, 0);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.08;
+  controls.update();
+
+  window.addEventListener('resize', resize);
+  canvas.addEventListener('mousedown', () => canvas.classList.add('dragging'));
+  window.addEventListener('mouseup', () => canvas.classList.remove('dragging'));
+
+  animate();
+}}
+
+function resize() {{
+  if (!renderer) return;
+  const r = canvas.getBoundingClientRect();
+  if (r.width === 0 || r.height === 0) return;
+  renderer.setSize(r.width, r.height, false);
+  camera.aspect = r.width / r.height;
+  camera.updateProjectionMatrix();
+}}
+
+function animate() {{
+  requestAnimationFrame(animate);
+  if (!controls || wrap3d.style.display === 'none') return;
+  controls.update();
+  renderer.render(scene, camera);
+  updateReadout();
+}}
+
+function updateReadout() {{
+  const d = camera.position.clone().sub(controls.target).normalize();
+  readout.textContent =
+    `view_dir = (${{d.x.toFixed(3)}}, ${{d.y.toFixed(3)}}, ${{d.z.toFixed(3)}})`;
+}}
+
+function loadSource(file_id) {{
+  // Hide the previously active group; show or load the new one.
+  if (active) active.visible = false;
+  partByName = new Map();
+  if (loaded.has(file_id)) {{
+    active = loaded.get(file_id);
+    active.visible = true;
+    indexParts(active);
+    frame(active);
+    return;
+  }}
+  const b64 = GLB_B64[file_id];
+  if (!b64) {{
+    readout.textContent = '(no 3D mesh for this source)';
+    return;
+  }}
+  const url = 'data:model/gltf-binary;base64,' + b64;
+  const loader = new GLTFLoader();
+  loader.load(url, (gltf) => {{
+    const grp = gltf.scene;
+    grp.traverse(obj => {{
+      if (obj.isMesh) {{
+        obj.material = new THREE.MeshLambertMaterial({{
+          color: 0xe8e8ea, transparent: false, side: THREE.DoubleSide,
+          polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1,
+        }});
+        // crease edges only (>=30deg dihedral) for a Composer-ish look
+        const edges = new THREE.EdgesGeometry(obj.geometry, 30);
+        const lines = new THREE.LineSegments(
+          edges,
+          new THREE.LineBasicMaterial({{ color: 0x000000, linewidth: 1 }})
+        );
+        lines.userData.isEdge = true;
+        obj.add(lines);
+        obj.userData.baseColor = 0xe8e8ea;
+      }}
+    }});
+    loaded.set(file_id, grp);
+    scene.add(grp);
+    active = grp;
+    indexParts(grp);
+    frame(grp);
+  }}, undefined, (err) => {{
+    console.error('GLB load failed', err);
+    readout.textContent = '(GLB load failed - see console)';
+  }});
+}}
+
+function indexParts(grp) {{
+  partByName = new Map();
+  grp.traverse(obj => {{
+    if (obj.isMesh && obj.name) {{
+      // node names from trimesh come back as the geometry name; keep both
+      partByName.set(obj.name, obj);
+    }}
+    // walk parents to capture node-level names too
+    if (obj.userData && obj.userData.name) {{
+      partByName.set(obj.userData.name, obj);
+    }}
+  }});
+  // also walk gltf scene children which carry node names
+  grp.children.forEach(child => {{
+    if (child.name) partByName.set(child.name, child);
+    child.traverse(o => {{ if (o.name) partByName.set(o.name, o); }});
+  }});
+}}
+
+function frame(grp) {{
+  const bbox = new THREE.Box3().setFromObject(grp);
+  const size = bbox.getSize(new THREE.Vector3());
+  const center = bbox.getCenter(new THREE.Vector3());
+  const maxDim = Math.max(size.x, size.y, size.z) || 1;
+  controls.target.copy(center);
+  // approach from the stored iso preset if available, else default
+  let vd = window.IFU_VIEWER?.getActiveViewDir?.() || [-0.5, -1.0, 0.7];
+  const dir = new THREE.Vector3(vd[0], vd[1], vd[2]).normalize();
+  camera.position.copy(center).add(dir.multiplyScalar(maxDim * 2.2));
+  camera.near = maxDim / 100;
+  camera.far = maxDim * 20;
+  camera.updateProjectionMatrix();
+  controls.update();
+}}
+
+function highlightPart(idx) {{
+  if (!active) return;
+  const name = `part_${{String(idx).padStart(3, '0')}}`;
+  active.traverse(o => {{
+    if (!o.isMesh) return;
+    // walk up the chain - trimesh's GLB nests mesh inside a named node
+    let isMatch = false, cur = o;
+    while (cur && cur !== active) {{
+      if (cur.name === name) {{ isMatch = true; break; }}
+      cur = cur.parent;
+    }}
+    o.material.color.setHex(isMatch ? 0x00836a : 0xe8e8ea);
+    o.material.opacity = isMatch ? 1.0 : 0.25;
+    o.material.transparent = !isMatch;
+  }});
+}}
+
+function clearHighlight3D() {{
+  if (!active) return;
+  active.traverse(o => {{
+    if (o.isMesh) {{
+      o.material.color.setHex(0xe8e8ea);
+      o.material.opacity = 1.0;
+      o.material.transparent = false;
+    }}
+  }});
+}}
+
+function snapToPresetView() {{
+  if (!active) return;
+  frame(active);
+}}
+
+function toggle() {{
+  const showing = wrap3d.classList.contains('show');
+  if (showing) {{
+    wrap3d.classList.remove('show');
+    wrap2d.classList.remove('hide');
+    btn3d.classList.remove('active');
+  }} else {{
+    wrap3d.classList.add('show');
+    wrap2d.classList.add('hide');
+    btn3d.classList.add('active');
+    init();
+    resize();
+    const fid = window.IFU_VIEWER.getActiveFileId();
+    loadSource(fid);
+  }}
+}}
+
+btn3d.addEventListener('click', toggle);
+
+document.getElementById('btn-lock-view').addEventListener('click', () => {{
+  const d = camera.position.clone().sub(controls.target).normalize();
+  const tup = `(${{d.x.toFixed(3)}}, ${{d.y.toFixed(3)}}, ${{d.z.toFixed(3)}})`;
+  navigator.clipboard?.writeText(tup);
+  readout.textContent = `copied ${{tup}}`;
+  setTimeout(updateReadout, 1500);
+}});
+
+document.getElementById('btn-reset-3d').addEventListener('click', () => {{
+  if (active) frame(active);
+}});
+
+// Sync with the file picker: switching source in 3D mode swaps the GLB.
+window.IFU_VIEWER.onFileChange(() => {{
+  if (wrap3d.classList.contains('show')) {{
+    loadSource(window.IFU_VIEWER.getActiveFileId());
+  }}
+}});
+// Switching view preset in 3D mode snaps the camera to that direction.
+window.IFU_VIEWER.onViewChange(() => {{
+  if (wrap3d.classList.contains('show')) snapToPresetView();
+}});
+
+// Expose for the classic script's tree-click handler.
+window.IFU_VIEWER.highlight3DPart = highlightPart;
+window.IFU_VIEWER.clearHighlight3D = clearHighlight3D;
 </script>
 </body>
 </html>
