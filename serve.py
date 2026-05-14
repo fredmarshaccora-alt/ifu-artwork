@@ -78,6 +78,7 @@ def render():
     body = request.get_json(silent=True) or {}
     file_id = body.get("file_id")
     view_dir = body.get("view_dir") or []
+    up_axis = body.get("up_axis")    # {"axis": [x,y,z], "angle": deg} or None
     if file_id not in _SHAPES:
         return jsonify({"error": f"unknown source: {file_id!r}",
                         "known": list(_SHAPES.keys())}), 400
@@ -86,6 +87,18 @@ def render():
     view_dir = tuple(float(x) for x in view_dir)
 
     shape, hlr_kw = _SHAPES[file_id]
+    # Apply the 3D viewer's Up: override to a fresh copy so the SVG matches
+    # what the user was looking at when they clicked "generate 2D".  The
+    # cache stays in its native pre-rotated state for the next request.
+    extra_rot_str = ""
+    if up_axis and float(up_axis.get("angle") or 0) != 0:
+        try:
+            ax = tuple(float(c) for c in up_axis["axis"])
+            ang = float(up_axis["angle"])
+            shape = rotate_shape(shape, ax, ang)
+            extra_rot_str = f"  +rot({ax}, {ang:.0f}deg)"
+        except Exception as exc:
+            return jsonify({"error": f"bad up_axis: {exc}"}), 400
     t0 = time.time()
     try:
         parts = run_hlr_per_solid(shape, view_dir, **hlr_kw)
@@ -95,8 +108,8 @@ def render():
     write_svg_parts(parts, out_path, precision=1)
     svg = out_path.read_text(encoding="utf-8")
     elapsed = time.time() - t0
-    print(f"  /api/render {file_id:<10s} dir={tuple(round(x,3) for x in view_dir)}  "
-          f"{elapsed:.1f}s  {len(svg)//1024}KB")
+    print(f"  /api/render {file_id:<10s} dir={tuple(round(x,3) for x in view_dir)}"
+          f"{extra_rot_str}  {elapsed:.1f}s  {len(svg)//1024}KB")
     return Response(svg, mimetype="image/svg+xml",
                     headers={"X-Render-Seconds": f"{elapsed:.2f}"})
 

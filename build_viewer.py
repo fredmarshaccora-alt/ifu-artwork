@@ -1747,6 +1747,14 @@ async function generateLiveSVG() {{
   const fid = window.IFU_VIEWER.getActiveFileId();
   const dir = camera.position.clone().sub(controls.target).normalize();
   const view_dir = [dir.x, dir.y, dir.z];
+  // Send the current Up: override so the server rotates the cached shape
+  // the same way the 3D view did before running HLR -- otherwise the SVG
+  // comes back in the model's native (unrotated) orientation.
+  const upRot = window.IFU_VIEWER.getActiveUpAxis?.();
+  const body = {{ file_id: fid, view_dir }};
+  if (upRot && upRot.angle && upRot.angle !== 0) {{
+    body.up_axis = {{ axis: upRot.axis, angle: upRot.angle }};
+  }}
 
   const orig = btnGen.innerHTML;
   btnGen.disabled = true;
@@ -1756,7 +1764,7 @@ async function generateLiveSVG() {{
     const r = await fetch('/api/render', {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/json' }},
-      body: JSON.stringify({{ file_id: fid, view_dir }}),
+      body: JSON.stringify(body),
     }});
     if (!r.ok) {{
       const err = await r.json().catch(() => ({{ error: 'HTTP ' + r.status }}));
