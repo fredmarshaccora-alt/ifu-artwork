@@ -409,19 +409,20 @@ def run_hlr_per_solid(shape, view_dir, focal=(0, 0, 0),
     return parts
 
 
-def _dedup_polylines_in_place(parts, precision=1):
+def _dedup_polylines_in_place(parts, precision=2):
     """Remove duplicate polylines (across all parts) and drop degenerate ones.
 
     HLR on a multi-solid compound returns shared edges once per neighbouring
     solid -- so the same outline edge between two adjacent panels appears in
     both solids' extracted polyline lists.  Without dedup the SVG draws each
-    shared edge 2x, 6x, even 10x on top of itself.  Effects: bloated file
-    size, dark overdraw artifacts on edges that should be hairline (the
-    "big circle" in dense viewports), and slower interactive pan/zoom.
+    shared edge 2x, 6x, even 10x on top of itself.
 
     Dedup key is the rounded coordinate sequence so floating-point jitter
-    between extractions doesn't defeat the comparison.  Within-part order
-    is preserved.
+    between extractions doesn't defeat the comparison.  Default precision is
+    2 decimal places (0.01 mm) -- tight enough that nearby-but-distinct
+    edges aren't conflated, loose enough that bit-for-bit-equal HLR output
+    from neighbouring solids collapses to one entry.  precision=1 (0.1 mm)
+    was previously the default but lost real sub-millimetre features.
     """
     seen = set()
     n_total = 0

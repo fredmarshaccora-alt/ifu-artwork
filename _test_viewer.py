@@ -298,6 +298,87 @@ def run():
            visible_cleared == total,
            detail=f"cleared={visible_cleared} total={total}")
 
+        # ---- Saved views: save -> reload page -> recall ----
+        # Switch back to siderail (the tree-search test left us on presto)
+        page.select_option("#file-sel", "siderail")
+        page.wait_for_timeout(400)
+        # Enter Split so the 3D camera is alive
+        page.locator("#lay-split").click()
+        page.wait_for_timeout(2500)
+        # Snap to a known camera then save with a fixed name
+        page.evaluate("""
+          (() => {
+            window.IFU_VIEWER.snapCameraTo([100, 200, 300], [10, 20, 30]);
+          })()
+        """)
+        page.wait_for_timeout(200)
+        page.fill("#view-name", "test_view")
+        page.locator("#btn-save-view").click()
+        page.wait_for_timeout(100)
+        ok("saved view appears in the list",
+           page.evaluate("document.querySelectorAll('#saved-views li .name').length === 1"))
+        ok("saved view stored in localStorage",
+           page.evaluate("localStorage.getItem('savedViews_siderail') !== null"))
+
+        # Reload to confirm persistence
+        page.reload(wait_until="networkidle")
+        page.select_option("#file-sel", "siderail")
+        page.wait_for_timeout(300)
+        ok("saved view survives a reload",
+           page.evaluate("loadSavedViews('siderail').length === 1"))
+
+        # Recall and check camera moved
+        page.locator("#lay-split").click()
+        page.wait_for_timeout(2500)
+        page.evaluate("recallSavedView(loadSavedViews('siderail')[0])")
+        page.wait_for_timeout(500)
+        cam = page.evaluate("window.IFU_VIEWER.getCameraEyeTarget()")
+        ok("recall restores camera eye (within 1mm)",
+           cam and abs(cam["eye"][0] - 100) < 1
+               and abs(cam["eye"][1] - 200) < 1
+               and abs(cam["eye"][2] - 300) < 1,
+           detail=f"eye={cam.get('eye') if cam else None}")
+        ok("recall restores camera target",
+           cam and abs(cam["target"][0] - 10) < 1
+               and abs(cam["target"][1] - 20) < 1
+               and abs(cam["target"][2] - 30) < 1,
+           detail=f"target={cam.get('target') if cam else None}")
+
+        # ---- Per-part style overrides ----
+        # Select part 0 and apply a custom stroke
+        page.evaluate("togglePartHighlight(0, {append: false})")
+        page.fill("#sty-stroke", "#ff0000")  # may not work on color input
+        page.evaluate("document.getElementById('sty-stroke').value = '#ff0000'")
+        page.evaluate("document.getElementById('sty-width').value = '1.5'")
+        page.locator("#btn-apply-style").click()
+        page.wait_for_timeout(100)
+        stored = page.evaluate("loadPartStyles('siderail')")
+        ok("apply-style writes part 0 entry",
+           "0" in stored and stored["0"].get("stroke", "").lower() == "#ff0000",
+           detail=f"stored={stored}")
+        css_has_rule = page.evaluate("""
+          (() => {
+            const s = document.getElementById('per-part-styles');
+            return s && s.textContent.includes('.part-000');
+          })()
+        """)
+        ok("CSS <style> tag emits the part-000 rule", css_has_rule)
+
+        # Reset that one part -- re-select it first (apply-style above may
+        # have left it selected, but toggling once would DEselect)
+        page.evaluate("""
+          (() => {
+            const st = getState(fileSel.value, viewSel.value);
+            st.highlights = new Set([0]);
+            applyHighlights();
+          })()
+        """)
+        page.locator("#btn-reset-style").click()
+        page.wait_for_timeout(100)
+        stored = page.evaluate("loadPartStyles('siderail')")
+        ok("reset-style removes the entry",
+           "0" not in stored, detail=f"stored={stored}")
+
         # Final console-error check (catches errors fired during 3D init)
         ok("no JS errors after full round-trip",
            not [e for e in console_errors if 'Quaternion' not in e],

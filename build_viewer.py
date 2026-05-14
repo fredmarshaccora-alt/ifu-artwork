@@ -541,6 +541,28 @@ HTML_TEMPLATE = r"""<!doctype html>
   #tree-search:focus {{ outline: none; border-color: var(--accora-teal); }}
   /* Hide tree nodes that don't match the current search */
   .tree-root li.filtered-out {{ display: none; }}
+  /* Saved views panel */
+  .saved-views-list {{ list-style: none; padding: 0; margin: 0;
+                        font-size: 12px; max-height: 220px; overflow-y: auto;
+                        border: 1px solid var(--line); border-radius: 3px; }}
+  .saved-views-list li {{ display: flex; align-items: center; gap: 4px;
+                           padding: 4px 6px; border-bottom: 1px solid #f0f0f0;
+                           font-family: ui-monospace, Consolas, monospace; }}
+  .saved-views-list li:hover {{ background: var(--accora-teal-pale); }}
+  .saved-views-list .name {{ flex: 1; cursor: pointer; }}
+  .saved-views-list button {{ font-size: 11px; padding: 2px 6px;
+                               border: 1px solid var(--line); background: white;
+                               border-radius: 3px; cursor: pointer; }}
+  /* Selection styling panel */
+  #style-panel button {{ font-size: 12px; padding: 3px 8px;
+                          border: 1px solid var(--line); background: white;
+                          border-radius: 3px; cursor: pointer; }}
+  #style-panel button:hover {{ background: var(--accora-teal-pale); }}
+  #view-name {{ font-family: ui-monospace, Consolas, monospace; }}
+  #btn-save-view {{ font-size: 12px; padding: 3px 8px;
+                     border: 1px solid var(--line); background: white;
+                     border-radius: 3px; cursor: pointer; }}
+  #btn-save-view:hover {{ background: var(--accora-teal-pale); }}
   /* Onshape tree */
   .tree-root {{ list-style: none; padding: 0; margin: 0; font-size: 12px;
                 font-family: ui-monospace, Consolas, monospace; }}
@@ -612,6 +634,17 @@ HTML_TEMPLATE = r"""<!doctype html>
 </header>
 <main>
   <aside class="left">
+    <h2>Saved views</h2>
+    <p style="font-size:11px; color: var(--muted); margin: 0 0 6px 0;">
+      Camera angles you've saved for this source.</p>
+    <div style="display:flex; gap:4px; margin-bottom:6px;">
+      <input type="text" id="view-name" placeholder="name..."
+             style="flex:1; padding:4px 6px; font-size:12px;
+                    border:1px solid var(--line); border-radius:3px;">
+      <button id="btn-save-view" title="Save current camera angle">save</button>
+    </div>
+    <ul id="saved-views" class="saved-views-list"></ul>
+
     <h2>Onshape tree</h2>
     <input type="search" id="tree-search" placeholder="filter tree..."
            autocomplete="off" spellcheck="false">
@@ -669,6 +702,41 @@ HTML_TEMPLATE = r"""<!doctype html>
       <span class="swatch dashed"></span> Hidden silhouette</label>
     <label class="layer-toggle"><input type="checkbox" data-layer="hidden_sharp">
       <span class="swatch dashed"></span> Hidden sharp</label>
+
+    <h2>Selection styling</h2>
+    <p style="font-size:11px; color: var(--muted); margin: 0 0 6px 0;">
+      Properties applied to the currently-highlighted parts.</p>
+    <div id="style-panel" style="font-size: 12px;">
+      <label style="display:flex; align-items:center; gap:6px; margin:4px 0;">
+        Stroke
+        <input type="color" id="sty-stroke" value="#00836a" style="width:30px;">
+      </label>
+      <label style="display:flex; align-items:center; gap:6px; margin:4px 0;">
+        Width
+        <input type="range" id="sty-width" min="0.1" max="3" step="0.1"
+               value="0.7" style="flex:1;">
+        <span id="sty-width-val">0.7</span>
+      </label>
+      <label style="display:flex; align-items:center; gap:6px; margin:4px 0;">
+        Opacity
+        <input type="range" id="sty-opacity" min="0.1" max="1" step="0.05"
+               value="1" style="flex:1;">
+        <span id="sty-opacity-val">1.0</span>
+      </label>
+      <label style="display:flex; align-items:center; gap:6px; margin:4px 0;">
+        Dash
+        <select id="sty-dash" style="flex:1; padding:2px;">
+          <option value="">solid</option>
+          <option value="3 2">dashed</option>
+          <option value="1 1.5">dotted</option>
+        </select>
+      </label>
+      <div style="display:flex; gap:4px; margin-top:6px;">
+        <button id="btn-apply-style" title="Apply to highlighted parts">apply</button>
+        <button id="btn-reset-style" title="Clear style for highlighted parts">reset</button>
+        <button id="btn-reset-all-style" title="Clear all style overrides for this source">reset all</button>
+      </div>
+    </div>
 
     <h2>Callouts</h2>
     <p style="font-size: 11px; color: var(--muted);">
@@ -1409,10 +1477,171 @@ $('lay-2d').addEventListener('click', () => setLayout('2d'));
 $('lay-split').addEventListener('click', () => setLayout('split'));
 $('lay-3d').addEventListener('click', () => setLayout('3d'));
 
+// --- Saved views --------------------------------------------------------
+// Per-source list of {{name, eye, target, up_axis}} kept in localStorage so
+// the camera angles a user has dialled in survive reloads.  No server
+// involvement -- recall just snaps the 3D camera + Up: dropdown.
+
+function _savedViewsKey(fid) {{ return 'savedViews_' + fid; }}
+function loadSavedViews(fid) {{
+  try {{
+    return JSON.parse(localStorage.getItem(_savedViewsKey(fid)) || '[]');
+  }} catch (_e) {{ return []; }}
+}}
+function persistSavedViews(fid, list) {{
+  localStorage.setItem(_savedViewsKey(fid), JSON.stringify(list));
+}}
+function refreshSavedViews() {{
+  const ul = $('saved-views');
+  ul.innerHTML = '';
+  const list = loadSavedViews(fileSel.value);
+  if (!list.length) {{
+    ul.innerHTML = '<li style="color:var(--muted); font-style:italic;">' +
+                   'none yet — orbit the 3D, then click save</li>';
+    return;
+  }}
+  list.forEach((v, i) => {{
+    const li = document.createElement('li');
+    const name = document.createElement('span');
+    name.className = 'name';
+    name.textContent = v.name;
+    name.title = 'click to recall';
+    name.addEventListener('click', () => recallSavedView(v));
+    const del = document.createElement('button');
+    del.textContent = '×';
+    del.title = 'delete';
+    del.addEventListener('click', (e) => {{
+      e.stopPropagation();
+      const cur = loadSavedViews(fileSel.value);
+      cur.splice(i, 1);
+      persistSavedViews(fileSel.value, cur);
+      refreshSavedViews();
+    }});
+    li.appendChild(name); li.appendChild(del);
+    ul.appendChild(li);
+  }});
+}}
+function recallSavedView(v) {{
+  // Make sure 3D is visible so OrbitControls can move
+  if (!is3DCurrentlyShown()) setLayout('split');
+  // Apply Up: rotation if different
+  if (v.up_axis && upAxisSel.value !== v.up_axis) {{
+    upAxisSel.value = v.up_axis;
+    upAxisSel.dispatchEvent(new Event('change'));
+  }}
+  window.IFU_VIEWER?.snapCameraTo?.(v.eye, v.target);
+}}
+function is3DCurrentlyShown() {{
+  return document.body.classList.contains('layout-split')
+      || document.body.classList.contains('layout-3d');
+}}
+$('btn-save-view').addEventListener('click', () => {{
+  const nameInput = $('view-name');
+  const name = (nameInput.value || '').trim();
+  if (!name) {{ nameInput.focus(); return; }}
+  const cam = window.IFU_VIEWER?.getCameraEyeTarget?.();
+  if (!cam) {{ alert('Open the 3D pane first.'); return; }}
+  const entry = {{
+    name,
+    eye:    cam.eye,
+    target: cam.target,
+    up_axis: upAxisSel.value,
+  }};
+  const cur = loadSavedViews(fileSel.value);
+  // Replace any same-named entry
+  const existing = cur.findIndex(v => v.name === name);
+  if (existing >= 0) cur[existing] = entry;
+  else cur.push(entry);
+  persistSavedViews(fileSel.value, cur);
+  nameInput.value = '';
+  refreshSavedViews();
+}});
+fileSel.addEventListener('change', refreshSavedViews);
+
+// --- Per-part styling ---------------------------------------------------
+// Per-source dict of part_idx -> {{stroke, width, opacity, dash}}
+// Persisted in localStorage, rebuilt into a <style> tag on every refresh
+// so the rules apply to live + baked SVGs alike.
+
+function _styleKey(fid) {{ return 'partStyles_' + fid; }}
+function loadPartStyles(fid) {{
+  try {{
+    return JSON.parse(localStorage.getItem(_styleKey(fid)) || '{{}}');
+  }} catch (_e) {{ return {{}}; }}
+}}
+function persistPartStyles(fid, m) {{
+  localStorage.setItem(_styleKey(fid), JSON.stringify(m));
+}}
+function applyStyleSheet() {{
+  const fid = fileSel.value;
+  const m = loadPartStyles(fid);
+  let css = '';
+  for (const [idx, st] of Object.entries(m)) {{
+    const sel = `.svg-pane[data-file="${{fid}}"] svg .part.part-${{String(idx).padStart(3, '0')}} path`;
+    const rules = [];
+    if (st.stroke)  rules.push(`stroke: ${{st.stroke}}`);
+    if (st.width != null)  rules.push(`stroke-width: ${{st.width}}`);
+    if (st.opacity != null) rules.push(`opacity: ${{st.opacity}}`);
+    if (st.dash)    rules.push(`stroke-dasharray: ${{st.dash}}`);
+    if (rules.length) {{
+      css += `${{sel}} {{ ${{rules.join('; ')}} !important; }}\n`;
+    }}
+  }}
+  let styleEl = document.getElementById('per-part-styles');
+  if (!styleEl) {{
+    styleEl = document.createElement('style');
+    styleEl.id = 'per-part-styles';
+    document.head.appendChild(styleEl);
+  }}
+  styleEl.textContent = css;
+  // Push to 3D pane too
+  window.IFU_VIEWER?.applyPartStyles3D?.(m);
+}}
+
+$('sty-width').addEventListener('input', (e) => {{
+  $('sty-width-val').textContent = parseFloat(e.target.value).toFixed(1);
+}});
+$('sty-opacity').addEventListener('input', (e) => {{
+  $('sty-opacity-val').textContent = parseFloat(e.target.value).toFixed(2);
+}});
+$('btn-apply-style').addEventListener('click', () => {{
+  const st = getState(fileSel.value, viewSel.value);
+  if (!st.highlights || !st.highlights.size) {{
+    alert('Select one or more parts first.');
+    return;
+  }}
+  const style = {{
+    stroke:  $('sty-stroke').value,
+    width:   parseFloat($('sty-width').value),
+    opacity: parseFloat($('sty-opacity').value),
+    dash:    $('sty-dash').value || null,
+  }};
+  const m = loadPartStyles(fileSel.value);
+  for (const idx of st.highlights) m[idx] = style;
+  persistPartStyles(fileSel.value, m);
+  applyStyleSheet();
+}});
+$('btn-reset-style').addEventListener('click', () => {{
+  const st = getState(fileSel.value, viewSel.value);
+  if (!st.highlights || !st.highlights.size) return;
+  const m = loadPartStyles(fileSel.value);
+  for (const idx of st.highlights) delete m[idx];
+  persistPartStyles(fileSel.value, m);
+  applyStyleSheet();
+}});
+$('btn-reset-all-style').addEventListener('click', () => {{
+  if (!confirm('Clear ALL part style overrides for this source?')) return;
+  persistPartStyles(fileSel.value, {{}});
+  applyStyleSheet();
+}});
+fileSel.addEventListener('change', applyStyleSheet);
+
 // init
 setMode('smart');
 refreshPane();
 refreshTree();
+refreshSavedViews();
+applyStyleSheet();
 loadUpAxisFor(fileSel.value);  // restore per-source up-axis on load
 setLayout('2d');
 </script>
@@ -1818,6 +2047,83 @@ window.IFU_VIEWER.getCurrentViewDir = () => {{
   return [d.x, d.y, d.z];
 }};
 
+// Camera position + target as world-space tuples.  Used by the saved-views
+// feature to capture and recall exact viewpoints (no view_dir conversion).
+window.IFU_VIEWER.getCameraEyeTarget = () => {{
+  if (!camera || !controls) return null;
+  return {{
+    eye:    [camera.position.x, camera.position.y, camera.position.z],
+    target: [controls.target.x,  controls.target.y,  controls.target.z],
+  }};
+}};
+
+window.IFU_VIEWER.snapCameraTo = (eye, target) => {{
+  if (!camera || !controls) return;
+  camera.position.set(eye[0], eye[1], eye[2]);
+  controls.target.set(target[0], target[1], target[2]);
+  camera.lookAt(controls.target);
+  // Re-fit the ortho frustum to the new direction WITHOUT moving the
+  // camera back to the framed default.  We just want the bounds redone.
+  if (active && camera.isOrthographicCamera) {{
+    const bbox = new THREE.Box3().setFromObject(active);
+    camera.updateMatrixWorld();
+    let minX = +Infinity, maxX = -Infinity,
+        minY = +Infinity, maxY = -Infinity;
+    const cs = [bbox.min, bbox.max];
+    for (const cx of [cs[0].x, cs[1].x])
+      for (const cy of [cs[0].y, cs[1].y])
+        for (const cz of [cs[0].z, cs[1].z]) {{
+          const p = new THREE.Vector3(cx, cy, cz)
+            .applyMatrix4(camera.matrixWorldInverse);
+          if (p.x < minX) minX = p.x;
+          if (p.x > maxX) maxX = p.x;
+          if (p.y < minY) minY = p.y;
+          if (p.y > maxY) maxY = p.y;
+        }}
+    const padX = (maxX - minX) * 0.05;
+    const padY = (maxY - minY) * 0.05;
+    let l = minX - padX, r = maxX + padX,
+        t = maxY + padY, bm = minY - padY;
+    const rect = canvas.getBoundingClientRect();
+    const aspect = (rect.width || 1) / (rect.height || 1);
+    const w = r - l, h = t - bm;
+    if (w / h > aspect) {{
+      const wantH = w / aspect, extra = (wantH - h) / 2;
+      t += extra; bm -= extra;
+    }} else {{
+      const wantW = h * aspect, extra = (wantW - w) / 2;
+      l -= extra; r += extra;
+    }}
+    camera.left = l; camera.right = r;
+    camera.top  = t; camera.bottom = bm;
+    camera.updateProjectionMatrix();
+  }}
+  controls.update();
+}};
+
+// Per-part 3D styling: colour, opacity per part_idx.  Each idx maps to an
+// optional override; meshes with no entry stay at the default.
+window.IFU_VIEWER.applyPartStyles3D = (stylesByIdx) => {{
+  if (!active) return;
+  active.traverse(o => {{
+    if (!o.isMesh) return;
+    const idx = _partIdxOf(o);
+    if (idx == null) return;
+    const st = stylesByIdx[idx];
+    if (st) {{
+      const hex = (st.stroke || '#00836a').replace('#', '');
+      const n = parseInt(hex, 16);
+      o.material.color.setHex(isNaN(n) ? 0x00836a : n);
+      o.material.opacity = (st.opacity != null) ? st.opacity : 1.0;
+      o.material.transparent = (o.material.opacity < 1.0);
+    }} else {{
+      o.material.color.setHex(0xe8e8ea);
+      o.material.opacity = 1.0;
+      o.material.transparent = false;
+    }}
+  }});
+}};
+
 // --- Generate-from-3D: button in the 3D toolbar -----------------------------
 // Calls the local server's /api/render with the current camera direction,
 // then injects the returned SVG as a special "live" view in the 2D pane.
@@ -1845,7 +2151,7 @@ async function probeServer() {{
 async function generateLiveSVG() {{
   if (!camera || !controls) return;
   const fid = window.IFU_VIEWER.getActiveFileId();
-  // Send the camera as {eye, target} -- two explicit world-space points.
+  // Send the camera as {{eye, target}} -- two explicit world-space points.
   // Unambiguous: HLR sets up its projection from the exact same camera
   // OrbitControls is currently driving.  No view_dir sign convention,
   // no separate focal arg, no chance of meaning the opposite side.
