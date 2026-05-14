@@ -1273,6 +1273,12 @@ function init() {{
 
 function handleCanvasClick(e) {{
   if (!active || !camera) return;
+  // Flush matrices so any pending up-axis rotation is propagated to every
+  // descendant before the raycaster transforms its ray into local space.
+  // The render loop does this every frame, but the click can land between
+  // a rotation and the next frame; without an explicit flush the raycaster
+  // sees stale transforms and misses every mesh.
+  scene.updateMatrixWorld(true);
   const rect = canvas.getBoundingClientRect();
   const ndc = new THREE.Vector2(
     ((e.clientX - rect.left) / rect.width) * 2 - 1,
@@ -1280,10 +1286,10 @@ function handleCanvasClick(e) {{
   );
   const raycaster = new THREE.Raycaster();
   raycaster.setFromCamera(ndc, camera);
-  // only intersect actual meshes, not the LineSegments we attach for edges
-  const meshes = [];
-  active.traverse(o => {{ if (o.isMesh) meshes.push(o); }});
-  const hits = raycaster.intersectObjects(meshes, false);
+  // Recurse into descendants and keep only Mesh hits (skip the LineSegments
+  // we attach for crease edges).
+  const hits = raycaster.intersectObjects([active], true)
+    .filter(h => h.object && h.object.isMesh);
   if (hits.length === 0) {{
     if (!e.ctrlKey && !e.metaKey) window.IFU_VIEWER?.clearHighlights?.();
     return;
