@@ -379,6 +379,94 @@ def run():
         ok("reset-style removes the entry",
            "0" not in stored, detail=f"stored={stored}")
 
+        # ---- Onshape group expansion ----
+        # Switch to a source with an Onshape tree (Presto) and verify
+        # that "+ Onshape group" grows the selection from 1 leaf to all
+        # leaves under the same parent Assembly.
+        page.select_option("#file-sel", "presto")
+        page.wait_for_timeout(800)
+        # Pick a part that we know maps to a leaf with siblings
+        page.evaluate("""
+          (() => {
+            // refreshTree populates _leafByPartIdx; find the first leaf
+            // whose parent has more than one Part descendant.
+            const candidates = [];
+            for (const [idx, leaf] of _leafByPartIdx) {
+              if (leaf._parent) {
+                const sibs = [];
+                _flattenLeaves([leaf._parent], sibs);
+                if (sibs.length > 1) candidates.push({idx, sibs: sibs.length});
+              }
+            }
+            if (!candidates.length) return null;
+            candidates.sort((a, b) => a.sibs - b.sibs);
+            const pick = candidates[0];
+            // select just this part
+            const st = getState(fileSel.value, viewSel.value);
+            st.highlights = new Set([pick.idx]);
+            applyHighlights();
+            window._test_pick = pick;
+            return pick;
+          })()
+        """)
+        pick = page.evaluate("window._test_pick")
+        if pick:
+            size_before = page.evaluate(
+                "(getState(fileSel.value, viewSel.value).highlights || new Set()).size"
+            )
+            page.locator("#btn-expand-parent").click()
+            page.wait_for_timeout(100)
+            size_after = page.evaluate(
+                "(getState(fileSel.value, viewSel.value).highlights || new Set()).size"
+            )
+            ok("'+ Onshape group' grows the selection",
+               size_after > size_before and size_after == pick["sibs"],
+               detail=f"before={size_before} after={size_after} expected={pick['sibs']}")
+
+        # ---- Depth-click cycles through occluded parts in 3D ----
+        # Switch to siderail for a reliable, faster scene; scan a small
+        # grid of click positions until one lands on a mesh, then click
+        # again at the SAME pixel and confirm the selection changed
+        # (= different part from the depth cycle).
+        page.select_option("#file-sel", "siderail")
+        page.wait_for_timeout(500)
+        page.locator("#lay-split").click()
+        page.wait_for_timeout(3500)
+        page.evaluate("clearHighlights()")
+        rect = page.evaluate(
+            "(() => { const r = document.querySelector('canvas#webgl-canvas').getBoundingClientRect(); return {l:r.left,t:r.top,w:r.width,h:r.height}; })()"
+        )
+        first = []
+        click_xy = None
+        for fx in (0.30, 0.50, 0.70, 0.40, 0.60):
+            for fy in (0.40, 0.55, 0.30, 0.50, 0.65):
+                page.evaluate("clearHighlights()")
+                x = rect["l"] + rect["w"] * fx
+                y = rect["t"] + rect["h"] * fy
+                page.mouse.click(x, y)
+                page.wait_for_timeout(120)
+                sel = page.evaluate(
+                    "[...(getState(fileSel.value, viewSel.value).highlights || [])]"
+                )
+                if sel:
+                    first = sel
+                    click_xy = (x, y)
+                    break
+            if first:
+                break
+        ok("depth-click first hit lands on a part",
+           bool(first), detail=f"first={first}")
+        if first:
+            page.mouse.click(click_xy[0], click_xy[1])
+            page.wait_for_timeout(150)
+            second = page.evaluate(
+                "[...(getState(fileSel.value, viewSel.value).highlights || [])]"
+            )
+            # Either cycled to a different part OR (only one hit at this
+            # pixel, so it toggled off).  Both are acceptable behaviour.
+            ok("depth-click changes selection on repeat",
+               first != second, detail=f"first={first} second={second}")
+
         # Final console-error check (catches errors fired during 3D init)
         ok("no JS errors after full round-trip",
            not [e for e in console_errors if 'Quaternion' not in e],

@@ -731,10 +731,14 @@ HTML_TEMPLATE = r"""<!doctype html>
           <option value="1 1.5">dotted</option>
         </select>
       </label>
-      <div style="display:flex; gap:4px; margin-top:6px;">
+      <div style="display:flex; gap:4px; margin-top:6px; flex-wrap:wrap;">
         <button id="btn-apply-style" title="Apply to highlighted parts">apply</button>
         <button id="btn-reset-style" title="Clear style for highlighted parts">reset</button>
         <button id="btn-reset-all-style" title="Clear all style overrides for this source">reset all</button>
+      </div>
+      <div style="display:flex; gap:4px; margin-top:8px; flex-wrap:wrap;">
+        <button id="btn-expand-parent" title="Add all siblings under the same Onshape Assembly to the selection">+ Onshape group</button>
+        <button id="btn-cycle-deeper" title="In 3D mode, next click at the same pixel goes one layer deeper">depth-click ↻</button>
       </div>
     </div>
 
@@ -1271,11 +1275,22 @@ const treeStatus = $('tree-status');
 let _tree_id_counter = 0;
 let _tree_idmap = {{}};        // tree-node-id -> tree-node-object
 let _tree_to_part_idx = {{}};  // tree-node-id -> solid idx (or null)
+let _leafByPartIdx = new Map(); // solid idx -> leaf tree node (for grouping)
 
 function _flattenLeaves(nodes, out) {{
   for (const n of nodes || []) {{
     if (n.type === 'Part') out.push(n);
     else if (n.children && n.children.length) _flattenLeaves(n.children, out);
+  }}
+}}
+
+// Stamp every tree node with a back-pointer to its parent so the
+// "expand to parent group" operation can walk upward without recursing
+// the whole tree per call.
+function _annotateParents(nodes, parent) {{
+  for (const n of nodes || []) {{
+    n._parent = parent || null;
+    if (n.children && n.children.length) _annotateParents(n.children, n);
   }}
 }}
 
@@ -1289,13 +1304,19 @@ function refreshTree() {{
     treeStatus.textContent = 'No tree for this source.';
     return;
   }}
-  // positional leaf->solid map
+  // positional leaf->solid map + parent-back-pointers
+  _annotateParents(tree, null);
   const leaves = [];
   _flattenLeaves(tree, leaves);
   const partsById = new Map(fe.parts.map(p => [p.idx, p]));
   leaves.forEach((leaf, i) => {{
     leaf._mapped_idx = (i < fe.parts.length) ? fe.parts[i].idx : null;
   }});
+  // Reverse map: solid idx -> tree node (used by "+ Onshape group")
+  _leafByPartIdx = new Map();
+  for (const leaf of leaves) {{
+    if (leaf._mapped_idx != null) _leafByPartIdx.set(leaf._mapped_idx, leaf);
+  }}
   treeStatus.textContent = `${{leaves.length}} part instances, mapped to ` +
     `${{Math.min(leaves.length, fe.parts.length)}} solids (positional).`;
 
@@ -1636,6 +1657,50 @@ $('btn-reset-all-style').addEventListener('click', () => {{
 }});
 fileSel.addEventListener('change', applyStyleSheet);
 
+// Expand the current selection to every leaf-Part under the same
+// Onshape Assembly.  For each highlighted body, walk up to its parent
+// node, then take every Part descendant of that parent (= the
+// "sub-assembly" the body belongs to).  Falls back to a no-op when the
+// source has no Onshape tree.
+$('btn-expand-parent').addEventListener('click', () => {{
+  const st = getState(fileSel.value, viewSel.value);
+  if (!st.highlights || !st.highlights.size) {{
+    alert('Highlight at least one body first.');
+    return;
+  }}
+  if (!_leafByPartIdx.size) {{
+    alert("This source has no Onshape tree, so grouping by Onshape Assembly is not available here.");
+    return;
+  }}
+  const before = st.highlights.size;
+  const newSel = new Set(st.highlights);
+  for (const idx of st.highlights) {{
+    const leaf = _leafByPartIdx.get(idx);
+    if (!leaf || !leaf._parent) continue;
+    // gather every Part descendant of the parent assembly
+    const siblings = [];
+    _flattenLeaves([leaf._parent], siblings);
+    for (const s of siblings) {{
+      if (s._mapped_idx != null) newSel.add(s._mapped_idx);
+    }}
+  }}
+  st.highlights = newSel;
+  applyHighlights();
+  console.log(`[expand] selection ${{before}} -> ${{newSel.size}}`);
+}});
+
+// Reset the depth-click cycle (the 3D handler also bumps it forward).
+// Useful when the user wants to "start over" at a given pixel without
+// having to move the mouse meaningfully far.
+$('btn-cycle-deeper').addEventListener('click', () => {{
+  // Just nudge the cycle counter exposed by the module.
+  if (window.IFU_VIEWER?.advanceClickCycle) {{
+    window.IFU_VIEWER.advanceClickCycle();
+  }} else {{
+    alert('Open the 3D pane first.');
+  }}
+}});
+
 // init
 setMode('smart');
 refreshPane();
@@ -1737,13 +1802,13 @@ function init() {{
   animate();
 }}
 
+// Click-through state: repeat-clicking the same pixel cycles through ray
+// intersections so parts hidden behind other parts become selectable.
+let _lastClickPx = null;
+let _lastClickRayCycle = 0;
+
 function handleCanvasClick(e) {{
   if (!active || !camera) return;
-  // Flush matrices so any pending up-axis rotation is propagated to every
-  // descendant before the raycaster transforms its ray into local space.
-  // The render loop does this every frame, but the click can land between
-  // a rotation and the next frame; without an explicit flush the raycaster
-  // sees stale transforms and misses every mesh.
   scene.updateMatrixWorld(true);
   const rect = canvas.getBoundingClientRect();
   const ndc = new THREE.Vector2(
@@ -1752,15 +1817,36 @@ function handleCanvasClick(e) {{
   );
   const raycaster = new THREE.Raycaster();
   raycaster.setFromCamera(ndc, camera);
-  // Recurse into descendants and keep only Mesh hits (skip the LineSegments
-  // we attach for crease edges).
-  const hits = raycaster.intersectObjects([active], true)
+  // Get ALL mesh hits, sorted by depth (closest first by default).
+  // Then drop adjacent duplicates from the same part so cycling steps
+  // through DIFFERENT parts, not different faces of the same part.
+  const rawHits = raycaster.intersectObjects([active], true)
     .filter(h => h.object && h.object.isMesh);
+  const hits = [];
+  let lastIdx = null;
+  for (const h of rawHits) {{
+    const i = _partIdxOf(h.object);
+    if (i !== lastIdx) {{ hits.push({{ ...h, _partIdx: i }}); lastIdx = i; }}
+  }}
+
+  // If this click is at (essentially) the same pixel as the last,
+  // advance to the next-deepest hit.  Otherwise reset the cycle.
+  const pxNow = [e.clientX, e.clientY];
+  const samePx = _lastClickPx &&
+    Math.abs(pxNow[0] - _lastClickPx[0]) < 4 &&
+    Math.abs(pxNow[1] - _lastClickPx[1]) < 4;
+  if (!samePx) _lastClickRayCycle = 0;
+  _lastClickPx = pxNow;
+
   if (hits.length === 0) {{
     if (!e.ctrlKey && !e.metaKey) window.IFU_VIEWER?.clearHighlights?.();
     return;
   }}
-  const idx = _partIdxOf(hits[0].object);
+
+  // Pick the hit at the current cycle position (modulo for wrap-around)
+  const hit = hits[_lastClickRayCycle % hits.length];
+  if (samePx) _lastClickRayCycle++;     // next click goes deeper
+  const idx = hit._partIdx;
   if (idx != null) {{
     window.IFU_VIEWER.togglePartHighlight(idx, {{
       append: e.ctrlKey || e.metaKey,
@@ -2055,6 +2141,14 @@ window.IFU_VIEWER.getCameraEyeTarget = () => {{
     eye:    [camera.position.x, camera.position.y, camera.position.z],
     target: [controls.target.x,  controls.target.y,  controls.target.z],
   }};
+}};
+
+// Manually advance the depth-click cycle.  The classic-side button uses
+// this when the user wants the NEXT pixel-click to drill one layer deeper
+// even though their mouse may have moved slightly.
+window.IFU_VIEWER.advanceClickCycle = () => {{
+  _lastClickRayCycle++;
+  console.log('[depth-click] next click will be layer', _lastClickRayCycle);
 }};
 
 window.IFU_VIEWER.snapCameraTo = (eye, target) => {{
