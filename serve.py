@@ -123,6 +123,17 @@ def render():
         parts = run_hlr_per_solid(shape, view_dir, **hlr_kw)
     except Exception as exc:
         return jsonify({"error": f"HLR failed: {type(exc).__name__}: {exc}"}), 500
+
+    # three.js and OCCT have opposite screen-X conventions (three.js right =
+    # up x view_dir; OCCT screen-X = view_dir x up).  Without correction the
+    # SVG comes back as the horizontal mirror of what the user saw in 3D --
+    # same viewing direction, left and right swapped.  Negate the polyline
+    # X values before writing so the live SVG lines up with the 3D pane.
+    for part in parts:
+        polys = part.get("polys", {})
+        for cat in list(polys.keys()):
+            polys[cat] = [[(-x, y) for (x, y) in pl] for pl in polys[cat]]
+
     out_path = OUT / f"_live_{file_id}.svg"
     write_svg_parts(parts, out_path, precision=1)
     svg = out_path.read_text(encoding="utf-8")
