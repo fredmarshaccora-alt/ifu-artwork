@@ -194,6 +194,124 @@ def export_glb_b64(shape, mesh_defl):
                  "kb": len(glb_bytes) // 1024}
 
 
+def fetch_step_tree(step_path):
+    """Return the STEP product hierarchy as a list-of-dicts shaped like
+    fetch_onshape_tree's output.  Each leaf-Part is assigned a
+    `_solid_idx` by depth-first leaf order so the viewer's positional
+    mapping (i-th leaf <-> i-th cadquery solid) lines up.
+
+    Used as a fallback tree for sources without Onshape doc IDs so the
+    user can still select by sub-assembly rather than by individual body.
+    """
+    try:
+        from OCP.STEPCAFControl import STEPCAFControl_Reader
+        from OCP.TDocStd import TDocStd_Document
+        from OCP.XCAFApp import XCAFApp_Application
+        from OCP.XCAFDoc import XCAFDoc_DocumentTool, XCAFDoc_ShapeTool
+        from OCP.TCollection import TCollection_ExtendedString
+        from OCP.TDF import TDF_LabelSequence, TDF_Label
+        from OCP.TDataStd import TDataStd_Name
+    except Exception as exc:
+        print(f"  STEPCAFControl unavailable: {exc}", flush=True)
+        return None
+
+    app = XCAFApp_Application.GetApplication_s()
+    doc = TDocStd_Document(TCollection_ExtendedString("XmlOcaf"))
+    app.NewDocument(TCollection_ExtendedString("XmlOcaf"), doc)
+    reader = STEPCAFControl_Reader()
+    reader.SetNameMode(True)
+    status = reader.ReadFile(str(step_path))
+    if int(status) != 1:   # IFSelect_RetDone
+        print(f"  STEPCAFControl ReadFile failed: status={int(status)}",
+              flush=True)
+        return None
+    try:
+        reader.Transfer(doc)
+    except Exception as exc:
+        print(f"  STEPCAFControl Transfer failed: {exc}", flush=True)
+        return None
+
+    stool = XCAFDoc_DocumentTool.ShapeTool_s(doc.Main())
+
+    def name_of(label):
+        n = TDataStd_Name()
+        if label.FindAttribute(TDataStd_Name.GetID_s(), n):
+            try:
+                return str(n.Get().ToExtString())
+            except Exception:
+                return "?"
+        return ""
+
+    # NAUO* and similar component-instance names are auto-generated and
+    # usually not useful; prefer the referred shape's name.
+    def looks_auto(nm):
+        if not nm:
+            return True
+        if nm.startswith("NAUO") or nm.startswith("SHAPE"):
+            return True
+        return False
+
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_SOLID
+
+    def count_solids_in(shape):
+        if shape is None or shape.IsNull():
+            return 0
+        n = 0
+        exp = TopExp_Explorer(shape, TopAbs_SOLID)
+        while exp.More():
+            n += 1
+            exp.Next()
+        return n
+
+    def walk(label, counter):
+        target = label
+        is_ref = XCAFDoc_ShapeTool.IsReference_s(label)
+        if is_ref:
+            ref = TDF_Label()
+            if XCAFDoc_ShapeTool.GetReferredShape_s(label, ref):
+                target = ref
+        comp_nm = name_of(label) if is_ref else ""
+        tgt_nm = name_of(target)
+        nm = tgt_nm if tgt_nm else (comp_nm if not looks_auto(comp_nm) else "?")
+
+        is_asm = XCAFDoc_ShapeTool.IsAssembly_s(target)
+        if is_asm:
+            children_seq = TDF_LabelSequence()
+            XCAFDoc_ShapeTool.GetComponents_s(target, children_seq, False)
+            kids = []
+            for i in range(1, children_seq.Length() + 1):
+                kids.append(walk(children_seq.Value(i), counter))
+            return {"name": nm, "type": "Assembly",
+                    "part_id": "", "children": kids}
+
+        # Leaf - count how many solids this Part contains; some Onshape
+        # "Parts" have multiple bodies which the STEP exporter splits
+        # into multiple TopoDS_Solid entries.  Reserve a CONTIGUOUS range
+        # of solid indices so the per-Part selection lights up all bodies.
+        try:
+            shape = XCAFDoc_ShapeTool.GetShape_s(target)
+            n = count_solids_in(shape) or 1
+        except Exception:
+            n = 1
+        start = counter[0]
+        counter[0] += n
+        indices = list(range(start, start + n))
+        return {"name": nm, "type": "Part",
+                "part_id": f"step_{start}", "children": [],
+                "_solid_indices": indices}
+
+    free = TDF_LabelSequence()
+    stool.GetFreeShapes(free)
+    counter = [0]
+    nodes = []
+    for i in range(1, free.Length() + 1):
+        nodes.append(walk(free.Value(i), counter))
+    print(f"  STEP tree: {counter[0]} leaf parts via STEPCAFControl_Reader",
+          flush=True)
+    return nodes
+
+
 def fetch_onshape_tree(ids):
     """Pull the assembly instance tree from Onshape.
 
@@ -290,13 +408,23 @@ def generate_svgs():
               f"tris={glb_info['tris']}  size={glb_info['kb']}KB  "
               f"({time.time()-t_glb:.1f}s)", flush=True)
 
-        # Onshape feature tree (optional).
+        # Hierarchy tree: Onshape API first (richer metadata), then fall
+        # back to STEPCAFControl_Reader if Onshape IDs aren't configured
+        # for this source.  Either way the viewer renders the same
+        # collapsible tree in the left sidebar and keys selection by
+        # leaf order, so the user can pick whole sub-assemblies.
         tree = None
         if onshape_ids is not None:
             t_tree = time.time()
             tree = fetch_onshape_tree(onshape_ids)
             if tree is not None:
                 print(f"  onshape tree: {_count_tree(tree)} nodes "
+                      f"({time.time()-t_tree:.1f}s)", flush=True)
+        if tree is None:
+            t_tree = time.time()
+            tree = fetch_step_tree(sp)
+            if tree is not None:
+                print(f"  STEP tree: {_count_tree(tree)} nodes "
                       f"({time.time()-t_tree:.1f}s)", flush=True)
 
         file_entry = {
@@ -1421,21 +1549,40 @@ function refreshTree() {{
     treeStatus.textContent = 'No tree for this source.';
     return;
   }}
-  // positional leaf->solid map + parent-back-pointers
+  // positional leaf->solid map + parent-back-pointers.  Each leaf may
+  // map to MULTIPLE solid indices (multi-body STEP Part); for Onshape
+  // trees the API gives us one idx per leaf, but for STEP trees the
+  // server pre-computes _solid_indices as a contiguous range.
   _annotateParents(tree, null);
   const leaves = [];
   _flattenLeaves(tree, leaves);
-  const partsById = new Map(fe.parts.map(p => [p.idx, p]));
+  let cursor = 0;
   leaves.forEach((leaf, i) => {{
-    leaf._mapped_idx = (i < fe.parts.length) ? fe.parts[i].idx : null;
+    if (Array.isArray(leaf._solid_indices) && leaf._solid_indices.length) {{
+      // STEP-tree leaf: server already attached the index range
+      leaf._mapped_idx = leaf._solid_indices[0];
+    }} else if (i < fe.parts.length) {{
+      leaf._mapped_idx = fe.parts[i].idx;
+      leaf._solid_indices = [leaf._mapped_idx];
+      cursor = i + 1;
+    }} else {{
+      leaf._mapped_idx = null;
+      leaf._solid_indices = [];
+    }}
   }});
-  // Reverse map: solid idx -> tree node (used by "+ Onshape group")
+  // Reverse map: any solid idx -> tree node (so 3D click can find its
+  // sub-assembly).  Each idx in _solid_indices points back to the leaf.
   _leafByPartIdx = new Map();
   for (const leaf of leaves) {{
-    if (leaf._mapped_idx != null) _leafByPartIdx.set(leaf._mapped_idx, leaf);
+    for (const idx of (leaf._solid_indices || [])) {{
+      _leafByPartIdx.set(idx, leaf);
+    }}
   }}
-  treeStatus.textContent = `${{leaves.length}} part instances, mapped to ` +
-    `${{Math.min(leaves.length, fe.parts.length)}} solids (positional).`;
+  const totalBodies = leaves.reduce(
+    (s, l) => s + (l._solid_indices ? l._solid_indices.length : 0), 0);
+  treeStatus.textContent =
+    `${{leaves.length}} part instances, ${{totalBodies}} bodies. ` +
+    `Click an Assembly to select everything under it.`;
 
   function buildNode(n) {{
     const id = String(++_tree_id_counter);
@@ -1472,9 +1619,30 @@ function refreshTree() {{
       }});
     }}
     row.addEventListener('click', (ev) => {{
-      const idx = _tree_to_part_idx[id];
-      if (idx == null) return;
-      togglePartHighlight(idx, {{append: ev.ctrlKey || ev.metaKey}});
+      const node = _tree_idmap[id];
+      const append = ev.ctrlKey || ev.metaKey;
+      if (!node) return;
+      // Gather all the solid indices this row represents.  Part leaves
+      // can have multiple solids (multi-body STEP Part); Assemblies pull
+      // in every leaf descendant's full index range.
+      let indices = [];
+      if (node.type === 'Part') {{
+        indices = (node._solid_indices && node._solid_indices.length)
+          ? node._solid_indices.slice()
+          : (_tree_to_part_idx[id] != null ? [_tree_to_part_idx[id]] : []);
+      }} else {{
+        const leaves = [];
+        _flattenLeaves([node], leaves);
+        for (const l of leaves) {{
+          for (const i of (l._solid_indices || [])) indices.push(i);
+        }}
+      }}
+      if (!indices.length) return;
+      const st = getState(fileSel.value, viewSel.value);
+      if (!st.highlights) st.highlights = new Set();
+      if (!append) st.highlights.clear();
+      indices.forEach(i => st.highlights.add(i));
+      applyHighlights();
     }});
     return li;
   }}
@@ -1794,11 +1962,12 @@ $('btn-expand-parent').addEventListener('click', () => {{
   for (const idx of st.highlights) {{
     const leaf = _leafByPartIdx.get(idx);
     if (!leaf || !leaf._parent) continue;
-    // gather every Part descendant of the parent assembly
+    // Gather every leaf-Part descendant of the parent assembly, then
+    // every solid index those leaves represent (multi-body friendly).
     const siblings = [];
     _flattenLeaves([leaf._parent], siblings);
     for (const s of siblings) {{
-      if (s._mapped_idx != null) newSel.add(s._mapped_idx);
+      for (const i of (s._solid_indices || [])) newSel.add(i);
     }}
   }}
   st.highlights = newSel;
