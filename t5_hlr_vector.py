@@ -329,9 +329,12 @@ def run_hlr_per_solid(shape, view_dir, focal=(0, 0, 0),
             if progress and (idx + 1) % 50 == 0:
                 print(f"    ...{idx + 1}/{len(solids)}  "
                       f"({time.time()-t1:.1f}s extract)", flush=True)
+        n_total, n_kept, n_degen = _dedup_polylines_in_place(parts)
         if progress:
             print(f"  per-solid extract done {time.time()-t1:.1f}s  "
-                  f"({len(parts)} parts with edges)", flush=True)
+                  f"({len(parts)} parts with edges; "
+                  f"deduped {n_total}->{n_kept}, dropped {n_degen} degenerate)",
+                  flush=True)
         return parts
 
     # exact Algo: per-shape selector returns nothing when compound was added.
@@ -357,10 +360,59 @@ def run_hlr_per_solid(shape, view_dir, focal=(0, 0, 0),
     t2 = time.time()
     solid_bboxes_2d = _project_solid_bboxes(solids, x_axis, y_axis, focal_pt)
     parts = _tag_by_bbox(all_polys, solid_bboxes_2d)
+    nT, nK, nD = _dedup_polylines_in_place(parts)
     if progress:
         print(f"  bbox-tagged {n_total} polylines into {len(parts)} parts "
-              f"in {time.time()-t2:.1f}s", flush=True)
+              f"in {time.time()-t2:.1f}s (deduped {nT}->{nK}, "
+              f"dropped {nD} degenerate)", flush=True)
     return parts
+
+
+def _dedup_polylines_in_place(parts, precision=1):
+    """Remove duplicate polylines (across all parts) and drop degenerate ones.
+
+    HLR on a multi-solid compound returns shared edges once per neighbouring
+    solid -- so the same outline edge between two adjacent panels appears in
+    both solids' extracted polyline lists.  Without dedup the SVG draws each
+    shared edge 2x, 6x, even 10x on top of itself.  Effects: bloated file
+    size, dark overdraw artifacts on edges that should be hairline (the
+    "big circle" in dense viewports), and slower interactive pan/zoom.
+
+    Dedup key is the rounded coordinate sequence so floating-point jitter
+    between extractions doesn't defeat the comparison.  Within-part order
+    is preserved.
+    """
+    seen = set()
+    n_total = 0
+    n_kept = 0
+    n_degen = 0
+    for part in parts:
+        for cat in list(part.get("polys", {}).keys()):
+            pls = part["polys"][cat]
+            n_total += len(pls)
+            kept = []
+            for pl in pls:
+                # drop degenerate (0 or 1 distinct points)
+                if len(pl) < 2:
+                    n_degen += 1
+                    continue
+                rounded = tuple(
+                    (round(x, precision), round(y, precision)) for x, y in pl
+                )
+                if len(set(rounded)) < 2:
+                    n_degen += 1
+                    continue
+                # canonicalise: same polyline traversed in reverse counts as same
+                key_fwd = rounded
+                key_rev = rounded[::-1]
+                key = min(key_fwd, key_rev)
+                if key in seen:
+                    continue
+                seen.add(key)
+                kept.append(pl)
+            part["polys"][cat] = kept
+            n_kept += len(kept)
+    return n_total, n_kept, n_degen
 
 
 def _project_solid_bboxes(solids, x_axis, y_axis, focal_pt):
