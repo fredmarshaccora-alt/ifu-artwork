@@ -427,11 +427,37 @@ HTML_TEMPLATE = r"""<!doctype html>
                                    border-radius: 3px; cursor: pointer; }}
   header button.active {{ background: var(--accora-teal); color: white;
                           border-color: var(--accora-teal); }}
-  main {{ display: grid; grid-template-columns: 240px 1fr 260px;
-           grid-template-areas: "left center right"; overflow: hidden; }}
-  aside.left {{ grid-area: left; }}
+  /* Segmented layout control: 2D | Split | 3D */
+  .seg-ctl {{ display: inline-flex; border: 1px solid var(--line);
+              border-radius: 4px; overflow: hidden; }}
+  .seg-btn {{ font-size: 13px; padding: 4px 12px; border: none;
+              background: white; cursor: pointer; color: var(--muted);
+              border-right: 1px solid var(--line); font-weight: 500; }}
+  .seg-btn:last-child {{ border-right: none; }}
+  .seg-btn:hover {{ background: var(--accora-teal-pale); color: var(--text); }}
+  .seg-btn.active {{ background: var(--accora-teal); color: white; }}
+  /* 3-layout grid: areas reflow when body switches layout-* class */
+  main {{ display: grid; grid-template-rows: 1fr;
+           grid-template-columns: 240px 1fr 260px;
+           grid-template-areas: "left center right"; overflow: hidden;
+           transition: grid-template-columns 0.18s ease; }}
+  aside.left  {{ grid-area: left; }}
   aside.right {{ grid-area: right; }}
-  .canvas-wrap, .webgl-wrap {{ grid-area: center; }}
+  /* 2D-only (default) */
+  body.layout-2d .canvas-wrap {{ grid-area: center; display: block; }}
+  body.layout-2d .webgl-wrap  {{ display: none; }}
+  /* 3D-only */
+  body.layout-3d .webgl-wrap  {{ grid-area: center; display: block; }}
+  body.layout-3d .canvas-wrap {{ display: none; }}
+  /* Split view: a 4-column grid with both panes visible */
+  body.layout-split main {{
+    grid-template-columns: 240px 1fr 1fr 260px;
+    grid-template-areas: "left center2d center3d right";
+  }}
+  body.layout-split .canvas-wrap {{ grid-area: center2d; display: block;
+                                     border-right: 1px solid var(--line); }}
+  body.layout-split .webgl-wrap  {{ grid-area: center3d; display: block; }}
+  /* In any layout the panes themselves are the same */
   aside.left, aside.right {{ background: var(--panel);
                               border-right: 1px solid var(--line);
                               padding: 12px; overflow-y: auto; font-size: 13px; }}
@@ -456,10 +482,7 @@ HTML_TEMPLATE = r"""<!doctype html>
                 background: var(--accora-teal-pale); color: var(--accora-teal);
                 font-size: 11px; font-weight: bold; margin-right: 6px; }}
   .canvas-wrap {{ position: relative; overflow: hidden; background: white; }}
-  .canvas-wrap.hide {{ display: none; }}
-  .webgl-wrap {{ position: relative; overflow: hidden; background: white;
-                  display: none; }}
-  .webgl-wrap.show {{ display: block; }}
+  .webgl-wrap  {{ position: relative; overflow: hidden; background: white; }}
   .webgl-wrap canvas {{ width: 100%; height: 100%; display: block;
                          cursor: grab; }}
   .webgl-wrap canvas.dragging {{ cursor: grabbing; }}
@@ -542,7 +565,12 @@ HTML_TEMPLATE = r"""<!doctype html>
   <button id="btn-detailed">+ smooth</button>
   <button id="btn-hidden">+ hidden</button>
   <span style="flex:1"></span>
-  <button id="btn-3d">3D view-finder</button>
+  <div class="seg-ctl" role="tablist" aria-label="Layout">
+    <button id="lay-2d"    class="seg-btn active" title="2D drawing only">2D</button>
+    <button id="lay-split" class="seg-btn"        title="2D + 3D side-by-side">Split</button>
+    <button id="lay-3d"    class="seg-btn"        title="3D explore only">3D</button>
+  </div>
+  <span style="flex:1"></span>
   <button id="btn-annotate">+ callout</button>
   <button id="btn-clear">clear callouts</button>
   <button id="btn-export">export SVG</button>
@@ -1186,11 +1214,36 @@ window.IFU_VIEWER = {{
 // Tree refresh on source change
 fileSel.addEventListener('change', refreshTree);
 
+// --- Layout (2D / Split / 3D) ----------------------------------------------
+// Three-segment control replacing the old hidden "3D view-finder" toggle.
+// Body class drives the grid (grid-template-areas reflow between layouts);
+// the module script wakes / sleeps three.js based on whether the WebGL
+// pane is currently visible.
+
+const LAYOUTS = ['2d', 'split', '3d'];
+let currentLayout = '2d';
+function setLayout(name) {{
+  if (!LAYOUTS.includes(name)) return;
+  currentLayout = name;
+  document.body.classList.remove('layout-2d', 'layout-split', 'layout-3d');
+  document.body.classList.add('layout-' + name);
+  ['lay-2d', 'lay-split', 'lay-3d'].forEach(id => {{
+    $(id).classList.toggle('active', id === 'lay-' + name);
+  }});
+  // tell three.js to (de)activate
+  const show3d = (name === 'split' || name === '3d');
+  window.IFU_VIEWER?.set3DActive?.(show3d);
+}}
+$('lay-2d').addEventListener('click', () => setLayout('2d'));
+$('lay-split').addEventListener('click', () => setLayout('split'));
+$('lay-3d').addEventListener('click', () => setLayout('3d'));
+
 // init
 setMode('smart');
 refreshPane();
 refreshTree();
 loadUpAxisFor(fileSel.value);  // restore per-source up-axis on load
+setLayout('2d');
 </script>
 
 <script type="module">
@@ -1208,9 +1261,15 @@ import {{ GLTFLoader }} from 'three/addons/loaders/GLTFLoader.js';
 
 const canvas = document.getElementById('webgl-canvas');
 const wrap3d = document.getElementById('webgl-wrap');
-const wrap2d = document.getElementById('canvas-wrap');
-const btn3d = document.getElementById('btn-3d');
 const readout = document.getElementById('viewdir-readout');
+
+// "Is 3D currently visible?" -- driven by the body's layout class so we
+// don't have to query the wrap3d element style (CSS rules with !important
+// can stomp on classList).
+const is3DVisible = () => {{
+  const cl = document.body.classList;
+  return cl.contains('layout-split') || cl.contains('layout-3d');
+}};
 
 let scene, camera, renderer, controls;
 let loaded = new Map();      // file_id -> THREE.Group
@@ -1313,8 +1372,14 @@ function resize() {{
 
 function animate() {{
   requestAnimationFrame(animate);
-  if (!controls || wrap3d.style.display === 'none') return;
+  if (!controls || !is3DVisible()) return;
   controls.update();
+  // Pane width can change when entering Split; keep the renderer in sync.
+  const r = canvas.getBoundingClientRect();
+  if (renderer.domElement.width !== Math.round(r.width * (window.devicePixelRatio || 1)) ||
+      renderer.domElement.height !== Math.round(r.height * (window.devicePixelRatio || 1))) {{
+    resize();
+  }}
   renderer.render(scene, camera);
   updateReadout();
 }}
@@ -1460,24 +1525,22 @@ function applyUpAxisOverride(rot) {{
   frame(active);
 }}
 
-function toggle() {{
-  const showing = wrap3d.classList.contains('show');
-  if (showing) {{
-    wrap3d.classList.remove('show');
-    wrap2d.classList.remove('hide');
-    btn3d.classList.remove('active');
-  }} else {{
-    wrap3d.classList.add('show');
-    wrap2d.classList.add('hide');
-    btn3d.classList.add('active');
-    init();
-    resize();
-    const fid = window.IFU_VIEWER.getActiveFileId();
-    loadSource(fid);
+// Replaces the old toggle button: the classic-script segmented control
+// drives layout, and just tells us whether the WebGL pane is visible.
+function set3DActive(on) {{
+  if (on) {{
+    init();           // idempotent
+    // CSS already showed the canvas; resize after the next reflow so the
+    // renderer matches the new pane width (especially when entering Split).
+    requestAnimationFrame(() => {{
+      resize();
+      const fid = window.IFU_VIEWER.getActiveFileId();
+      loadSource(fid);
+    }});
   }}
+  // When off, no extra work needed -- CSS hides the canvas; we keep the
+  // scene loaded so re-entering doesn't pay the GLB-parse cost again.
 }}
-
-btn3d.addEventListener('click', toggle);
 
 document.getElementById('btn-lock-view').addEventListener('click', () => {{
   const d = camera.position.clone().sub(controls.target).normalize();
@@ -1491,22 +1554,22 @@ document.getElementById('btn-reset-3d').addEventListener('click', () => {{
   if (active) frame(active);
 }});
 
-// Sync with the file picker: switching source in 3D mode swaps the GLB.
+// Sync with the file picker: switching source while 3D is on screen swaps GLB.
 window.IFU_VIEWER.onFileChange(() => {{
-  if (wrap3d.classList.contains('show')) {{
-    loadSource(window.IFU_VIEWER.getActiveFileId());
-  }}
+  if (is3DVisible()) loadSource(window.IFU_VIEWER.getActiveFileId());
 }});
-// Switching view preset in 3D mode snaps the camera to that direction.
+// Switching the 2D view preset snaps the 3D camera to that direction too,
+// so the two panes stay roughly aligned in Split mode.
 window.IFU_VIEWER.onViewChange(() => {{
-  if (wrap3d.classList.contains('show')) snapToPresetView();
+  if (is3DVisible()) snapToPresetView();
 }});
 
-// Expose for the classic script's selection + orientation handlers.
+// Expose for the classic script's selection + orientation + layout handlers.
 window.IFU_VIEWER.applyHighlights3D = applyHighlights3D;
 window.IFU_VIEWER.applyUpAxisOverride = (rot) => {{
   applyUpAxisOverride(rot);
 }};
+window.IFU_VIEWER.set3DActive = set3DActive;
 </script>
 </body>
 </html>

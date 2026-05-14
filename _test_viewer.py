@@ -51,8 +51,12 @@ def run():
            page.locator("#up-axis-sel").count() == 1)
         ok("copy pre_rotate button present",
            page.locator("#btn-copy-orient").count() == 1)
-        ok("3D view-finder button present",
-           page.locator("#btn-3d").count() == 1)
+        ok("layout segmented control present (2D / Split / 3D)",
+           page.locator("#lay-2d").count() == 1
+           and page.locator("#lay-split").count() == 1
+           and page.locator("#lay-3d").count() == 1)
+        ok("2D is the default active layout",
+           page.evaluate("$('lay-2d').classList.contains('active')"))
 
         # ---- Initial state ----
         active_file = page.evaluate("fileSel.value")
@@ -147,13 +151,13 @@ def run():
            "No tree" in tree_status or tree_rows > 0,
            detail=f"status={tree_status!r} rows={tree_rows}")
 
-        # ---- 3D toggle activates webgl-wrap ----
-        page.locator("#btn-3d").click()
+        # ---- Layout segmented control: 3D mode ----
+        page.locator("#lay-3d").click()
         page.wait_for_timeout(200)
-        wrap3d_show = page.evaluate(
-            "document.getElementById('webgl-wrap').classList.contains('show')"
-        )
-        ok("3D button toggles WebGL panel on", wrap3d_show)
+        ok("clicking 3D activates layout-3d on body",
+           page.evaluate("document.body.classList.contains('layout-3d')"))
+        ok("3D segment shows active style",
+           page.evaluate("$('lay-3d').classList.contains('active')"))
 
         # Wait for GLB to load + scene to populate
         page.wait_for_function(
@@ -234,13 +238,27 @@ def run():
         ok("clicking somewhere on visible 3D geometry selects a part",
            hit_found, detail=f"final size={sz}")
 
-        # Toggle off
-        page.locator("#btn-3d").click()
+        # ---- Split layout: both panes visible at once ----
+        page.locator("#lay-split").click()
+        page.wait_for_timeout(200)
+        ok("Split layout activates layout-split on body",
+           page.evaluate("document.body.classList.contains('layout-split')"))
+        ok("Split shows BOTH panes",
+           page.evaluate("""
+             (() => {
+               const c2 = getComputedStyle(document.getElementById('canvas-wrap'));
+               const c3 = getComputedStyle(document.getElementById('webgl-wrap'));
+               return c2.display !== 'none' && c3.display !== 'none';
+             })()
+           """))
+
+        # ---- Back to 2D ----
+        page.locator("#lay-2d").click()
         page.wait_for_timeout(100)
-        wrap3d_show = page.evaluate(
-            "document.getElementById('webgl-wrap').classList.contains('show')"
-        )
-        ok("3D button toggles WebGL panel off again", not wrap3d_show)
+        ok("clicking 2D goes back to layout-2d",
+           page.evaluate("document.body.classList.contains('layout-2d')"))
+        ok("3D pane hidden after returning to 2D",
+           page.evaluate("getComputedStyle(document.getElementById('webgl-wrap')).display === 'none'"))
 
         # Final console-error check (catches errors fired during 3D init)
         ok("no JS errors after full round-trip",
