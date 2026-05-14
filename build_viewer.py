@@ -92,11 +92,17 @@ SOURCES = [
       "eid": "0a03a83f17a3c3550242614b"}),
 ]
 
-# Three good IFU view dirs.  Defined for the bed convention (X=length, Z=up).
+# Per-view 2D HLR renders.  Each entry is (id, label, (x, y, z)) where the
+# tuple is the camera direction in the model's (X=length, Z=up) frame.
+#
+# To add a new view: orbit in the 3D pane, click "copy view_dir" in the
+# floating toolbar (puts a tuple on your clipboard), then paste a line here
+# and rerun `python build_viewer.py`.  ONE file edit, no STD_VIEWS dance.
 VIEWS = [
-    ("iso",   "Iso 3/4 (front-right-above)", STD_VIEWS["iso"]),
-    ("front", "Front elevation",              STD_VIEWS["front"]),
-    ("side",  "Side elevation",               STD_VIEWS["side"]),
+    ("iso",   "Iso 3/4 (front-right-above)", (-0.5, -1.0,  0.7)),
+    ("front", "Front elevation",              ( 0.0, -1.0,  0.25)),
+    ("side",  "Side elevation",               (-1.0,  0.0,  0.25)),
+    # ("hero",  "Hero shot",                    (0.456, -0.234, 0.789)),
 ]
 
 
@@ -490,13 +496,43 @@ HTML_TEMPLATE = r"""<!doctype html>
                      transform: translateX(-50%); background: rgba(255,255,255,0.95);
                      padding: 6px 12px; border-radius: 14px;
                      border: 1px solid var(--line); font-size: 12px;
-                     display: flex; gap: 12px; align-items: center;
-                     font-family: ui-monospace, Consolas, monospace; }}
+                     display: flex; gap: 8px; align-items: center;
+                     font-family: ui-monospace, Consolas, monospace;
+                     max-width: calc(100% - 40px); }}
+  .three-toolbar .tb-sep {{ width: 1px; height: 18px; background: var(--line);
+                             margin: 0 2px; }}
+  .three-toolbar .tb-label {{ font-family: Arial, sans-serif; color: var(--muted);
+                               font-size: 12px; }}
+  .three-toolbar select {{ font-size: 12px; padding: 2px 4px;
+                            border: 1px solid var(--line); border-radius: 3px;
+                            background: white; cursor: pointer; }}
   .three-toolbar button {{ font-family: Arial, sans-serif; font-size: 12px;
                             padding: 3px 10px; border: 1px solid var(--line);
                             background: white; border-radius: 3px;
                             cursor: pointer; }}
   .three-toolbar button:hover {{ background: var(--accora-teal-pale); }}
+  /* Hide 2D-only header controls when in 3D-only layout (Split keeps them) */
+  body.layout-3d #btn-smart,
+  body.layout-3d #btn-detailed,
+  body.layout-3d #btn-hidden,
+  body.layout-3d #mode-pill,
+  body.layout-3d #btn-annotate,
+  body.layout-3d #btn-clear,
+  body.layout-3d #btn-export {{ display: none; }}
+  /* In 3D-only mode the right sidebar (layer toggles, callouts) doesn't
+     apply; reclaim the space for the 3D canvas. */
+  body.layout-3d aside.right {{ display: none; }}
+  body.layout-3d main {{
+    grid-template-columns: 240px 1fr;
+    grid-template-areas: "left center";
+  }}
+  /* Tree search input */
+  #tree-search {{ width: 100%; padding: 4px 6px; font-size: 12px;
+                   border: 1px solid var(--line); border-radius: 3px;
+                   font-family: ui-monospace, Consolas, monospace; }}
+  #tree-search:focus {{ outline: none; border-color: var(--accora-teal); }}
+  /* Hide tree nodes that don't match the current search */
+  .tree-root li.filtered-out {{ display: none; }}
   /* Onshape tree */
   .tree-root {{ list-style: none; padding: 0; margin: 0; font-size: 12px;
                 font-family: ui-monospace, Consolas, monospace; }}
@@ -551,15 +587,6 @@ HTML_TEMPLATE = r"""<!doctype html>
   <h1>ACCORA IFU viewer</h1>
   <label>File: <select id="file-sel"></select></label>
   <label>View: <select id="view-sel"></select></label>
-  <label title="Override what axis is 'up' in the imported model. 3D-side preview only - paste the resulting tuple into SOURCES and rebuild to bake it in.">Up: <select id="up-axis-sel">
-    <option value="Z" selected>Z (model native)</option>
-    <option value="Y">Y &rarr; Z (rotate 90 about X)</option>
-    <option value="X">X &rarr; Z (rotate -90 about Y)</option>
-    <option value="-Z">-Z &rarr; Z (rotate 180 about X)</option>
-    <option value="-Y">-Y &rarr; Z (rotate -90 about X)</option>
-    <option value="-X">-X &rarr; Z (rotate 90 about Y)</option>
-  </select></label>
-  <button id="btn-copy-orient" title="Copy pre_rotate tuple to clipboard">&#9112; pre_rotate</button>
   <span class="mode-pill" id="mode-pill">smart</span>
   <button id="btn-smart"    class="active">smart</button>
   <button id="btn-detailed">+ smooth</button>
@@ -578,7 +605,9 @@ HTML_TEMPLATE = r"""<!doctype html>
 <main>
   <aside class="left">
     <h2>Onshape tree</h2>
-    <p style="font-size:11px; color: var(--muted); margin: 0 0 8px 0;"
+    <input type="search" id="tree-search" placeholder="filter tree..."
+           autocomplete="off" spellcheck="false">
+    <p style="font-size:11px; color: var(--muted); margin: 4px 0 8px 0;"
        id="tree-status">No tree for this source.</p>
     <ul class="tree-root" id="tree-root"></ul>
     <h2>Solids (STEP order)</h2>
@@ -600,7 +629,19 @@ HTML_TEMPLATE = r"""<!doctype html>
     <div class="three-toolbar">
       <span id="viewdir-readout">view_dir = (—, —, —)</span>
       <button id="btn-lock-view" title="Copy view_dir tuple to clipboard">copy view_dir</button>
-      <button id="btn-reset-3d">reset camera</button>
+      <button id="btn-reset-3d" title="Frame the model from the active 2D view direction">reset camera</button>
+      <span class="tb-sep"></span>
+      <label class="tb-label" title="Override what axis is 'up'. 3D-side preview only - paste the resulting tuple into SOURCES and rebuild to bake into 2D HLR.">Up:
+        <select id="up-axis-sel">
+          <option value="Z" selected>Z</option>
+          <option value="Y">Y</option>
+          <option value="X">X</option>
+          <option value="-Z">-Z</option>
+          <option value="-Y">-Y</option>
+          <option value="-X">-X</option>
+        </select>
+      </label>
+      <button id="btn-copy-orient" title="Copy pre_rotate tuple to clipboard">copy pre_rotate</button>
     </div>
   </div>
   <aside class="right">
@@ -1213,6 +1254,48 @@ window.IFU_VIEWER = {{
 
 // Tree refresh on source change
 fileSel.addEventListener('change', refreshTree);
+
+// --- Tree search ------------------------------------------------------------
+// Live-filter the tree as the user types. Matches any name (substring,
+// case-insensitive); shows matching leaves and their ancestor path so the
+// hierarchy stays readable. Empty query = show all.
+const treeSearch = $('tree-search');
+function filterTree(q) {{
+  q = (q || '').trim().toLowerCase();
+  const allLi = treeRoot.querySelectorAll('li');
+  if (!q) {{
+    allLi.forEach(li => li.classList.remove('filtered-out'));
+    return;
+  }}
+  // First pass: mark every li as filtered-out
+  allLi.forEach(li => li.classList.add('filtered-out'));
+  // Second pass: for each li whose name matches, un-filter it AND all ancestor li's
+  allLi.forEach(li => {{
+    const row = li.querySelector(':scope > .tree-row');
+    if (!row) return;
+    const name = row.textContent.toLowerCase();
+    if (name.includes(q)) {{
+      let cur = li;
+      while (cur && cur.classList.contains('filtered-out')) {{
+        cur.classList.remove('filtered-out');
+        cur = cur.parentElement?.closest('li');
+      }}
+      // Also reveal direct descendants of a matched node so the user sees
+      // what's inside the matched subtree.
+      li.querySelectorAll('li').forEach(d => d.classList.remove('filtered-out'));
+    }}
+  }});
+}}
+treeSearch.addEventListener('input', () => filterTree(treeSearch.value));
+// Esc inside the search clears it (separate from the global Esc which
+// clears selection -- only act on Esc if the search is focused and has content)
+treeSearch.addEventListener('keydown', (e) => {{
+  if (e.key === 'Escape' && treeSearch.value) {{
+    treeSearch.value = '';
+    filterTree('');
+    e.stopPropagation();   // don't bubble to the global Esc-clears-selection
+  }}
+}});
 
 // --- Layout (2D / Split / 3D) ----------------------------------------------
 // Three-segment control replacing the old hidden "3D view-finder" toggle.

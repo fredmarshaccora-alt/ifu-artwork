@@ -47,9 +47,9 @@ def run():
            detail="; ".join(console_errors[:3]))
 
         # ---- Header controls exist ----
-        ok("up-axis dropdown present",
+        ok("up-axis dropdown present (in 3D toolbar)",
            page.locator("#up-axis-sel").count() == 1)
-        ok("copy pre_rotate button present",
+        ok("copy pre_rotate button present (in 3D toolbar)",
            page.locator("#btn-copy-orient").count() == 1)
         ok("layout segmented control present (2D / Split / 3D)",
            page.locator("#lay-2d").count() == 1
@@ -57,6 +57,13 @@ def run():
            and page.locator("#lay-3d").count() == 1)
         ok("2D is the default active layout",
            page.evaluate("$('lay-2d').classList.contains('active')"))
+        ok("tree search input present",
+           page.locator("#tree-search").count() == 1)
+        # Up:/pre_rotate live inside the 3D toolbar now (not the header)
+        ok("Up: dropdown is inside the 3D floating toolbar",
+           page.evaluate(
+               "document.getElementById('up-axis-sel').closest('.three-toolbar') !== null"
+           ))
 
         # ---- Initial state ----
         active_file = page.evaluate("fileSel.value")
@@ -114,6 +121,10 @@ def run():
            detail=f"size={sel_size}")
 
         # ---- Up-axis dropdown change calls applyUpAxisOverride ----
+        # The control lives in the 3D floating toolbar, so we have to be in
+        # a layout that shows the 3D pane (Split or 3D) for it to be visible.
+        page.locator("#lay-split").click()
+        page.wait_for_timeout(200)
         page.evaluate("""
             window._upAxisCalls = [];
             const orig = window.IFU_VIEWER?.applyUpAxisOverride;
@@ -259,6 +270,33 @@ def run():
            page.evaluate("document.body.classList.contains('layout-2d')"))
         ok("3D pane hidden after returning to 2D",
            page.evaluate("getComputedStyle(document.getElementById('webgl-wrap')).display === 'none'"))
+
+        # ---- Onshape tree search filters results ----
+        # Use Presto for this -- it has a real tree; siderail has none.
+        page.select_option("#file-sel", "presto")
+        page.wait_for_timeout(200)
+        total = page.evaluate("treeRoot.querySelectorAll('li').length")
+        visible_before = page.evaluate(
+            "Array.from(treeRoot.querySelectorAll('li')).filter(li => !li.classList.contains('filtered-out')).length"
+        )
+        # Type something that should match a small number of nodes
+        page.fill("#tree-search", "castor")
+        page.wait_for_timeout(100)
+        visible_after = page.evaluate(
+            "Array.from(treeRoot.querySelectorAll('li')).filter(li => !li.classList.contains('filtered-out')).length"
+        )
+        ok("tree search filters nodes",
+           total > 0 and visible_after < visible_before and visible_after > 0,
+           detail=f"total={total} before={visible_before} after={visible_after}")
+        # Clear the search
+        page.fill("#tree-search", "")
+        page.wait_for_timeout(50)
+        visible_cleared = page.evaluate(
+            "Array.from(treeRoot.querySelectorAll('li')).filter(li => !li.classList.contains('filtered-out')).length"
+        )
+        ok("tree search clears back to full",
+           visible_cleared == total,
+           detail=f"cleared={visible_cleared} total={total}")
 
         # Final console-error check (catches errors fired during 3D init)
         ok("no JS errors after full round-trip",
