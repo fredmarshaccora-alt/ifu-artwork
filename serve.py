@@ -102,19 +102,38 @@ def healthz():
 def render():
     body = request.get_json(silent=True) or {}
     file_id = body.get("file_id")
-    view_dir = body.get("view_dir") or []
-    focal = body.get("focal")        # [x, y, z] world-space point the camera looks at
+    # Camera definition.  Two equivalent forms accepted:
+    #   - {eye: [x,y,z], target: [x,y,z]}    (preferred -- unambiguous)
+    #   - {view_dir: [x,y,z], focal: [x,y,z]} (legacy -- view_dir = eye-target)
+    eye = body.get("eye")
+    target = body.get("target")
+    view_dir = body.get("view_dir")
+    focal = body.get("focal")
     up_axis = body.get("up_axis")    # {"axis": [x,y,z], "angle": deg} or None
+
     if file_id not in _SHAPES:
         return jsonify({"error": f"unknown source: {file_id!r}",
                         "known": list(_SHAPES.keys())}), 400
-    if not (isinstance(view_dir, list) and len(view_dir) == 3):
-        return jsonify({"error": "view_dir must be a 3-element [x, y, z] list"}), 400
-    view_dir = tuple(float(x) for x in view_dir)
-    if isinstance(focal, list) and len(focal) == 3:
-        focal = tuple(float(x) for x in focal)
+
+    # Resolve view_dir + focal from whichever pair we got
+    if isinstance(eye, list) and isinstance(target, list) \
+            and len(eye) == 3 and len(target) == 3:
+        eye = tuple(float(x) for x in eye)
+        focal = tuple(float(x) for x in target)
+        vd = (eye[0] - focal[0], eye[1] - focal[1], eye[2] - focal[2])
+        mag = (vd[0] ** 2 + vd[1] ** 2 + vd[2] ** 2) ** 0.5
+        if mag < 1e-9:
+            return jsonify({"error": "eye and target coincide"}), 400
+        view_dir = (vd[0] / mag, vd[1] / mag, vd[2] / mag)
+    elif isinstance(view_dir, list) and len(view_dir) == 3:
+        view_dir = tuple(float(x) for x in view_dir)
+        if isinstance(focal, list) and len(focal) == 3:
+            focal = tuple(float(x) for x in focal)
+        else:
+            focal = (0.0, 0.0, 0.0)
     else:
-        focal = (0.0, 0.0, 0.0)
+        return jsonify({"error":
+            "supply either {eye, target} or {view_dir, focal}"}), 400
 
     shape, hlr_kw = _SHAPES[file_id]
     # Apply the 3D viewer's Up: override to a fresh copy so the SVG matches
@@ -152,18 +171,12 @@ def render():
         return jsonify({"error": f"HLR failed: {type(exc).__name__}: {exc}"}), 500
     t_hlr = time.time() - t_hlr0
 
-    # three.js camera-right = up × view_dir; OCCT screen-X = view_dir × up.
-    # The two are EXACT negatives of each other for any view_dir (with
-    # up=world Z), so the OCCT SVG comes back as the horizontal mirror of
-    # what the user saw in 3D.  Negate polyline X to compensate.
-    # Verified empirically by side-by-side render with mirror off: the
-    # 2D bed appears reversed left-to-right relative to the 3D pane.
-    t_mir0 = time.time()
-    for part in parts:
-        polys = part.get("polys", {})
-        for cat in list(polys.keys()):
-            polys[cat] = [[(-x, y) for (x, y) in pl] for pl in polys[cat]]
-    t_mir = time.time() - t_mir0
+    # X-mirror is gone now.  build_projector was rewritten to build the
+    # Ax2 with Z = +view_dir and X = up × view_dir, so OCCT's camera and
+    # screen-X axis natively match three.js -- no post-process flip
+    # needed.  Previously OCCT's camera was on the OPPOSITE side of the
+    # model and the X-flip was a mask that broke for arbitrary view_dirs.
+    t_mir = 0.0
 
     t_svg0 = time.time()
     out_path = OUT / f"_live_{file_id}.svg"

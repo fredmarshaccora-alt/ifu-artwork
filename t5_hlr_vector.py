@@ -68,11 +68,24 @@ def rotate_shape(shape, axis_dir, angle_deg, origin=(0, 0, 0)):
 
 
 def build_projector(view_dir, focal=(0, 0, 0)):
-    """Build an HLR projector matching the VTK iso convention.
+    """Build an HLR projector that matches three.js's camera convention.
 
-    view_dir = camera position direction relative to focal point (eye - focal).
-    The HLR Ax2's Z is the *projection direction* = scene -> camera, i.e. -cam.
-    X is the image-right axis; chosen so world +X projects to image right.
+    view_dir = (eye - focal) -- direction from the focal point to the camera.
+    The camera is at +view_dir side of the scene.
+
+    Ax2 setup:
+      Z = +view_dir              (the "to-camera" direction; HLR's observer
+                                  is at +Ax2_Z infinity, so this puts the
+                                  observer on the same side three.js has it)
+      X = up x view_dir          (camera-right, matching three.js's
+                                  Matrix4.lookAt which does
+                                  x_axis = up x z_axis, z_axis = view_dir)
+      Y = Z x X  (computed by OCCT to keep the frame right-handed)
+
+    Previously the code used Z = -view_dir which put the OCCT observer on
+    the OPPOSITE side of the model from three.js, producing a back-of-the-
+    bed view that the SVG-side X-mirror tried (and failed for non-axial
+    view_dirs) to compensate for.
 
     Returns (projector, x_axis_tuple, y_axis_tuple, focal_tuple) so callers
     can project arbitrary 3D points to projection (u, v) coords for
@@ -80,21 +93,19 @@ def build_projector(view_dir, focal=(0, 0, 0)):
     """
     cam = gp_Vec(*view_dir)
     cam.Normalize()
-    # projection direction = -camera (camera looks toward scene origin)
-    proj_v = gp_Vec(-cam.X(), -cam.Y(), -cam.Z())
-    z_dir = gp_Dir(proj_v.X(), proj_v.Y(), proj_v.Z())
+    z_dir = gp_Dir(cam.X(), cam.Y(), cam.Z())
 
     if abs(cam.Z()) < 0.95:
         up = gp_Vec(0, 0, 1)
     else:
         up = gp_Vec(0, 1, 0)
-    # camera_x = up x proj = up x (-cam) = cam x up   (right-handed, world +Z up)
-    x_vec = cam.Crossed(up)
+    # screen-right axis = up x view_dir, matches three.js
+    x_vec = up.Crossed(cam)
     x_vec.Normalize()
     x_dir = gp_Dir(x_vec.X(), x_vec.Y(), x_vec.Z())
     ax = gp_Ax2(gp_Pnt(*focal), z_dir, x_dir)
-    # camera_y = z x x = proj_v x x_vec
-    y_vec = proj_v.Crossed(x_vec)
+    # screen-up axis = Z x X = view_dir x (up x view_dir) = up - vd*(vd.up)
+    y_vec = cam.Crossed(x_vec)
     y_vec.Normalize()
     return (HLRAlgo_Projector(ax),
             (x_vec.X(), x_vec.Y(), x_vec.Z()),

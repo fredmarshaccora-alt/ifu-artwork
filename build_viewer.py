@@ -1845,18 +1845,17 @@ async function probeServer() {{
 async function generateLiveSVG() {{
   if (!camera || !controls) return;
   const fid = window.IFU_VIEWER.getActiveFileId();
-  const dir = camera.position.clone().sub(controls.target).normalize();
-  const view_dir = [dir.x, dir.y, dir.z];
-  // Send the focal point too -- HLR's projection centres on (0,0,0) by
-  // default, but the 3D viewer can be panned anywhere via OrbitControls.
-  // If we don't sync this, the SVG and 3D pane centre on different points
-  // and look like "different views" even when the direction is identical.
-  const focal = [controls.target.x, controls.target.y, controls.target.z];
+  // Send the camera as {eye, target} -- two explicit world-space points.
+  // Unambiguous: HLR sets up its projection from the exact same camera
+  // OrbitControls is currently driving.  No view_dir sign convention,
+  // no separate focal arg, no chance of meaning the opposite side.
+  const eye    = [camera.position.x, camera.position.y, camera.position.z];
+  const target = [controls.target.x,  controls.target.y,  controls.target.z];
   // Send the current Up: override so the server rotates the cached shape
   // the same way the 3D view did before running HLR -- otherwise the SVG
   // comes back in the model's native (unrotated) orientation.
   const upRot = window.IFU_VIEWER.getActiveUpAxis?.();
-  const body = {{ file_id: fid, view_dir, focal }};
+  const body = {{ file_id: fid, eye, target }};
   if (upRot && upRot.angle && upRot.angle !== 0) {{
     body.up_axis = {{ axis: upRot.axis, angle: upRot.angle }};
   }}
