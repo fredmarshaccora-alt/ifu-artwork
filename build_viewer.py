@@ -1881,10 +1881,15 @@ async function generateLiveSVG() {{
     }}
     const svgText = await r.text();
     const elapsed = r.headers.get('X-Render-Seconds') || '?';
+    const breakdown = r.headers.get('X-Render-Breakdown') || '';
     window.IFU_VIEWER.injectLiveSVG(fid, view_dir, svgText);
     // Auto-switch to Split so the new SVG appears on the left next to the 3D
     window.IFU_VIEWER.setLayout?.('split');
     btnGen.innerHTML = `&#10003; ${{elapsed}}s`;
+    if (breakdown) {{
+      readout.title = `last render: ${{elapsed}}s -- ${{breakdown}}`;
+      console.log(`[generate] ${{elapsed}}s -- ${{breakdown}}`);
+    }}
   }} catch (e) {{
     console.error('generate failed:', e);
     btnGen.innerHTML = '&#10007; ' + (e.message || 'render failed');

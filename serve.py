@@ -63,6 +63,12 @@ def _options(_p):
 # Shape cache: file_id -> (TopoDS_Shape, hlr_kw)
 _SHAPES: dict[str, tuple] = {}
 
+# Render cache: maps (file_id, rounded view_dir, rounded focal, up_axis)
+# to the SVG bytes for that exact render.  Exact HLR is the killer cost
+# (~80s for Presto), so memoising lets the user revisit an angle for free.
+_RENDER_CACHE: dict[tuple, bytes] = {}
+_RENDER_CACHE_MAX = 20    # rough cap on memory
+
 
 def boot():
     print("Loading sources into memory (one-time cost) ...")
@@ -115,38 +121,69 @@ def render():
     # what the user was looking at when they clicked "generate 2D".  The
     # cache stays in its native pre-rotated state for the next request.
     extra_rot_str = ""
+    up_axis_key: tuple = ()
     if up_axis and float(up_axis.get("angle") or 0) != 0:
         try:
             ax = tuple(float(c) for c in up_axis["axis"])
             ang = float(up_axis["angle"])
             shape = rotate_shape(shape, ax, ang)
             extra_rot_str = f"  +rot({ax}, {ang:.0f}deg)"
+            up_axis_key = (round(ax[0], 3), round(ax[1], 3), round(ax[2], 3),
+                           round(ang, 1))
         except Exception as exc:
             return jsonify({"error": f"bad up_axis: {exc}"}), 400
-    t0 = time.time()
+
+    # Cache check: identical (source, view, focal, up_axis) -> instant.
+    vd_key = tuple(round(x, 3) for x in view_dir)
+    focal_key = tuple(round(x, 1) for x in focal)
+    cache_key = (file_id, vd_key, focal_key, up_axis_key)
+    cached = _RENDER_CACHE.get(cache_key)
+    if cached is not None:
+        print(f"  /api/render {file_id:<10s} dir={vd_key}{extra_rot_str}  "
+              f"CACHE HIT  {len(cached)//1024}KB")
+        return Response(cached, mimetype="image/svg+xml", headers={
+            "X-Render-Seconds": "0.0",
+            "X-Render-Breakdown": "cache-hit",
+        })
+    t_hlr0 = time.time()
     try:
         parts = run_hlr_per_solid(shape, view_dir, focal=focal, **hlr_kw)
     except Exception as exc:
         return jsonify({"error": f"HLR failed: {type(exc).__name__}: {exc}"}), 500
+    t_hlr = time.time() - t_hlr0
 
     # three.js and OCCT have opposite screen-X conventions (three.js right =
     # up x view_dir; OCCT screen-X = view_dir x up).  Without correction the
     # SVG comes back as the horizontal mirror of what the user saw in 3D --
     # same viewing direction, left and right swapped.  Negate the polyline
     # X values before writing so the live SVG lines up with the 3D pane.
+    t_mir0 = time.time()
     for part in parts:
         polys = part.get("polys", {})
         for cat in list(polys.keys()):
             polys[cat] = [[(-x, y) for (x, y) in pl] for pl in polys[cat]]
+    t_mir = time.time() - t_mir0
 
+    t_svg0 = time.time()
     out_path = OUT / f"_live_{file_id}.svg"
     write_svg_parts(parts, out_path, precision=1)
     svg = out_path.read_text(encoding="utf-8")
-    elapsed = time.time() - t0
+    t_svg = time.time() - t_svg0
+    elapsed = t_hlr + t_mir + t_svg
+    breakdown = f"hlr={t_hlr:.1f}s mirror={t_mir:.1f}s svg-write={t_svg:.1f}s"
     print(f"  /api/render {file_id:<10s} dir={tuple(round(x,3) for x in view_dir)}"
-          f"{extra_rot_str}  {elapsed:.1f}s  {len(svg)//1024}KB")
-    return Response(svg, mimetype="image/svg+xml",
-                    headers={"X-Render-Seconds": f"{elapsed:.2f}"})
+          f"{extra_rot_str}  total={elapsed:.1f}s ({breakdown})  "
+          f"{len(svg)//1024}KB")
+    # Insert into render cache (evict oldest if over cap)
+    svg_bytes = svg.encode("utf-8")
+    if len(_RENDER_CACHE) >= _RENDER_CACHE_MAX:
+        _RENDER_CACHE.pop(next(iter(_RENDER_CACHE)))
+    _RENDER_CACHE[cache_key] = svg_bytes
+
+    return Response(svg_bytes, mimetype="image/svg+xml", headers={
+        "X-Render-Seconds": f"{elapsed:.2f}",
+        "X-Render-Breakdown": breakdown,
+    })
 
 
 def main() -> int:

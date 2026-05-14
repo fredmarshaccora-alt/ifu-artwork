@@ -243,13 +243,18 @@ def split_solids(shape):
 def _build_full_hlr(shape, solids, proj, mesh_defl):
     """Run a SINGLE assembly-wide HLR by adding the COMPOUND (not each solid
     individually).  After Update+Hide, extr.VCompound(sub_solid) still works
-    to extract per-solid edges - tested.  This is dramatically faster than
-    adding 700 solids individually (avoids O(N^2) pairwise occlusion tests).
+    to extract per-solid edges - tested.
 
-    Tries PolyAlgo first; on the multi-part assembly bug, falls back to
-    exact HLRBRep_Algo.  Returns (extr, kind) where kind in {"poly", "exact"}.
+    Three tries in order:
+      1. PolyAlgo on the whole compound (fastest path; works on most assemblies)
+      2. PolyAlgo with each solid loaded separately (works around
+         Standard_OutOfRange on compound-load for complex assemblies; still
+         multi-solid so cross-solid occlusion is preserved)
+      3. Exact HLRBRep_Algo (correct fallback, 3-5x slower than PolyAlgo)
+
+    Returns (extr, kind) where kind in {"poly", "poly_per_solid", "exact"}.
     """
-    # PolyAlgo path - compound add
+    # 1) PolyAlgo - compound add
     try:
         BRepMesh_IncrementalMesh(shape, mesh_defl, False, 0.5, True)
         algo = HLRBRep_PolyAlgo()
@@ -260,10 +265,35 @@ def _build_full_hlr(shape, solids, proj, mesh_defl):
         extr.Update(algo)
         return extr, "poly"
     except Exception as e:
-        print(f"  PolyAlgo failed ({type(e).__name__}); falling back to "
-              f"exact HLRBRep_Algo")
+        print(f"  PolyAlgo (compound) failed ({type(e).__name__}); "
+              f"trying per-solid PolyAlgo")
 
-    # Exact path - compound add (fast Hide)
+    # 2) PolyAlgo - per-solid add (workaround for Standard_OutOfRange on
+    #    multi-part compounds; PolyAlgo internally indexes faces per-shape,
+    #    and Loading individual solids one at a time sidesteps the bug
+    #    while still feeding ALL solids into the same algo instance so
+    #    occlusion between them is computed correctly).
+    try:
+        BRepMesh_IncrementalMesh(shape, mesh_defl, False, 0.5, True)
+        algo = HLRBRep_PolyAlgo()
+        added = 0
+        for _, _, solid in solids:
+            try:
+                algo.Load(solid)
+                added += 1
+            except Exception:
+                pass
+        if added > 0:
+            algo.Projector(proj)
+            algo.Update()
+            extr = HLRBRep_PolyHLRToShape()
+            extr.Update(algo)
+            return extr, "poly_per_solid"
+    except Exception as e:
+        print(f"  PolyAlgo (per-solid) failed ({type(e).__name__}); "
+              f"falling back to exact HLRBRep_Algo")
+
+    # 3) Exact path - compound add
     algo = HLRBRep_Algo()
     algo.Add(shape)
     algo.Projector(proj)
@@ -310,7 +340,7 @@ def run_hlr_per_solid(shape, view_dir, focal=(0, 0, 0),
         ("hidden_outline", "OutLineHCompound"),
     )
 
-    if kind == "poly":
+    if kind in ("poly", "poly_per_solid"):
         # PolyAlgo: per-shape selector works directly
         parts = []
         t1 = time.time()
@@ -447,17 +477,31 @@ def _tag_by_bbox(polys_by_cat, solid_bboxes_2d):
     """Tag each polyline by which solid's projected bbox contains its centroid.
 
     On multi-match: pick the smallest-area bbox (most specific part).
-    On no match: nearest bbox center.
+    On no match: assign to the NEAREST bbox ONLY if the centroid is within
+    one bbox-diagonal of the model envelope; otherwise drop the polyline
+    entirely.  HLR on complex assemblies sometimes emits spurious arcs /
+    silhouettes far from any real part; the legacy "nearest" fallback was
+    pulling these in and they were dominating the SVG viewBox.
     """
     parts_map = {}
-    # Pre-compute areas
+    # Pre-compute areas + overall model envelope
     bb_arr = [(idx, label, u0, v0, u1, v1, (u1 - u0) * (v1 - v0))
               for idx, label, u0, v0, u1, v1 in solid_bboxes_2d]
+    if bb_arr:
+        env_u0 = min(b[2] for b in bb_arr)
+        env_v0 = min(b[3] for b in bb_arr)
+        env_u1 = max(b[4] for b in bb_arr)
+        env_v1 = max(b[5] for b in bb_arr)
+        env_diag = ((env_u1 - env_u0) ** 2 + (env_v1 - env_v0) ** 2) ** 0.5
+        max_fallback_dist = env_diag * 0.05    # 5% of envelope diagonal
+    else:
+        max_fallback_dist = 0.0
+
+    n_dropped = 0
     for cat, polylines in polys_by_cat.items():
         for pl in polylines:
             if not pl:
                 continue
-            # centroid
             n = len(pl)
             cx = sum(p[0] for p in pl) / n
             cy = sum(p[1] for p in pl) / n
@@ -470,20 +514,31 @@ def _tag_by_bbox(polys_by_cat, solid_bboxes_2d):
                     best_label = label
                     best_area = area
             if best_idx is None:
-                # fallback: nearest bbox center
+                # No containing bbox: only fall back to the nearest if the
+                # polyline is near the model envelope.  Far-away polylines
+                # are spurious HLR output and are dropped.
                 best_dist = float("inf")
+                near_idx = None
+                near_label = "unknown"
                 for idx, label, u0, v0, u1, v1, _a in bb_arr:
                     bcx = (u0 + u1) / 2.0
                     bcy = (v0 + v1) / 2.0
-                    d = (bcx - cx) ** 2 + (bcy - cy) ** 2
+                    d = ((bcx - cx) ** 2 + (bcy - cy) ** 2) ** 0.5
                     if d < best_dist:
                         best_dist = d
-                        best_idx = idx
-                        best_label = label
+                        near_idx = idx
+                        near_label = label
+                if best_dist <= max_fallback_dist:
+                    best_idx = near_idx
+                    best_label = near_label
+                else:
+                    n_dropped += 1
+                    continue   # drop spurious polyline
             p = parts_map.setdefault(best_idx, {
                 "idx": best_idx, "label": best_label, "polys": {}})
             p["polys"].setdefault(cat, []).append(pl)
-    # Ensure each part has all expected categories (some may be empty)
+    if n_dropped:
+        print(f"  dropped {n_dropped} polylines outside the model envelope")
     return list(parts_map.values())
 
 
