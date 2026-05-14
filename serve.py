@@ -152,11 +152,12 @@ def render():
         return jsonify({"error": f"HLR failed: {type(exc).__name__}: {exc}"}), 500
     t_hlr = time.time() - t_hlr0
 
-    # three.js and OCCT have opposite screen-X conventions (three.js right =
-    # up x view_dir; OCCT screen-X = view_dir x up).  Without correction the
-    # SVG comes back as the horizontal mirror of what the user saw in 3D --
-    # same viewing direction, left and right swapped.  Negate the polyline
-    # X values before writing so the live SVG lines up with the 3D pane.
+    # three.js camera-right = up × view_dir; OCCT screen-X = view_dir × up.
+    # The two are EXACT negatives of each other for any view_dir (with
+    # up=world Z), so the OCCT SVG comes back as the horizontal mirror of
+    # what the user saw in 3D.  Negate polyline X to compensate.
+    # Verified empirically by side-by-side render with mirror off: the
+    # 2D bed appears reversed left-to-right relative to the 3D pane.
     t_mir0 = time.time()
     for part in parts:
         polys = part.get("polys", {})
