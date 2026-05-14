@@ -734,7 +734,32 @@ function loadUpAxisFor(fid) {{
 upAxisSel.addEventListener('change', () => {{
   localStorage.setItem(_upAxisKey(fileSel.value), upAxisSel.value);
   window.IFU_VIEWER?.applyUpAxisOverride?.(UP_AXIS_ROT[upAxisSel.value]);
+  // Drop the existing Live SVG -- it was rendered against the old
+  // orientation and would be misleading next to the freshly-rotated 3D.
+  invalidateLiveView(fileSel.value);
 }});
+
+// Remove any cached "Live (from 3D)" view for a source.  Called whenever
+// upstream state changes (Up: override, source switch) that would make
+// the previously-generated SVG stale relative to the current 3D pane.
+function invalidateLiveView(file_id) {{
+  const fe = CATALOGUE.find(x => x.file_id === file_id);
+  if (!fe) return;
+  const had = fe.views.some(v => v.view_id === '__live__');
+  fe.views = fe.views.filter(v => v.view_id !== '__live__');
+  document
+    .querySelectorAll(`.svg-pane[data-file="${{file_id}}"][data-view="__live__"]`)
+    .forEach((p) => p.remove());
+  if (!had) return;
+  if (fileSel.value === file_id) {{
+    const wasLive = viewSel.value === '__live__';
+    refreshViews();
+    if (wasLive) {{
+      viewSel.value = fe.views[0]?.view_id || 'iso';
+      refreshPane();
+    }}
+  }}
+}}
 $('btn-copy-orient').addEventListener('click', () => {{
   const r = UP_AXIS_ROT[upAxisSel.value];
   const line = (r.angle === 0)
@@ -1285,7 +1310,7 @@ function injectLiveSVG(file_id, view_dir, svgText) {{
     }} else {{
       fe.views.push({{
         view_id: '__live__',
-        label: '\\u26A1 Live (from 3D)',
+        label: '⚡ Live (from 3D)',
         view_dir: view_dir,
       }});
     }}
@@ -1763,6 +1788,10 @@ async function generateLiveSVG() {{
   const orig = btnGen.innerHTML;
   btnGen.disabled = true;
   btnGen.innerHTML = '&#8987; rendering ...';
+  // Freeze the orbit so the 3D pane can't drift away from the angle the
+  // server is rendering -- otherwise the user sees a "matching" 2D that
+  // doesn't match what the 3D is now showing.
+  controls.enabled = false;
 
   try {{
     const r = await fetch(API_BASE + '/api/render', {{
@@ -1784,6 +1813,7 @@ async function generateLiveSVG() {{
     console.error('generate failed:', e);
     btnGen.innerHTML = '&#10007; ' + (e.message || 'render failed');
   }} finally {{
+    controls.enabled = true;
     setTimeout(() => {{ btnGen.disabled = false; btnGen.innerHTML = orig; }}, 2500);
   }}
 }}
