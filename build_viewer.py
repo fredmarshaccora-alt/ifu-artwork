@@ -1728,12 +1728,16 @@ window.IFU_VIEWER.getCurrentViewDir = () => {{
 // If the server isn't running, the button greys out with a helpful tooltip.
 const btnGen = document.getElementById('btn-generate');
 
+// Server URL: same-origin when viewer is loaded via http://, else hop to
+// the standard local server.  Works whether the user opened
+// http://localhost:5000/ or a file:// build.
+const API_BASE = (location.protocol === 'http:' || location.protocol === 'https:')
+  ? ''
+  : 'http://localhost:5000';
+
 async function probeServer() {{
-  // file:// pages can't fetch anything; skip the probe entirely so we
-  // don't pollute the console with "URL scheme not supported" errors.
-  if (location.protocol === 'file:') return false;
   try {{
-    const r = await fetch('/api/healthz', {{ cache: 'no-store' }});
+    const r = await fetch(API_BASE + '/api/healthz', {{ cache: 'no-store' }});
     if (!r.ok) throw new Error('healthz ' + r.status);
     const data = await r.json();
     return data && data.ok;
@@ -1761,7 +1765,7 @@ async function generateLiveSVG() {{
   btnGen.innerHTML = '&#8987; rendering ...';
 
   try {{
-    const r = await fetch('/api/render', {{
+    const r = await fetch(API_BASE + '/api/render', {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/json' }},
       body: JSON.stringify(body),

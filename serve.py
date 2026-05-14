@@ -41,6 +41,25 @@ from t5_hlr_vector import (
 HERE = Path(__file__).parent
 app = Flask(__name__)
 
+
+@app.after_request
+def _cors_and_no_cache(resp):
+    # Allow viewer.html loaded from file:// (or any other origin) to call
+    # /api/*.  Single-user local tool -- no need to be picky about origins.
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    # Always serve a fresh viewer.html so a rebuild while the server is
+    # running is picked up on the next reload.
+    if request.path in ("/", "/viewer.html"):
+        resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/api/<path:_p>", methods=["OPTIONS"])
+def _options(_p):
+    return ("", 204)
+
 # Shape cache: file_id -> (TopoDS_Shape, hlr_kw)
 _SHAPES: dict[str, tuple] = {}
 
