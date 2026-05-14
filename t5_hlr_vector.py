@@ -304,7 +304,11 @@ def _build_full_hlr(shape, solids, proj, mesh_defl):
         print(f"  PolyAlgo (per-solid) failed ({type(e).__name__}); "
               f"falling back to exact HLRBRep_Algo")
 
-    # 3) Exact path - compound add
+    # 3) Exact path - compound add.  Per-solid Add was tried (so VCompound
+    #    selectors would work) but OCCT's Hide goes O(N^2) on 700+ solids
+    #    and the render stalls.  We stick with compound Add and lean on
+    #    improved bbox-tagging (full-polyline-bbox containment) to avoid
+    #    the "scattered fragments" misassignment problem.
     algo = HLRBRep_Algo()
     algo.Add(shape)
     algo.Projector(proj)
@@ -409,7 +413,7 @@ def run_hlr_per_solid(shape, view_dir, focal=(0, 0, 0),
     return parts
 
 
-def _dedup_polylines_in_place(parts, precision=2):
+def _dedup_polylines_in_place(parts, precision=1):
     """Remove duplicate polylines (across all parts) and drop degenerate ones.
 
     HLR on a multi-solid compound returns shared edges once per neighbouring
@@ -418,11 +422,10 @@ def _dedup_polylines_in_place(parts, precision=2):
     shared edge 2x, 6x, even 10x on top of itself.
 
     Dedup key is the rounded coordinate sequence so floating-point jitter
-    between extractions doesn't defeat the comparison.  Default precision is
-    2 decimal places (0.01 mm) -- tight enough that nearby-but-distinct
-    edges aren't conflated, loose enough that bit-for-bit-equal HLR output
-    from neighbouring solids collapses to one entry.  precision=1 (0.1 mm)
-    was previously the default but lost real sub-millimetre features.
+    between extractions doesn't defeat the comparison.  precision=1 (0.1 mm)
+    catches OCCT's natural float jitter between extractions on neighbouring
+    solids.  precision=2 leaves real duplicates because float noise exceeds
+    0.01 mm, blowing SVG size up by 2x for ~3% of duplicates caught.
     """
     seen = set()
     n_total = 0
@@ -486,17 +489,24 @@ def _project_solid_bboxes(solids, x_axis, y_axis, focal_pt):
 
 
 def _tag_by_bbox(polys_by_cat, solid_bboxes_2d):
-    """Tag each polyline by which solid's projected bbox contains its centroid.
+    """Tag each polyline by the solid whose projected bbox contains the
+    polyline's FULL extent (not just its centroid).
 
-    On multi-match: pick the smallest-area bbox (most specific part).
-    On no match: assign to the NEAREST bbox ONLY if the centroid is within
-    one bbox-diagonal of the model envelope; otherwise drop the polyline
-    entirely.  HLR on complex assemblies sometimes emits spurious arcs /
-    silhouettes far from any real part; the legacy "nearest" fallback was
-    pulling these in and they were dominating the SVG viewBox.
+    Centroid-only matching gave scattered, incoherent highlighting on
+    densely-packed assemblies (Presto): the centroid of a polyline
+    belonging to part A would happen to fall inside the bbox of an
+    unrelated nearby part B with a smaller bbox, so part B "stole" the
+    edge.  Full-bbox containment means a polyline only matches a solid
+    whose 2D bbox FULLY ENCLOSES the polyline's 2D bbox -- much more
+    accurate.  We still pick the smallest-area enclosing bbox so a leaf
+    body inside an assembly beats the assembly's outer bbox.
+
+    Fallback chain: full containment -> centroid containment (smaller
+    bbox wins) -> nearest center, but only within 5% of envelope
+    diagonal.  Outside that, the polyline is dropped as a spurious HLR
+    artifact.
     """
     parts_map = {}
-    # Pre-compute areas + overall model envelope
     bb_arr = [(idx, label, u0, v0, u1, v1, (u1 - u0) * (v1 - v0))
               for idx, label, u0, v0, u1, v1 in solid_bboxes_2d]
     if bb_arr:
@@ -505,30 +515,50 @@ def _tag_by_bbox(polys_by_cat, solid_bboxes_2d):
         env_u1 = max(b[4] for b in bb_arr)
         env_v1 = max(b[5] for b in bb_arr)
         env_diag = ((env_u1 - env_u0) ** 2 + (env_v1 - env_v0) ** 2) ** 0.5
-        max_fallback_dist = env_diag * 0.05    # 5% of envelope diagonal
+        max_fallback_dist = env_diag * 0.05
     else:
         max_fallback_dist = 0.0
 
     n_dropped = 0
+    n_full = 0; n_centroid = 0; n_nearest = 0
     for cat, polylines in polys_by_cat.items():
         for pl in polylines:
             if not pl:
                 continue
-            n = len(pl)
-            cx = sum(p[0] for p in pl) / n
-            cy = sum(p[1] for p in pl) / n
+            xs = [p[0] for p in pl]
+            ys = [p[1] for p in pl]
+            pu0, pu1 = min(xs), max(xs)
+            pv0, pv1 = min(ys), max(ys)
+            cx = (pu0 + pu1) / 2.0
+            cy = (pv0 + pv1) / 2.0
+
+            # Tier 1: smallest-area solid bbox that FULLY ENCLOSES the
+            # polyline bbox.  This is the authoritative test.
             best_idx = None
             best_label = "unknown"
             best_area = float("inf")
             for idx, label, u0, v0, u1, v1, area in bb_arr:
-                if u0 <= cx <= u1 and v0 <= cy <= v1 and area < best_area:
+                if u0 <= pu0 and pu1 <= u1 and v0 <= pv0 and pv1 <= v1 \
+                        and area < best_area:
                     best_idx = idx
                     best_label = label
                     best_area = area
+            if best_idx is not None:
+                n_full += 1
+            else:
+                # Tier 2: centroid containment (legacy heuristic).  Allows
+                # polylines that slightly cross a bbox boundary -- common
+                # near edge tangents and shared-edge HLR artefacts.
+                for idx, label, u0, v0, u1, v1, area in bb_arr:
+                    if u0 <= cx <= u1 and v0 <= cy <= v1 and area < best_area:
+                        best_idx = idx
+                        best_label = label
+                        best_area = area
+                if best_idx is not None:
+                    n_centroid += 1
+
             if best_idx is None:
-                # No containing bbox: only fall back to the nearest if the
-                # polyline is near the model envelope.  Far-away polylines
-                # are spurious HLR output and are dropped.
+                # Tier 3: nearest-center fallback, capped at 5% of envelope.
                 best_dist = float("inf")
                 near_idx = None
                 near_label = "unknown"
@@ -543,14 +573,16 @@ def _tag_by_bbox(polys_by_cat, solid_bboxes_2d):
                 if best_dist <= max_fallback_dist:
                     best_idx = near_idx
                     best_label = near_label
+                    n_nearest += 1
                 else:
                     n_dropped += 1
-                    continue   # drop spurious polyline
+                    continue
+
             p = parts_map.setdefault(best_idx, {
                 "idx": best_idx, "label": best_label, "polys": {}})
             p["polys"].setdefault(cat, []).append(pl)
-    if n_dropped:
-        print(f"  dropped {n_dropped} polylines outside the model envelope")
+    print(f"  bbox-tag: full={n_full} centroid={n_centroid} nearest={n_nearest} "
+          f"dropped={n_dropped}")
     return list(parts_map.values())
 
 

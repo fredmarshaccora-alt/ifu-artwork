@@ -631,6 +631,7 @@ HTML_TEMPLATE = r"""<!doctype html>
   <button id="btn-annotate">+ callout</button>
   <button id="btn-clear">clear callouts</button>
   <button id="btn-export">export SVG</button>
+  <button id="btn-screenshot" title="Save the current pane(s) as PNG">📸 PNG</button>
 </header>
 <main>
   <aside class="left">
@@ -1247,6 +1248,122 @@ function updateCalloutCount() {{
     (st.annotations.length === 1 ? '' : 's') + ' on this view';
 }}
 
+// --- Screenshot exporter ------------------------------------------------
+// Captures whichever panes are currently visible (2D, 3D, or both for
+// Split) into a single PNG so the user can save the rendered comparison
+// for iteration / IFU artwork prep.
+// - 2D pane: serialise the SVG, rasterise via <canvas>
+// - 3D pane: read the WebGL canvas directly
+// - Split:   composite the two side-by-side onto a single canvas
+async function svgPaneToCanvas(pane, width, height) {{
+  const svg = pane.querySelector('svg');
+  if (!svg) return null;
+  // Inline computed dimensions from the viewBox so the serialised SVG
+  // rasterises at a known size.
+  const clone = svg.cloneNode(true);
+  clone.setAttribute('width',  width);
+  clone.setAttribute('height', height);
+  // Inline the per-part styles so they survive serialisation.  The
+  // <style id="per-part-styles"> tag lives in document.head, not inside
+  // the SVG; without inlining, an SVG-as-image-via-blob has no document
+  // context to pick up our overrides.
+  const styleEl = document.getElementById('per-part-styles');
+  if (styleEl && styleEl.textContent) {{
+    const inline = document.createElementNS('http://www.w3.org/2000/svg', 'style');
+    inline.textContent = styleEl.textContent;
+    clone.insertBefore(inline, clone.firstChild);
+  }}
+  const xml = new XMLSerializer().serializeToString(clone);
+  const blob = new Blob([xml], {{ type: 'image/svg+xml;charset=utf-8' }});
+  const url = URL.createObjectURL(blob);
+  const img = new Image();
+  await new Promise((res, rej) => {{
+    img.onload = res; img.onerror = rej; img.src = url;
+  }});
+  const cnv = document.createElement('canvas');
+  cnv.width = width; cnv.height = height;
+  const ctx = cnv.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, width, height);
+  ctx.drawImage(img, 0, 0, width, height);
+  URL.revokeObjectURL(url);
+  return cnv;
+}}
+
+async function captureScreenshot() {{
+  const wantS = document.body.classList.contains('layout-split');
+  const want2 = wantS || document.body.classList.contains('layout-2d');
+  const want3 = wantS || document.body.classList.contains('layout-3d');
+  let canvas2 = null, canvas3 = null;
+
+  if (want2) {{
+    const pane = activePane();
+    if (pane) {{
+      const r = pane.getBoundingClientRect();
+      canvas2 = await svgPaneToCanvas(pane, Math.round(r.width), Math.round(r.height));
+    }}
+  }}
+  if (want3) {{
+    const webglCanvas = document.getElementById('webgl-canvas');
+    if (webglCanvas) {{
+      // Force a fresh render before reading the pixels -- the WebGL
+      // back-buffer is often cleared after present.
+      renderer3d_request_present();
+      const out = document.createElement('canvas');
+      out.width = webglCanvas.width;
+      out.height = webglCanvas.height;
+      const ctx = out.getContext('2d');
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, out.width, out.height);
+      ctx.drawImage(webglCanvas, 0, 0);
+      canvas3 = out;
+    }}
+  }}
+
+  // Composite into one image
+  let final;
+  if (canvas2 && canvas3) {{
+    // Side-by-side; scale to match heights
+    const h = Math.max(canvas2.height, canvas3.height);
+    const w2 = Math.round(canvas2.width * h / canvas2.height);
+    const w3 = Math.round(canvas3.width * h / canvas3.height);
+    final = document.createElement('canvas');
+    final.width = w2 + 8 + w3;
+    final.height = h;
+    const ctx = final.getContext('2d');
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, final.width, final.height);
+    ctx.drawImage(canvas2, 0, 0, w2, h);
+    ctx.fillStyle = '#d8d8da';
+    ctx.fillRect(w2 + 3, 0, 2, h);
+    ctx.drawImage(canvas3, w2 + 8, 0, w3, h);
+  }} else {{
+    final = canvas2 || canvas3;
+  }}
+  if (!final) return;
+
+  // Trigger download
+  final.toBlob((blob) => {{
+    const a = document.createElement('a');
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    a.href = URL.createObjectURL(blob);
+    a.download = `${{fileSel.value}}_${{viewSel.value}}_${{ts}}.png`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  }}, 'image/png');
+}}
+
+// Stub kept here so the synchronous capture call resolves -- the module
+// script overrides this with a real `renderer.render(scene, camera)` call.
+function renderer3d_request_present() {{}}
+
+$('btn-screenshot').addEventListener('click', () => {{
+  captureScreenshot().catch(err => {{
+    console.error('screenshot failed:', err);
+    alert('Screenshot failed: ' + err.message);
+  }});
+}});
+
 $('btn-export').onclick = () => {{
   const svg = activeSvg();
   if (!svg) return;
@@ -1762,7 +1879,11 @@ function init() {{
   camera.position.set(-2000, -4000, 3000);
   camera.lookAt(0, 0, 0);
 
-  renderer = new THREE.WebGLRenderer({{ canvas, antialias: true }});
+  renderer = new THREE.WebGLRenderer({{
+    canvas,
+    antialias: true,
+    preserveDrawingBuffer: true,  // required for screenshot exporter
+  }});
   renderer.setSize(r.width, r.height, false);
   renderer.setPixelRatio(window.devicePixelRatio || 1);
 
@@ -2151,6 +2272,16 @@ window.IFU_VIEWER.advanceClickCycle = () => {{
   console.log('[depth-click] next click will be layer', _lastClickRayCycle);
 }};
 
+// Override the classic-side stub so the screenshot exporter can force a
+// fresh render into the back-buffer immediately before reading pixels.
+window.renderer3d_request_present = () => {{
+  if (renderer && scene && camera) {{
+    // preserveDrawingBuffer might not be on; render explicitly into the
+    // visible canvas right before the screenshot reads it
+    renderer.render(scene, camera);
+  }}
+}};
+
 window.IFU_VIEWER.snapCameraTo = (eye, target) => {{
   if (!camera || !controls) return;
   camera.position.set(eye[0], eye[1], eye[2]);
@@ -2281,6 +2412,12 @@ async function generateLiveSVG() {{
     const svgText = await r.text();
     const elapsed = r.headers.get('X-Render-Seconds') || '?';
     const breakdown = r.headers.get('X-Render-Breakdown') || '';
+    // injectLiveSVG stores a view_dir for the Live entry; derive it from
+    // the eye/target we just sent so the dropdown's Live preset still
+    // round-trips for snap-back.
+    const _vdx = eye[0] - target[0], _vdy = eye[1] - target[1], _vdz = eye[2] - target[2];
+    const _vdL = Math.hypot(_vdx, _vdy, _vdz) || 1;
+    const view_dir = [_vdx / _vdL, _vdy / _vdL, _vdz / _vdL];
     window.IFU_VIEWER.injectLiveSVG(fid, view_dir, svgText);
     // Auto-switch to Split so the new SVG appears on the left next to the 3D
     window.IFU_VIEWER.setLayout?.('split');
