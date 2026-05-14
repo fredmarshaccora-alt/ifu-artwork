@@ -1456,7 +1456,14 @@ function init() {{
   scene.background = new THREE.Color(0xffffff);
 
   const r = canvas.getBoundingClientRect();
-  camera = new THREE.PerspectiveCamera(35, r.width / r.height || 1, 1, 200000);
+  // OrthographicCamera, NOT perspective: OCCT HLR uses orthographic
+  // projection, so the SVG never has converging lines.  If the 3D pane
+  // were perspective, the same iso direction would look different
+  // between 2D and 3D (perspective foreshortens far edges).  Bounds are
+  // re-fit in frame() per source; here we just set up the camera shell.
+  const aspect = (r.width || 1) / (r.height || 1);
+  camera = new THREE.OrthographicCamera(
+    -1000 * aspect, 1000 * aspect, 1000, -1000, -100000, 100000);
   camera.up.set(0, 0, 1);                // Z-up world: verticals stay vertical
   camera.position.set(-2000, -4000, 3000);
   camera.lookAt(0, 0, 0);
@@ -1537,7 +1544,18 @@ function resize() {{
   const r = canvas.getBoundingClientRect();
   if (r.width === 0 || r.height === 0) return;
   renderer.setSize(r.width, r.height, false);
-  camera.aspect = r.width / r.height;
+  // Ortho: maintain the on-screen scale by keeping (right - left) / width
+  // and (top - bottom) / height equal across resizes.  Use the existing
+  // half-height; recompute half-width from the new aspect.
+  if (camera.isOrthographicCamera) {{
+    const halfHeight = (camera.top - camera.bottom) / 2;
+    const aspect = r.width / r.height;
+    const halfWidth = halfHeight * aspect;
+    camera.left = -halfWidth;
+    camera.right = halfWidth;
+  }} else if (camera.isPerspectiveCamera) {{
+    camera.aspect = r.width / r.height;
+  }}
   camera.updateProjectionMatrix();
 }}
 
@@ -1640,8 +1658,61 @@ function frame(grp) {{
   let vd = window.IFU_VIEWER?.getActiveViewDir?.() || [-0.5, -1.0, 0.7];
   const dir = new THREE.Vector3(vd[0], vd[1], vd[2]).normalize();
   camera.position.copy(center).add(dir.multiplyScalar(maxDim * 2.2));
-  camera.near = maxDim / 100;
-  camera.far = maxDim * 20;
+  if (camera.isOrthographicCamera) {{
+    // Project the bbox 8 corners to camera-local axes, then size the
+    // ortho frustum to enclose them with a 10% pad.  This matches the
+    // HLR projection's natural fit on the SAME view_dir so 2D and 3D
+    // pane have equivalent zoom/extent.
+    const cornersWorld = [
+      new THREE.Vector3(bbox.min.x, bbox.min.y, bbox.min.z),
+      new THREE.Vector3(bbox.min.x, bbox.min.y, bbox.max.z),
+      new THREE.Vector3(bbox.min.x, bbox.max.y, bbox.min.z),
+      new THREE.Vector3(bbox.min.x, bbox.max.y, bbox.max.z),
+      new THREE.Vector3(bbox.max.x, bbox.min.y, bbox.min.z),
+      new THREE.Vector3(bbox.max.x, bbox.min.y, bbox.max.z),
+      new THREE.Vector3(bbox.max.x, bbox.max.y, bbox.min.z),
+      new THREE.Vector3(bbox.max.x, bbox.max.y, bbox.max.z),
+    ];
+    // Make sure camera matrices are current before we use them
+    camera.lookAt(center);
+    camera.updateMatrixWorld();
+    let minX = +Infinity, maxX = -Infinity, minY = +Infinity, maxY = -Infinity;
+    for (const c of cornersWorld) {{
+      const local = c.clone().applyMatrix4(camera.matrixWorldInverse);
+      if (local.x < minX) minX = local.x;
+      if (local.x > maxX) maxX = local.x;
+      if (local.y < minY) minY = local.y;
+      if (local.y > maxY) maxY = local.y;
+    }}
+    const padX = (maxX - minX) * 0.05;
+    const padY = (maxY - minY) * 0.05;
+    let left = minX - padX, right = maxX + padX;
+    let top = maxY + padY, bottom = minY - padY;
+    // Keep aspect ratio to the canvas so the model isn't stretched
+    const r = canvas.getBoundingClientRect();
+    const aspect = (r.width || 1) / (r.height || 1);
+    const w = right - left;
+    const h = top - bottom;
+    if (w / h > aspect) {{
+      // wider than canvas: expand vertically
+      const want_h = w / aspect;
+      const extra = (want_h - h) / 2;
+      top += extra; bottom -= extra;
+    }} else {{
+      const want_w = h * aspect;
+      const extra = (want_w - w) / 2;
+      left -= extra; right += extra;
+    }}
+    camera.left = left;
+    camera.right = right;
+    camera.top = top;
+    camera.bottom = bottom;
+    camera.near = -maxDim * 10;
+    camera.far = maxDim * 10;
+  }} else {{
+    camera.near = maxDim / 100;
+    camera.far = maxDim * 20;
+  }}
   camera.updateProjectionMatrix();
   controls.update();
 }}
@@ -1776,11 +1847,16 @@ async function generateLiveSVG() {{
   const fid = window.IFU_VIEWER.getActiveFileId();
   const dir = camera.position.clone().sub(controls.target).normalize();
   const view_dir = [dir.x, dir.y, dir.z];
+  // Send the focal point too -- HLR's projection centres on (0,0,0) by
+  // default, but the 3D viewer can be panned anywhere via OrbitControls.
+  // If we don't sync this, the SVG and 3D pane centre on different points
+  // and look like "different views" even when the direction is identical.
+  const focal = [controls.target.x, controls.target.y, controls.target.z];
   // Send the current Up: override so the server rotates the cached shape
   // the same way the 3D view did before running HLR -- otherwise the SVG
   // comes back in the model's native (unrotated) orientation.
   const upRot = window.IFU_VIEWER.getActiveUpAxis?.();
-  const body = {{ file_id: fid, view_dir }};
+  const body = {{ file_id: fid, view_dir, focal }};
   if (upRot && upRot.angle && upRot.angle !== 0) {{
     body.up_axis = {{ axis: upRot.axis, angle: upRot.angle }};
   }}

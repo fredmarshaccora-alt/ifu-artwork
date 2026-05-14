@@ -97,6 +97,7 @@ def render():
     body = request.get_json(silent=True) or {}
     file_id = body.get("file_id")
     view_dir = body.get("view_dir") or []
+    focal = body.get("focal")        # [x, y, z] world-space point the camera looks at
     up_axis = body.get("up_axis")    # {"axis": [x,y,z], "angle": deg} or None
     if file_id not in _SHAPES:
         return jsonify({"error": f"unknown source: {file_id!r}",
@@ -104,6 +105,10 @@ def render():
     if not (isinstance(view_dir, list) and len(view_dir) == 3):
         return jsonify({"error": "view_dir must be a 3-element [x, y, z] list"}), 400
     view_dir = tuple(float(x) for x in view_dir)
+    if isinstance(focal, list) and len(focal) == 3:
+        focal = tuple(float(x) for x in focal)
+    else:
+        focal = (0.0, 0.0, 0.0)
 
     shape, hlr_kw = _SHAPES[file_id]
     # Apply the 3D viewer's Up: override to a fresh copy so the SVG matches
@@ -120,7 +125,7 @@ def render():
             return jsonify({"error": f"bad up_axis: {exc}"}), 400
     t0 = time.time()
     try:
-        parts = run_hlr_per_solid(shape, view_dir, **hlr_kw)
+        parts = run_hlr_per_solid(shape, view_dir, focal=focal, **hlr_kw)
     except Exception as exc:
         return jsonify({"error": f"HLR failed: {type(exc).__name__}: {exc}"}), 500
 
