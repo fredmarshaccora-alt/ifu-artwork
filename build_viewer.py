@@ -511,6 +511,14 @@ HTML_TEMPLATE = r"""<!doctype html>
                             background: white; border-radius: 3px;
                             cursor: pointer; }}
   .three-toolbar button:hover {{ background: var(--accora-teal-pale); }}
+  .three-toolbar button.primary {{ background: var(--accora-teal); color: white;
+                                    border-color: var(--accora-teal);
+                                    font-weight: 600; padding: 4px 14px; }}
+  .three-toolbar button.primary:hover {{ background: #006e58; }}
+  .three-toolbar button:disabled {{ opacity: 0.6; cursor: wait; }}
+  .three-toolbar button.primary.unavailable {{
+    background: #c0c0c4; border-color: #c0c0c4; color: #fff; cursor: help;
+  }}
   /* Hide 2D-only header controls when in 3D-only layout (Split keeps them) */
   body.layout-3d #btn-smart,
   body.layout-3d #btn-detailed,
@@ -627,6 +635,11 @@ HTML_TEMPLATE = r"""<!doctype html>
   <div class="webgl-wrap" id="webgl-wrap">
     <canvas id="webgl-canvas"></canvas>
     <div class="three-toolbar">
+      <button id="btn-generate" class="primary"
+              title="Render an HLR SVG of the current camera angle and show it on the left. Requires the local server (python serve.py).">
+        &#9889; generate 2D
+      </button>
+      <span class="tb-sep"></span>
       <span id="viewdir-readout">view_dir = (—, —, —)</span>
       <button id="btn-lock-view" title="Copy view_dir tuple to clipboard">copy view_dir</button>
       <button id="btn-reset-3d" title="Frame the model from the active 2D view direction">reset camera</button>
@@ -1237,10 +1250,60 @@ function refreshTree() {{
   tree.forEach(n => treeRoot.appendChild(buildNode(n)));
 }}
 
+// Inject a freshly-rendered SVG (from the local server's /api/render) as a
+// "live" view for the given source.  Per-source: each source has its own
+// __live__ slot that gets overwritten on every generate.
+function injectLiveSVG(file_id, view_dir, svgText) {{
+  // Strip any XML prolog and stamp an id on the <svg> so existing helpers
+  // (applyTransform / attachInteractivity) can find it.
+  const cleaned = svgText
+    .replace(/<\\?xml[^>]*\\?>\\s*/, '')
+    .replace('<svg', `<svg id="svg_${{file_id}}___live__"`);
+
+  // Re-use or create the live pane for this source.
+  let pane = document.querySelector(
+    `.svg-pane[data-file="${{file_id}}"][data-view="__live__"]`
+  );
+  if (!pane) {{
+    pane = document.createElement('div');
+    pane.className = 'svg-pane';
+    pane.dataset.file = file_id;
+    pane.dataset.view = '__live__';
+    pane.dataset.svgId = `svg_${{file_id}}___live__`;
+    canvasWrap.appendChild(pane);
+  }}
+  pane.innerHTML = cleaned;
+  // attached flag must be cleared so attachInteractivity rewires the new svg
+  pane.querySelector('svg')?.removeAttribute('data-attached');
+
+  // Add or update the "Live" option in the View dropdown (per-source).
+  const fe = CATALOGUE.find(x => x.file_id === file_id);
+  if (fe) {{
+    let existing = fe.views.find(v => v.view_id === '__live__');
+    if (existing) {{
+      existing.view_dir = view_dir;
+    }} else {{
+      fe.views.push({{
+        view_id: '__live__',
+        label: '\\u26A1 Live (from 3D)',
+        view_dir: view_dir,
+      }});
+    }}
+  }}
+  // Refresh the View dropdown if this is the active source
+  if (fileSel.value === file_id) {{
+    refreshViews();
+    viewSel.value = '__live__';
+    refreshPane();
+  }}
+}}
+
 // Expose for the module script (cross-script comms)
 window.IFU_VIEWER = {{
   togglePartHighlight,
   clearHighlights,
+  injectLiveSVG,
+  setLayout: (name) => setLayout(name),
   getActiveFileId: () => fileSel.value,
   getActiveViewDir: () => {{
     const fe = CATALOGUE.find(x => x.file_id === fileSel.value);
@@ -1653,6 +1716,79 @@ window.IFU_VIEWER.applyUpAxisOverride = (rot) => {{
   applyUpAxisOverride(rot);
 }};
 window.IFU_VIEWER.set3DActive = set3DActive;
+window.IFU_VIEWER.getCurrentViewDir = () => {{
+  if (!camera || !controls) return null;
+  const d = camera.position.clone().sub(controls.target).normalize();
+  return [d.x, d.y, d.z];
+}};
+
+// --- Generate-from-3D: button in the 3D toolbar -----------------------------
+// Calls the local server's /api/render with the current camera direction,
+// then injects the returned SVG as a special "live" view in the 2D pane.
+// If the server isn't running, the button greys out with a helpful tooltip.
+const btnGen = document.getElementById('btn-generate');
+
+async function probeServer() {{
+  // file:// pages can't fetch anything; skip the probe entirely so we
+  // don't pollute the console with "URL scheme not supported" errors.
+  if (location.protocol === 'file:') return false;
+  try {{
+    const r = await fetch('/api/healthz', {{ cache: 'no-store' }});
+    if (!r.ok) throw new Error('healthz ' + r.status);
+    const data = await r.json();
+    return data && data.ok;
+  }} catch (_e) {{
+    return false;
+  }}
+}}
+
+async function generateLiveSVG() {{
+  if (!camera || !controls) return;
+  const fid = window.IFU_VIEWER.getActiveFileId();
+  const dir = camera.position.clone().sub(controls.target).normalize();
+  const view_dir = [dir.x, dir.y, dir.z];
+
+  const orig = btnGen.innerHTML;
+  btnGen.disabled = true;
+  btnGen.innerHTML = '&#8987; rendering ...';
+
+  try {{
+    const r = await fetch('/api/render', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ file_id: fid, view_dir }}),
+    }});
+    if (!r.ok) {{
+      const err = await r.json().catch(() => ({{ error: 'HTTP ' + r.status }}));
+      throw new Error(err.error || 'HTTP ' + r.status);
+    }}
+    const svgText = await r.text();
+    const elapsed = r.headers.get('X-Render-Seconds') || '?';
+    window.IFU_VIEWER.injectLiveSVG(fid, view_dir, svgText);
+    // Auto-switch to Split so the new SVG appears on the left next to the 3D
+    window.IFU_VIEWER.setLayout?.('split');
+    btnGen.innerHTML = `&#10003; ${{elapsed}}s`;
+  }} catch (e) {{
+    console.error('generate failed:', e);
+    btnGen.innerHTML = '&#10007; ' + (e.message || 'render failed');
+  }} finally {{
+    setTimeout(() => {{ btnGen.disabled = false; btnGen.innerHTML = orig; }}, 2500);
+  }}
+}}
+
+btnGen.addEventListener('click', generateLiveSVG);
+
+// Decide whether the server is reachable at load time and grey the button
+// out if not (file:// or stand-alone deployment).
+probeServer().then((alive) => {{
+  if (!alive) {{
+    btnGen.classList.add('unavailable');
+    btnGen.disabled = true;
+    btnGen.title = "Local server not reachable. Start it with:\\n"
+                   + "  python serve.py\\n"
+                   + "then open http://localhost:5000";
+  }}
+}});
 </script>
 </body>
 </html>
