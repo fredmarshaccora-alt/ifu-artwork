@@ -40,6 +40,51 @@ use, in priority order.  Every item ships in this rhythm:
 No phase gates, no productisation track, no cloud build-out.  Just:
 make-it-better, with regression protection.
 
+## Build status
+
+| Phase | Status | What shipped |
+|---|---|---|
+| A | done | Figures-on-disk, CRUD endpoints, threaded server + OCCT lock |
+| B | done | Projects layer, per-project figures, project picker UI |
+| C | done | Onshape Versions polling, revision cache, status badges on figures |
+| D-lite | done | Manual `bind_revision` endpoint + audit log on figures |
+| D-full | **deferred** | Onshape STEP-export-at-Version API integration + selection-conflict diff UI -- next time we need it |
+| E | partial | Keyboard shortcuts shipped (1/2/3/R/F/Esc); view-cube gizmo, thumbnails, undo/redo all deferred |
+
+## D-full (deferred work)
+
+When this is worth shipping, the missing pieces are:
+
+1. New module `ifu/onshape_step_fetch.py`:
+   ```python
+   def fetch_step_at_version(did, vid, eid) -> Path:
+       # POST /api/assemblies/d/{did}/v/{vid}/e/{eid}/translations
+       # body: {formatName: "STEP", storeInDocument: false}
+       # Poll /api/translations/{job_id} until DONE
+       # GET /api/documents/d/{did}/externaldata/{ext_id}
+       # Save to out/sources/{source_id}/revisions/{vid}/source.step
+   ```
+2. Endpoint `POST /api/figures/{id}/preview_update?to=vid`:
+   - Fetches STEP at target Version (cached after first hit)
+   - Imports + pre-rotates per SOURCES entry
+   - Runs HLR with figure's camera + applied styles
+   - Returns SVG bytes
+3. Endpoint `POST /api/figures/{id}/commit_update`:
+   - Same as preview but persists the new figure render as the canonical one
+   - Updates `bound_revision` and writes audit entry
+4. UI: side-by-side modal (current vs preview), conflict resolution
+   when a selected part_idx doesn't map across the revision split.
+
+Until that ships, the manual workflow is:
+  - download new STEP from Onshape Versions page (browser)
+  - drop it on top of the local SOURCES path
+  - restart `serve.py`
+  - in UI: refresh versions -> click figure -> "bind to revision" -> R04
+  - the figure's bound_revision metadata is correct; visible rendering
+    will reflect the new STEP from the server's next boot
+
+---
+
 ## Active priorities (May 2026)
 
 ### P1 — Easy 3D <-> 2D sync (the big one)

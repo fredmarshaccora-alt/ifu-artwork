@@ -283,6 +283,54 @@ def versions_refresh(source_id):
     return jsonify(env)
 
 
+@app.route("/api/figures/<fig_id>/bind_revision", methods=["POST"])
+def figure_bind_revision(fig_id):
+    """Bind a figure to a specific cached Version of its source.
+
+    Body: ``{version_id: "..."}``.  The full Version dict is stamped onto
+    the figure's ``bound_revision`` field (id, name, description, created_at,
+    microversion) so we can detect "N behind latest" without an extra
+    cache hit later.
+
+    Phase D-lite: this updates metadata only.  Actually re-rendering the
+    figure against the new geometry requires pulling the STEP at the
+    target Version from Onshape and rerunning HLR -- that's the
+    "Phase D-full" work tracked in PLAN.md.
+    """
+    body = request.get_json(silent=True) or {}
+    version_id = body.get("version_id")
+    if not version_id:
+        return jsonify({"error": "version_id required"}), 400
+    fig = figures_store.load(fig_id)
+    if fig is None:
+        return jsonify({"error": "figure not found"}), 404
+    src = fig.get("source_id")
+    ver = revisions_store.find_version(src, version_id) if src else None
+    if ver is None:
+        return jsonify({"error":
+            f"version {version_id!r} not in cache for {src!r}; "
+            "refresh first"}), 404
+    fig["bound_revision"] = {
+        "id": ver["id"],
+        "name": ver.get("name"),
+        "description": ver.get("description", ""),
+        "created_at": ver.get("created_at"),
+        "microversion": ver.get("microversion"),
+        "bound_at": figures_store._now_iso(),
+    }
+    # Append to an audit log so the illustrator can see "I bound this
+    # figure to R04 on date X" later.
+    audit = fig.setdefault("audit", [])
+    audit.append({
+        "what": "bind_revision",
+        "version_id": ver["id"],
+        "version_name": ver.get("name"),
+        "at": figures_store._now_iso(),
+    })
+    figures_store.save(fig)
+    return jsonify(fig)
+
+
 @app.route("/api/figures/<fig_id>/revision_status", methods=["GET"])
 def figure_revision_status(fig_id):
     """Quick lookup: 'this figure is bound to revision X, latest is Y,

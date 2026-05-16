@@ -2045,6 +2045,41 @@ async function refreshVersionsForActiveSource() {{
 
 $('btn-revs-refresh').addEventListener('click', refreshVersionsForActiveSource);
 
+// Browser-prompt-based version picker.  Lists the cached Versions
+// newest-first and asks the user which one to bind to.  Single-user
+// local tool -- not worth a fancy modal yet.
+async function _promptBindRevision(figureId, versions) {{
+  if (!versions || !versions.length) {{
+    alert('No cached Versions for this source. Refresh first.');
+    return;
+  }}
+  const lines = versions.map((v, i) =>
+    `${{i + 1}}. ${{v.name || '?'}}  (${{(v.created_at || '').slice(0, 10)}})`
+  ).join('\\n');
+  const pick = prompt(
+    'Bind to which Version?\\n\\n' + lines + '\\n\\nEnter number (1-'
+      + versions.length + ') or blank to cancel:');
+  if (!pick) return;
+  const idx = parseInt(pick) - 1;
+  if (Number.isNaN(idx) || idx < 0 || idx >= versions.length) {{
+    alert('Invalid choice.');
+    return;
+  }}
+  const target = versions[idx];
+  const r = await fetch(API_BASE + '/api/figures/'
+                          + encodeURIComponent(figureId) + '/bind_revision', {{
+    method: 'POST',
+    headers: {{ 'Content-Type': 'application/json' }},
+    body: JSON.stringify({{ version_id: target.id }}),
+  }});
+  if (!r.ok) {{
+    const err = await r.json().catch(() => ({{}}));
+    alert('Bind failed: ' + (err.error || ('HTTP ' + r.status)));
+    return;
+  }}
+  refreshFiguresList();
+}}
+
 // Re-render the figures list with revision badges.  Wraps the prior
 // refresh so we can stamp a small ⬆/✓ on each <li>.
 const _refreshFiguresList_phaseC = refreshFiguresList;
@@ -2066,16 +2101,49 @@ refreshFiguresList = async function() {{
       badge.style.fontSize = '10px';
       badge.style.marginRight = '4px';
       if (s.versions_behind === null || s.versions_behind === undefined) {{
-        // No bound revision OR no cache -- nothing to say
-        continue;
+        // No bound revision OR no cache -- show a "bind" button if there
+        // ARE cached versions for the source, otherwise skip.
+        const vresp = await fetch(API_BASE + '/api/sources/'
+                                    + encodeURIComponent(s.source_id || '')
+                                    + '/versions').catch(() => null);
+        const versions = vresp && vresp.ok
+          ? ((await vresp.json()).versions || []) : [];
+        if (versions.length === 0) continue;
+        badge.textContent = '⚓';
+        badge.style.color = '#888';
+        badge.style.cursor = 'pointer';
+        badge.title = `Bind this figure to a Version. ${{versions.length}} cached.`;
+        badge.addEventListener('click', (e) => {{
+          e.stopPropagation();
+          _promptBindRevision(s.figure_id, versions);
+        }});
       }} else if (s.versions_behind === 0) {{
         badge.textContent = '✓';
         badge.style.color = '#0a8';
-        badge.title = 'Up to date with the latest Version';
+        badge.style.cursor = 'pointer';
+        badge.title = 'Bound to the latest Version. Click to re-bind.';
+        badge.addEventListener('click', async (e) => {{
+          e.stopPropagation();
+          const vresp = await fetch(API_BASE + '/api/sources/'
+                                       + encodeURIComponent(s.source_id)
+                                       + '/versions');
+          const versions = (await vresp.json()).versions || [];
+          _promptBindRevision(s.figure_id, versions);
+        }});
       }} else {{
         badge.textContent = '⬆' + s.versions_behind;
         badge.style.color = '#c70';
-        badge.title = `Figure is bound to ${{s.bound_revision?.name || '?'}}; latest is ${{s.latest_revision?.name || '?'}}`;
+        badge.style.cursor = 'pointer';
+        badge.title = `Bound to ${{s.bound_revision?.name || '?'}}; latest is `
+                    + `${{s.latest_revision?.name || '?'}}. Click to re-bind.`;
+        badge.addEventListener('click', async (e) => {{
+          e.stopPropagation();
+          const vresp = await fetch(API_BASE + '/api/sources/'
+                                       + encodeURIComponent(s.source_id)
+                                       + '/versions');
+          const versions = (await vresp.json()).versions || [];
+          _promptBindRevision(s.figure_id, versions);
+        }});
       }}
       li.insertBefore(badge, li.firstChild);
     }} catch (_e) {{}}
