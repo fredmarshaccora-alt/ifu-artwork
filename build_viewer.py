@@ -3836,6 +3836,27 @@ function injectLiveSVG(file_id, view_dir, svgText) {{
     .replace(/<\\?xml[^>]*\\?>\\s*/, '')
     .replace('<svg', `<svg id="svg_${{file_id}}___live__"`);
 
+  // CRITICAL: every cached overlay keyed by (file_id, '__live__') is
+  // tied to the camera the previous render used.  We're about to swap
+  // in geometry from a DIFFERENT camera, so the stored polylines no
+  // longer correspond to the new SVG's pixel space.  If we don't drop
+  // them, the next applyHighlights() will paint last-camera footprints
+  // onto this-camera SVG -- closed loops in the wrong place.
+  const vid = '__live__';
+  for (const k of Array.from(_footprintCache.keys())) {{
+    if (k.startsWith(file_id + '|' + vid + '|')) _footprintCache.delete(k);
+  }}
+  for (const k of Array.from(_trueSilCache.keys())) {{
+    if (k.startsWith(file_id + '|' + vid + '|')) _trueSilCache.delete(k);
+  }}
+  for (const k of Array.from(_groupSilCache.keys())) {{
+    if (k.startsWith(file_id + '|' + vid + '|')) _groupSilCache.delete(k);
+  }}
+  _footprintViewFetched.delete(_fpViewKey(file_id, vid));
+  // Force the next fetchSelected* to re-fetch even if the selection
+  // didn't change between renders.
+  _lastSilHighlightSig = '__force_refetch__';
+
   // Re-use or create the live pane for this source.
   let pane = document.querySelector(
     `.svg-pane[data-file="${{file_id}}"][data-view="__live__"]`
