@@ -2434,13 +2434,27 @@ function init() {{
   renderer.setSize(r.width, r.height, false);
   renderer.setPixelRatio(window.devicePixelRatio || 1);
 
-  scene.add(new THREE.AmbientLight(0xffffff, 0.7));
-  const sun = new THREE.DirectionalLight(0xffffff, 0.55);
+  scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+  const sun = new THREE.DirectionalLight(0xffffff, 0.85);
   sun.position.set(1, -1, 1.5);
   scene.add(sun);
-  const fill = new THREE.DirectionalLight(0xffffff, 0.25);
+  const fill = new THREE.DirectionalLight(0xffffff, 0.30);
   fill.position.set(-1, 0.5, -0.5);
   scene.add(fill);
+  const rim = new THREE.DirectionalLight(0xffffff, 0.20);
+  rim.position.set(0, 1, -1);
+  scene.add(rim);
+
+  // Ground grid + world axes for orientation reference.  Sized
+  // generously so they remain visible at any source bbox; auto-resize
+  // happens in frame() once the model is loaded.
+  const grid = new THREE.GridHelper(4000, 40, 0xcccccc, 0xeeeeee);
+  grid.rotation.x = Math.PI / 2;  // GridHelper is XZ-plane; flip to XY (Z-up)
+  grid.userData._helper = true;
+  scene.add(grid);
+  const axes = new THREE.AxesHelper(300);
+  axes.userData._helper = true;
+  scene.add(axes);
 
   controls = new OrbitControls(camera, canvas);
   controls.target.set(0, 0, 0);
@@ -2585,8 +2599,12 @@ function loadSource(file_id) {{
     const grp = gltf.scene;
     grp.traverse(obj => {{
       if (obj.isMesh) {{
-        obj.material = new THREE.MeshLambertMaterial({{
-          color: 0xe8e8ea, transparent: false, side: THREE.DoubleSide,
+        // PBR material gives the surface a subtle sheen + proper
+        // response to the rim/sun/fill lighting, instead of the flat
+        // Lambert "construction paper" look.
+        obj.material = new THREE.MeshStandardMaterial({{
+          color: 0xe8e8ea, metalness: 0.15, roughness: 0.55,
+          transparent: false, side: THREE.DoubleSide,
           polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1,
         }});
         // crease edges only (>=30deg dihedral) for a Composer-ish look
@@ -2789,8 +2807,13 @@ window.IFU_VIEWER.onViewChange(() => {{
   if (is3DVisible()) snapToPresetView();
 }});
 
-// Expose for the classic script's selection + orientation + layout handlers.
+// Expose for the classic script's selection + orientation + layout handlers,
+// plus debug/test access to the underlying three.js scene.
 window.IFU_VIEWER.applyHighlights3D = applyHighlights3D;
+window.IFU_VIEWER._scene = () => scene;
+window.IFU_VIEWER._camera = () => camera;
+window.IFU_VIEWER._renderer = () => renderer;
+window.IFU_VIEWER._active = () => active;
 window.IFU_VIEWER.applyUpAxisOverride = (rot) => {{
   applyUpAxisOverride(rot);
 }};
