@@ -1792,13 +1792,36 @@ async function saveCurrentAsFigure() {{
 
 function _loadFigureIntoEditor(fig) {{
   // Restore: source -> view -> camera -> selection -> styles -> layers
+  // Confirm before clobbering current state -- it's destructive and
+  // there's no undo.  Skip the prompt if the editor is in a "fresh"
+  // state (no selection, no applied styles).
+  const curSt = getState(fileSel.value, viewSel.value);
+  const curStyles = loadPartStyles(fileSel.value) || {{}};
+  const hasWork = (curSt.highlights && curSt.highlights.size > 0)
+               || Object.keys(curStyles).length > 0;
+  if (hasWork) {{
+    if (!confirm(`Loading "${{fig.name}}" will replace the current `
+                + `selection and applied styles.  Continue?`)) return;
+  }}
+
   if (fig.source_id && fig.source_id !== fileSel.value) {{
     fileSel.value = fig.source_id;
     fileSel.dispatchEvent(new Event('change'));
   }}
+  // Only switch view if the figure's view actually exists for this
+  // source.  An unknown id (e.g. saved __live__ from a previous
+  // session that's since been wiped) would blank the canvas.
   if (fig.view_id && fig.view_id !== viewSel.value) {{
-    viewSel.value = fig.view_id;
-    viewSel.dispatchEvent(new Event('change'));
+    const valid = Array.from(viewSel.options)
+                       .some(o => o.value === fig.view_id);
+    if (valid) {{
+      viewSel.value = fig.view_id;
+      viewSel.dispatchEvent(new Event('change'));
+    }} else {{
+      console.warn(`figure ${{fig.name}}: view_id ${{fig.view_id}} `
+                  + `not available on source ${{fig.source_id}}; `
+                  + `keeping current view`);
+    }}
   }}
   if (fig.camera && fig.camera.eye && fig.camera.target) {{
     window.IFU_VIEWER?.snapCameraTo?.(fig.camera.eye, fig.camera.target);
@@ -1809,7 +1832,9 @@ function _loadFigureIntoEditor(fig) {{
   }}
   const st = getState(fig.source_id, fig.view_id || viewSel.value);
   st.highlights = new Set(fig.selection || []);
-  if (fig.styles_per_part) {{
+  // Only overwrite styles when the figure has some to apply -- never
+  // wipe the user's current per-part styling for an empty figure.
+  if (fig.styles_per_part && Object.keys(fig.styles_per_part).length > 0) {{
     persistPartStyles(fig.source_id, fig.styles_per_part);
   }}
   if (fig.layers_on) {{
@@ -1825,6 +1850,9 @@ function _loadFigureIntoEditor(fig) {{
   applyStyleSheet();
   applyHighlights();
 }}
+
+// Expose for tests + ad-hoc debugging
+window._loadFigureIntoEditor = _loadFigureIntoEditor;
 
 async function refreshFiguresList() {{
   if (!figuresList) return;
