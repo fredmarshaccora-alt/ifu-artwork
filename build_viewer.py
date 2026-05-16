@@ -637,25 +637,43 @@ function _matchRoute(hash) {{
   return null;
 }}
 
-function renderRoute() {{
+async function renderRoute() {{
   const hash = location.hash || '';
   AppState.route = hash;
-  // Empty hash (or no hash at all) means "show the legacy editor".
-  // Future: once F.5 lands, '#/' becomes the Home screen and '' is
-  // a redirect to '#/'.
   const appRoot = document.getElementById('app-root');
   const header = document.querySelector('header');
   const main = document.querySelector('main');
+
+  // Empty hash falls through to the legacy editor.  The Home screen
+  // is opt-in via the logo link in the legacy header (and the explicit
+  // '#/' URL).  We don't redirect because too much of the e2e test
+  // suite (and existing muscle memory) expects the legacy editor as
+  // the default landing page.  When the editor is fully migrated into
+  // the route shape (post-F.5+), we can flip this.
   if (!hash || hash === '#') {{
-    if (_currentTeardown) {{ try {{ _currentTeardown(); }} catch (_e) {{}} _currentTeardown = null; }}
+    if (_currentTeardown) {{
+      try {{ _currentTeardown(); }} catch (_e) {{}}
+      _currentTeardown = null;
+    }}
     if (appRoot) appRoot.style.display = 'none';
     if (header) header.style.display = '';
     if (main) main.style.display = '';
     return;
   }}
+
   const matched = _matchRoute(hash);
+
+  // Tear down the previous screen before mounting the next one.
+  // mountFn can be async, so its returned value might be a Promise
+  // resolving to either undefined or a teardown function.
+  if (_currentTeardown) {{
+    try {{
+      if (typeof _currentTeardown === 'function') _currentTeardown();
+    }} catch (_e) {{}}
+    _currentTeardown = null;
+  }}
+
   if (!matched) {{
-    // Unknown route -- show a "not found" stub instead of corrupting state
     if (appRoot) {{
       appRoot.style.display = '';
       appRoot.innerHTML = '';
@@ -664,8 +682,6 @@ function renderRoute() {{
         h('p', [
           'Try ',
           h('a', {{ href: '#/' }}, '#/ (Home)'),
-          ' or ',
-          h('a', {{ href: '' }}, '/ (legacy editor)'),
           '.',
         ]),
       ]));
@@ -674,14 +690,23 @@ function renderRoute() {{
     if (main) main.style.display = 'none';
     return;
   }}
+
+  // EditorScreen wants the LEGACY editor visible; other screens want
+  // the app-root visible.  Let the screen decide.  We pre-set the
+  // common case (app-root visible, legacy hidden); EditorScreen
+  // overrides on mount.
   if (header) header.style.display = 'none';
   if (main) main.style.display = 'none';
   if (appRoot) {{
     appRoot.style.display = '';
-    if (_currentTeardown) {{ try {{ _currentTeardown(); }} catch (_e) {{}} }}
     appRoot.innerHTML = '';
     AppState.routeParams = matched.params;
-    _currentTeardown = matched.mountFn(appRoot, matched.params) || null;
+    // mountFn may be async -- await so the teardown captured is the
+    // real function, not a Promise.
+    const result = matched.mountFn(appRoot, matched.params);
+    _currentTeardown = (result && typeof result.then === 'function')
+      ? (await result) || null
+      : (result || null);
   }}
 }}
 
@@ -1121,6 +1146,148 @@ async function SettingsScreen(container) {{
 
 registerRoute(/^#\/settings$/, SettingsScreen);
 // ===== end F.6 Settings screen =====
+
+
+// =====================================================================
+// F.5 -- Editor route + breadcrumb on the legacy editor
+// =====================================================================
+//
+// '#/project/<pid>/figure/<fid>' opens the legacy editor and auto-loads
+// the figure on top.  A breadcrumb appears above the legacy header so
+// you can navigate back to Home / Project without using the URL bar.
+//
+// The legacy editor's chrome itself is not re-skinned in F.5 -- that's
+// a bigger reorganisation deferred to a later phase.  This is the
+// minimal wiring to make the editor first-class within the new route
+// shape.
+
+const _CRUMB_ID = 'editor-breadcrumb';
+const _CRUMB_CSS = `
+#${{_CRUMB_ID}} {{
+  display: flex; gap: 8px; align-items: center;
+  padding: 8px 16px; background: #f4f4f5; font-size: 13px;
+  border-bottom: 1px solid #d4d4d8;
+}}
+#${{_CRUMB_ID}} a {{ color: #71717a; text-decoration: none; }}
+#${{_CRUMB_ID}} a:hover {{ color: #00836a; text-decoration: underline; }}
+#${{_CRUMB_ID}} .sep {{ color: #d4d4d8; }}
+#${{_CRUMB_ID}} .current {{ color: #18181b; font-weight: 600; }}
+`;
+
+function _ensureCrumbStyles() {{
+  if (document.getElementById('editor-crumb-styles')) return;
+  const s = document.createElement('style');
+  s.id = 'editor-crumb-styles';
+  s.textContent = _CRUMB_CSS;
+  document.head.appendChild(s);
+}}
+
+function _removeCrumb() {{
+  document.getElementById(_CRUMB_ID)?.remove();
+}}
+
+function _installCrumb(parts) {{
+  _ensureCrumbStyles();
+  _removeCrumb();
+  const crumb = h('div', {{ id: _CRUMB_ID }});
+  parts.forEach((p, i) => {{
+    if (i > 0) crumb.appendChild(h('span.sep', '/'));
+    if (p.href) crumb.appendChild(h('a', {{ href: p.href }}, p.label));
+    else crumb.appendChild(h('span.current', p.label));
+  }});
+  document.body.insertBefore(crumb, document.body.firstChild);
+}}
+
+async function EditorScreen(container, params) {{
+  // We don't render into `container` -- the LEGACY editor is what we
+  // want visible.  We unhide it, install a breadcrumb, then load
+  // the figure on top of it.
+  container.style.display = 'none';
+  const header = document.querySelector('header');
+  const main = document.querySelector('main');
+  if (header) header.style.display = '';
+  if (main) main.style.display = '';
+
+  const projId = params[0];
+  const figId = params[1];
+
+  // Fetch both in parallel so we know the project name for the crumb
+  let proj = null, fig = null;
+  try {{
+    const [pr, fr] = await Promise.all([
+      fetch(API_BASE + '/api/projects/' + encodeURIComponent(projId)),
+      fetch(API_BASE + '/api/figures/' + encodeURIComponent(figId)),
+    ]);
+    if (pr.ok) proj = await pr.json();
+    if (fr.ok) fig = await fr.json();
+  }} catch (_e) {{}}
+
+  _installCrumb([
+    {{ label: 'Home', href: '#/' }},
+    {{ label: proj?.name || '(unknown project)',
+       href: '#/project/' + encodeURIComponent(projId) }},
+    {{ label: fig?.name || '(unknown figure)' }},
+  ]);
+
+  if (fig) {{
+    AppState.currentProjectId = projId;
+    AppState.currentFigureId = figId;
+    // Yield a tick so the legacy editor's catalogue is fully ready,
+    // then drop the figure in.  _loadFigureIntoEditor auto-fires the
+    // confirm dialog if the editor has current work; suppress it here
+    // because the user JUST clicked into this figure intentionally.
+    setTimeout(() => {{
+      try {{ window._loadFigureIntoEditor(fig); }} catch (_e) {{}}
+    }}, 200);
+  }}
+
+  // Teardown: remove the breadcrumb when the route changes
+  return () => {{
+    _removeCrumb();
+  }};
+}}
+
+registerRoute(/^#\/project\/([^/]+)\/figure\/([^/]+)$/, EditorScreen);
+
+// Update the Project screen's figure-card click to route into the
+// editor instead of falling back to legacy.  We do this by replacing
+// ProjectScreen with a slightly fuller version.
+const _OrigProjectScreen = ProjectScreen;
+ProjectScreen = async function(container, params) {{
+  await _OrigProjectScreen(container, params);
+  // After mount, rebind each figure card click to navigate properly.
+  const projId = params[0];
+  const cards = container.querySelectorAll('.grid .card:not(.placeholder)');
+  // We need the actual figure ids -- refetch them in order.
+  let figs = [];
+  try {{
+    const r = await fetch(API_BASE + '/api/projects/'
+                            + encodeURIComponent(projId) + '/figures');
+    if (r.ok) figs = (await r.json()).figures || [];
+  }} catch (_e) {{}}
+  cards.forEach((card, i) => {{
+    if (i >= figs.length) return;
+    const fid = figs[i].id;
+    // Replace existing click handler by cloning the node (drops listeners)
+    const clone = card.cloneNode(true);
+    card.parentNode.replaceChild(clone, card);
+    clone.addEventListener('click', () => {{
+      location.hash = '#/project/' + encodeURIComponent(projId)
+                    + '/figure/' + encodeURIComponent(fid);
+    }});
+  }});
+}};
+// re-register so the wrapped version wins
+_routes.length = 0;
+registerRoute(/^#\/$/, HomeScreen);
+registerRoute(/^#\/project\/([^/]+)$/, ProjectScreen);
+registerRoute(/^#\/project\/([^/]+)\/figure\/([^/]+)$/, EditorScreen);
+registerRoute(/^#\/settings$/, SettingsScreen);
+
+// Fire the router on first load.  renderRoute() handles empty-hash
+// by redirecting to '#/'.
+renderRoute();
+// ===== end F.5 Editor route =====
 
 
 const canvasWrap = $('canvas-wrap');

@@ -24,21 +24,19 @@ def test_app_shell_exposes_router_api(page):
 
 
 def test_empty_hash_shows_legacy_editor(page):
-    """No hash (or just '#') falls through to the legacy header+main."""
+    """No hash falls through to the legacy header+main.  The Home screen
+    is opt-in via the logo link (or explicit '#/' URL).  Once the
+    editor is fully migrated, we'll flip the default."""
     page.evaluate("location.hash = ''")
-    page.evaluate("window.IFU_APP.renderRoute()")
-    page.wait_for_timeout(100)
+    page.wait_for_timeout(300)
     state = page.evaluate("""() => ({
-        header_visible: !!document.querySelector('header')
-            && getComputedStyle(document.querySelector('header')).display !== 'none',
-        main_visible: !!document.querySelector('main')
-            && getComputedStyle(document.querySelector('main')).display !== 'none',
-        app_root_visible: !!document.getElementById('app-root')
-            && getComputedStyle(document.getElementById('app-root')).display !== 'none',
+        header_visible: getComputedStyle(document.querySelector('header')).display !== 'none',
+        main_visible: getComputedStyle(document.querySelector('main')).display !== 'none',
+        app_root_visible: getComputedStyle(document.getElementById('app-root')).display !== 'none',
     })""")
-    assert state["header_visible"], "legacy header should be visible at empty hash"
-    assert state["main_visible"], "legacy main should be visible at empty hash"
-    assert not state["app_root_visible"], "app-root should be hidden at empty hash"
+    assert state["header_visible"]
+    assert state["main_visible"]
+    assert not state["app_root_visible"]
 
 
 def test_unknown_route_shows_stub_and_hides_legacy(page):
