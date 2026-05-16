@@ -375,14 +375,16 @@ def render():
     t_hlr = time.time() - t_hlr0
     # Count what came out -- if everything's zero the user sees a blank
     # SVG, which is the "I clicked Generate and nothing happened" symptom.
+    # run_hlr_per_solid returns dicts with key "polys" (not "categories"
+    # or "polylines"); each value is {category: [polyline, ...]} where a
+    # polyline is a list of (x, y) tuples.
     n_polys = 0
     n_parts_with_geom = 0
     for pe in parts or []:
-        cats = pe.get("categories") or {}
+        cats = pe.get("polys") or pe.get("categories") or {}
         any_seg = False
-        for cat_name, polylines in cats.items():
+        for _cat_name, polylines in cats.items():
             for poly in polylines or []:
-                # poly is a list of (x, y) tuples
                 if poly and len(poly) >= 2:
                     n_polys += 1
                     any_seg = True
