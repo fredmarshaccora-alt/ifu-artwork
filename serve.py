@@ -39,7 +39,7 @@ from t5_hlr_vector import (
     run_part_silhouettes, run_group_silhouette,
     compute_visible_footprints, run_hlr_in_region,
 )
-from ifu import figures_store, projects_store, revisions_store
+from ifu import figures_store, projects_store, revisions_store, settings_store
 from ifu.config import SOURCES
 import threading
 import functools
@@ -238,6 +238,34 @@ def render():
         "X-Render-Seconds": f"{elapsed:.2f}",
         "X-Render-Breakdown": breakdown,
     })
+
+
+# ----- Settings (F.1) ------------------------------------------------
+
+@app.route("/api/settings", methods=["GET"])
+def settings_get():
+    """Return the merged app-level settings document."""
+    return jsonify(settings_store.load())
+
+
+@app.route("/api/settings", methods=["PUT", "PATCH"])
+def settings_update():
+    """Merge the request body onto current settings and persist.
+
+    PUT and PATCH are semantically identical here -- both partial.  We
+    accept both verbs because PATCH is the strictly-correct REST verb
+    but PUT-as-partial is widespread in single-tenant tools.
+    """
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return jsonify({"error": "body must be an object"}), 400
+    return jsonify(settings_store.save(body))
+
+
+@app.route("/api/settings/reset", methods=["POST"])
+def settings_reset():
+    """Replace settings.json with DEFAULT_SETTINGS.  Returns fresh dict."""
+    return jsonify(settings_store.reset())
 
 
 # ----- Sources + Revisions (Phase C) ---------------------------------

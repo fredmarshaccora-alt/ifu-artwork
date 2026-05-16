@@ -68,6 +68,10 @@ def test_load_figure_restores_selection(page):
     # Clear selection
     page.evaluate("window.clearHighlights()")
     page.wait_for_timeout(200)
+    # Auto-accept the confirm() dialog the safety check fires.  After
+    # clearing, no current work remains so the dialog should be skipped,
+    # but register the handler defensively in case the test runs again.
+    page.on("dialog", lambda d: d.accept())
     # Click the figure name to restore
     page.evaluate("""() => {
         const list = document.getElementById('figures-list');

@@ -31,6 +31,7 @@ from .catalogue import save_catalogue, load_catalogue
 from . import figures as figures_store
 from . import projects as projects_store
 from . import revisions as revisions_store
+from . import settings as settings_store
 
 __all__ = [
     "HERE", "OUT",
@@ -42,4 +43,5 @@ __all__ = [
     "generate_svgs",
     "save_catalogue", "load_catalogue",
     "figures_store", "projects_store", "revisions_store",
+    "settings_store",
 ]

@@ -529,10 +529,168 @@ HTML_TEMPLATE = r"""<!doctype html>
   </aside>
 </main>
 
+<!--
+  F.2 mount point for the new app screens.  Empty + hidden by default
+  so the legacy editor (the <header> + <main> above) stays the home
+  page; the router only flips this visible when the URL has a hash
+  matching one of the new routes (#/, #/project/<id>, etc.).
+-->
+<div id="app-root" style="display:none; padding: 24px;
+                           font-family: Arial, sans-serif;"></div>
+
 <script>
 {js_catalogue}
 
 const $ = (id) => document.getElementById(id);
+
+// =====================================================================
+// F.2 -- App shell: hash router + AppState + screen mount lifecycle
+// =====================================================================
+//
+// The new product shape has four screens (Home / Project / Editor /
+// Settings) navigated by URL hash.  F.2 ships the infra only; F.3+
+// progressively replaces the legacy editor below with screen modules.
+//
+// Until F.5 lands, an empty hash falls through to the legacy editor
+// (the <header> + <main> above).  Any recognised hash hides them and
+// mounts the named screen into #app-root.
+
+// Tiny hyperscript helper: h('div.card#x', {{onClick}}, [...])
+function h(spec, attrs, children) {{
+  let tag = 'div', id = '', classes = [];
+  if (typeof spec === 'string') {{
+    const m = spec.match(/^([a-z0-9]+)?((?:[.#][a-zA-Z0-9_-]+)*)$/);
+    if (m) {{
+      tag = m[1] || 'div';
+      (m[2] || '').split(/(?=[.#])/).forEach(part => {{
+        if (part.startsWith('#')) id = part.slice(1);
+        else if (part.startsWith('.')) classes.push(part.slice(1));
+      }});
+    }} else {{
+      tag = spec;
+    }}
+  }}
+  const el = document.createElementNS(
+    tag === 'svg' || tag === 'path' || tag === 'g'
+      ? 'http://www.w3.org/2000/svg'
+      : 'http://www.w3.org/1999/xhtml', tag);
+  if (id) el.id = id;
+  if (classes.length) el.setAttribute('class', classes.join(' '));
+  // Handle args overloads: h(spec, children), h(spec, attrs, children)
+  if (attrs && (Array.isArray(attrs) || typeof attrs === 'string'
+                 || attrs instanceof Node)) {{
+    children = attrs;
+    attrs = null;
+  }}
+  if (attrs) {{
+    for (const [k, v] of Object.entries(attrs)) {{
+      if (k === 'onClick' || k === 'onclick') {{
+        el.addEventListener('click', v);
+      }} else if (k === 'style' && typeof v === 'object') {{
+        for (const [sk, sv] of Object.entries(v)) el.style[sk] = sv;
+      }} else if (v === false || v == null) {{
+        /* skip */
+      }} else if (v === true) {{
+        el.setAttribute(k, '');
+      }} else {{
+        el.setAttribute(k, v);
+      }}
+    }}
+  }}
+  const kids = children == null ? []
+    : (Array.isArray(children) ? children : [children]);
+  for (const c of kids) {{
+    if (c == null || c === false) continue;
+    el.appendChild(typeof c === 'string' || typeof c === 'number'
+      ? document.createTextNode(String(c))
+      : c);
+  }}
+  return el;
+}}
+
+// Single source of truth replacing today's scattered globals.  Screens
+// read from it and dispatch via setRoute() / selectProject() etc. so
+// future undo / persist / sync layers have a stable hook surface.
+const AppState = {{
+  route: '#/',
+  routeParams: {{}},
+  currentProjectId: null,
+  currentFigureId: null,
+  settings: null,        // populated lazily by Settings screen
+}};
+
+// Map of route patterns to screen modules.  Each module exports
+// mount(container, params) -> teardownFn(optional).
+const _routes = [];
+let _currentTeardown = null;
+
+function registerRoute(pattern, mountFn) {{
+  _routes.push({{ pattern, mountFn }});
+}}
+
+function _matchRoute(hash) {{
+  for (const {{ pattern, mountFn }} of _routes) {{
+    const m = hash.match(pattern);
+    if (m) return {{ mountFn, params: m.slice(1) }};
+  }}
+  return null;
+}}
+
+function renderRoute() {{
+  const hash = location.hash || '';
+  AppState.route = hash;
+  // Empty hash (or no hash at all) means "show the legacy editor".
+  // Future: once F.5 lands, '#/' becomes the Home screen and '' is
+  // a redirect to '#/'.
+  const appRoot = document.getElementById('app-root');
+  const header = document.querySelector('header');
+  const main = document.querySelector('main');
+  if (!hash || hash === '#') {{
+    if (_currentTeardown) {{ try {{ _currentTeardown(); }} catch (_e) {{}} _currentTeardown = null; }}
+    if (appRoot) appRoot.style.display = 'none';
+    if (header) header.style.display = '';
+    if (main) main.style.display = '';
+    return;
+  }}
+  const matched = _matchRoute(hash);
+  if (!matched) {{
+    // Unknown route -- show a "not found" stub instead of corrupting state
+    if (appRoot) {{
+      appRoot.style.display = '';
+      appRoot.innerHTML = '';
+      appRoot.appendChild(h('div', [
+        h('h1', `Unknown route: ${{hash}}`),
+        h('p', [
+          'Try ',
+          h('a', {{ href: '#/' }}, '#/ (Home)'),
+          ' or ',
+          h('a', {{ href: '' }}, '/ (legacy editor)'),
+          '.',
+        ]),
+      ]));
+    }}
+    if (header) header.style.display = 'none';
+    if (main) main.style.display = 'none';
+    return;
+  }}
+  if (header) header.style.display = 'none';
+  if (main) main.style.display = 'none';
+  if (appRoot) {{
+    appRoot.style.display = '';
+    if (_currentTeardown) {{ try {{ _currentTeardown(); }} catch (_e) {{}} }}
+    appRoot.innerHTML = '';
+    AppState.routeParams = matched.params;
+    _currentTeardown = matched.mountFn(appRoot, matched.params) || null;
+  }}
+}}
+
+window.addEventListener('hashchange', renderRoute);
+// Don't fire renderRoute on first load yet -- screens aren't registered
+// until F.3+ lands.  But expose the router for the screens to use:
+window.IFU_APP = {{ AppState, h, registerRoute, renderRoute }};
+// ===== end F.2 app shell =====
+
+
 const canvasWrap = $('canvas-wrap');
 const fileSel = $('file-sel');
 const viewSel = $('view-sel');
