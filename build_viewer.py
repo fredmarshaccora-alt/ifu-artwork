@@ -352,10 +352,22 @@ HTML_TEMPLATE = r"""<!doctype html>
 </header>
 <main>
   <aside class="left">
+    <h2>Project</h2>
+    <p style="font-size:11px; color: var(--muted); margin: 0 0 6px 0;">
+      Group figures together for one IFU / doc.  Switch project to
+      filter the figures list below.</p>
+    <div style="display:flex; gap:4px; margin-bottom:6px;">
+      <select id="project-sel" style="flex:1; padding:4px 6px; font-size:12px;">
+        <option value="">— All figures —</option>
+      </select>
+      <button id="btn-project-new" title="Create a new project">+</button>
+      <button id="btn-project-del" title="Delete current project (keeps figures)">✕</button>
+    </div>
+
     <h2>Figures</h2>
     <p style="font-size:11px; color: var(--muted); margin: 0 0 6px 0;">
-      A figure = camera + selection + per-part styles, saved as a file
-      under <code>out/figures/</code>.</p>
+      A figure = camera + selection + per-part styles.  Saved figures
+      get attached to the selected project above.</p>
     <div style="display:flex; gap:4px; margin-bottom:6px;">
       <input type="text" id="fig-name" placeholder="figure name..."
              style="flex:1; padding:4px 6px; font-size:12px;
@@ -1850,6 +1862,145 @@ $('fig-name').addEventListener('keydown', (e) => {{
 // Initial load (once the server probe says we're online)
 // probeServer fires its .then before this; refresh manually after a beat.
 setTimeout(refreshFiguresList, 1500);
+
+// --- Projects (Phase B) ----------------------------------------------
+const projectSel = document.getElementById('project-sel');
+
+async function listProjects() {{
+  if (typeof API_BASE !== 'string') return [];
+  try {{
+    const r = await fetch(API_BASE + '/api/projects');
+    if (!r.ok) return [];
+    return (await r.json()).projects || [];
+  }} catch (_e) {{ return []; }}
+}}
+
+async function refreshProjectsList() {{
+  if (!projectSel) return;
+  const projs = await listProjects();
+  const current = projectSel.value;
+  projectSel.innerHTML = '<option value="">— All figures —</option>'
+    + '<option value="__orphans__">  (Unfiled)</option>';
+  for (const p of projs) {{
+    const opt = document.createElement('option');
+    opt.value = p.id;
+    opt.textContent = p.name;
+    if (p.id === current) opt.selected = true;
+    projectSel.appendChild(opt);
+  }}
+  // If the previously-selected project was deleted, reset to All
+  if (current && current !== '__orphans__'
+      && !projs.some(p => p.id === current)) {{
+    projectSel.value = '';
+  }}
+}}
+
+// Override figures list to filter by currently-selected project
+const _origRefreshFiguresList = refreshFiguresList;
+refreshFiguresList = async function() {{
+  if (!figuresList) return;
+  const pid = projectSel?.value || '';
+  let figs;
+  if (pid === '__orphans__') {{
+    try {{
+      const r = await fetch(API_BASE + '/api/figures/orphans');
+      figs = r.ok ? (await r.json()).figures || [] : [];
+    }} catch (_e) {{ figs = []; }}
+  }} else if (pid) {{
+    try {{
+      const r = await fetch(API_BASE + '/api/projects/'
+                              + encodeURIComponent(pid) + '/figures');
+      figs = r.ok ? (await r.json()).figures || [] : [];
+    }} catch (_e) {{ figs = []; }}
+  }} else {{
+    figs = await listFigures();
+  }}
+  figuresList.innerHTML = '';
+  if (!figs.length) {{
+    figuresList.innerHTML = '<li style="color:var(--muted); font-style:italic; padding:4px 0;">no figures here</li>';
+    return;
+  }}
+  for (const fig of figs) {{
+    const li = document.createElement('li');
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'name';
+    nameSpan.textContent = fig.name;
+    nameSpan.title = `Source: ${{fig.source_id}}  -  ${{fig.view_id}}\\n` +
+                      `Updated: ${{fig.updated_at || '?'}}\\n` +
+                      `${{(fig.selection || []).length}} parts selected`;
+    nameSpan.addEventListener('click', () => _loadFigureIntoEditor(fig));
+    li.appendChild(nameSpan);
+
+    const delBtn = document.createElement('button');
+    delBtn.textContent = '✕';
+    delBtn.title = 'Delete this figure (cannot be undone)';
+    delBtn.style.color = '#c44';
+    delBtn.addEventListener('click', async (e) => {{
+      e.stopPropagation();
+      if (!confirm(`Delete figure "${{fig.name}}"?`)) return;
+      await fetch(API_BASE + '/api/figures/' + encodeURIComponent(fig.id),
+                   {{ method: 'DELETE' }});
+      refreshFiguresList();
+    }});
+    li.appendChild(delBtn);
+    figuresList.appendChild(li);
+  }}
+}};
+
+// Override save so it sets project_id from the current selection
+const _origSaveCurrentAsFigure = saveCurrentAsFigure;
+saveCurrentAsFigure = async function() {{
+  const nameInput = $('fig-name');
+  const name = (nameInput.value || '').trim();
+  if (!name) {{ nameInput.focus(); return; }}
+  const body = {{ name, ..._gatherCurrentState() }};
+  const pid = projectSel?.value || '';
+  if (pid && pid !== '__orphans__') body.project_id = pid;
+  const r = await fetch(API_BASE + '/api/figures', {{
+    method: 'POST',
+    headers: {{ 'Content-Type': 'application/json' }},
+    body: JSON.stringify(body),
+  }});
+  if (!r.ok) {{
+    alert('Save figure failed: ' + r.status);
+    return;
+  }}
+  nameInput.value = '';
+  refreshFiguresList();
+}};
+
+$('btn-project-new').addEventListener('click', async () => {{
+  const name = prompt('Project name:');
+  if (!name) return;
+  const r = await fetch(API_BASE + '/api/projects', {{
+    method: 'POST',
+    headers: {{ 'Content-Type': 'application/json' }},
+    body: JSON.stringify({{ name }}),
+  }});
+  if (!r.ok) {{ alert('Create project failed: ' + r.status); return; }}
+  const proj = await r.json();
+  await refreshProjectsList();
+  projectSel.value = proj.id;
+  refreshFiguresList();
+}});
+
+$('btn-project-del').addEventListener('click', async () => {{
+  const pid = projectSel.value;
+  if (!pid || pid === '__orphans__') {{
+    alert('Pick a project first');
+    return;
+  }}
+  if (!confirm('Delete project? Its figures will become Unfiled.')) return;
+  await fetch(API_BASE + '/api/projects/' + encodeURIComponent(pid),
+               {{ method: 'DELETE' }});
+  projectSel.value = '';
+  await refreshProjectsList();
+  refreshFiguresList();
+}});
+
+projectSel.addEventListener('change', refreshFiguresList);
+
+setTimeout(refreshProjectsList, 1200);
 
 // --- Per-part styling ---------------------------------------------------
 // Per-source dict of part_idx -> {{stroke, width, opacity, dash}}

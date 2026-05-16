@@ -39,7 +39,7 @@ from t5_hlr_vector import (
     run_part_silhouettes, run_group_silhouette,
     compute_visible_footprints, run_hlr_in_region,
 )
-from ifu import figures_store
+from ifu import figures_store, projects_store
 import threading
 import functools
 
@@ -239,6 +239,91 @@ def render():
     })
 
 
+# ----- Projects CRUD (Phase B) ---------------------------------------
+
+@app.route("/api/projects", methods=["GET"])
+def projects_list():
+    """List every project, newest first."""
+    return jsonify({"projects": projects_store.list_all()})
+
+
+@app.route("/api/projects", methods=["POST"])
+def projects_create():
+    body = request.get_json(silent=True) or {}
+    name = body.get("name") or "Untitled project"
+    description = body.get("description") or ""
+    proj = projects_store.new_project(name=name, description=description)
+    projects_store.save(proj)
+    return jsonify(proj), 201
+
+
+@app.route("/api/projects/<proj_id>", methods=["GET"])
+def projects_get(proj_id):
+    proj = projects_store.load(proj_id)
+    if proj is None:
+        return jsonify({"error": "project not found"}), 404
+    return jsonify(proj)
+
+
+@app.route("/api/projects/<proj_id>", methods=["PUT"])
+def projects_update(proj_id):
+    body = request.get_json(silent=True) or {}
+    existing = projects_store.load(proj_id)
+    if existing is None:
+        return jsonify({"error": "project not found"}), 404
+    body["id"] = existing["id"]
+    body["created_at"] = existing.get("created_at",
+                                       projects_store._now_iso())
+    projects_store.save(body)
+    return jsonify(body)
+
+
+@app.route("/api/projects/<proj_id>", methods=["DELETE"])
+def projects_delete(proj_id):
+    """Delete project.  Query ``?cascade=1`` to also delete its figures;
+    default leaves figures as orphans (their project_id is preserved
+    on the figure record so you can later see "this figure used to
+    belong to <deleted project>")."""
+    cascade = request.args.get("cascade") in ("1", "true", "yes")
+    ok = projects_store.delete(proj_id, cascade=cascade)
+    if not ok:
+        return jsonify({"error": "project not found"}), 404
+    return ("", 204)
+
+
+@app.route("/api/projects/<proj_id>/figures", methods=["GET"])
+def projects_figures(proj_id):
+    """List figures in this project (resolved dicts, not just ids)."""
+    if projects_store.load(proj_id) is None:
+        return jsonify({"error": "project not found"}), 404
+    return jsonify({"figures": projects_store.figures_in(proj_id)})
+
+
+@app.route("/api/projects/<proj_id>/figures/<fig_id>", methods=["POST"])
+def projects_attach_figure(proj_id, fig_id):
+    """Attach an existing figure to this project.  Idempotent."""
+    ok = projects_store.add_figure(proj_id, fig_id)
+    if not ok:
+        return jsonify({"error": "project or figure not found"}), 404
+    return ("", 204)
+
+
+@app.route("/api/projects/<proj_id>/figures/<fig_id>", methods=["DELETE"])
+def projects_detach_figure(proj_id, fig_id):
+    """Remove the figure from this project (figure record itself stays)."""
+    ok = projects_store.remove_figure(proj_id, fig_id)
+    if not ok:
+        return jsonify({"error": "figure not in project"}), 404
+    return ("", 204)
+
+
+@app.route("/api/figures/orphans", methods=["GET"])
+def figures_orphans():
+    """Figures with no project (or with a project_id pointing to a
+    deleted project).  Shown in the UI's "Unfiled" bucket."""
+    return jsonify({"figures": projects_store.orphan_figures()})
+
+
 # ----- Figures CRUD (Phase A) ----------------------------------------
 
 @app.route("/api/figures", methods=["GET"])
@@ -250,20 +335,26 @@ def figures_list():
 @app.route("/api/figures", methods=["POST"])
 def figures_create():
     """Create a new figure.  Body: any subset of figure fields.  Missing
-    fields get defaults from new_figure()."""
+    fields get defaults from new_figure().  If ``project_id`` is
+    supplied, the figure is attached to that project on creation."""
     body = request.get_json(silent=True) or {}
     name = body.get("name") or "Untitled figure"
     source_id = body.get("source_id")
     if not source_id:
         return jsonify({"error": "source_id required"}), 400
     view_id = body.get("view_id") or "iso"
-    # Pull through any extra known fields the client supplied
+    project_id = body.get("project_id")
     extra = {k: v for k, v in body.items()
              if k in ("camera", "selection", "styles_per_part",
                        "layers_on", "detail", "annotations", "notes")}
     fig = figures_store.new_figure(name=name, source_id=source_id,
                                     view_id=view_id, **extra)
     figures_store.save(fig)
+    if project_id:
+        # Attach (idempotent; silently no-ops if the project doesn't exist)
+        projects_store.add_figure(project_id, fig["id"])
+        # Re-load to pick up the project_id backlink stamped by add_figure
+        fig = figures_store.load(fig["id"])
     return jsonify(fig), 201
 
 
