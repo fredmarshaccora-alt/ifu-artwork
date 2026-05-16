@@ -39,6 +39,24 @@ from t5_hlr_vector import (
     run_part_silhouettes, run_group_silhouette,
     compute_visible_footprints, run_hlr_in_region,
 )
+from ifu import figures_store
+import threading
+import functools
+
+# Serialises OCCT-touching endpoints (/api/render, /api/part_silhouettes,
+# /api/part_footprints, /api/render_region).  Cheap endpoints
+# (/api/figures*, /api/healthz, /) bypass the lock so the UI stays
+# responsive even while a Presto raster runs for 2 minutes.
+_HLR_LOCK = threading.Lock()
+
+
+def _occt_serialised(fn):
+    """Decorator: take _HLR_LOCK around an endpoint that touches OCCT."""
+    @functools.wraps(fn)
+    def _wrapper(*args, **kwargs):
+        with _HLR_LOCK:
+            return fn(*args, **kwargs)
+    return _wrapper
 
 HERE = Path(__file__).parent
 app = Flask(__name__)
@@ -119,6 +137,7 @@ def healthz():
 
 
 @app.route("/api/render", methods=["POST"])
+@_occt_serialised
 def render():
     body = request.get_json(silent=True) or {}
     file_id = body.get("file_id")
@@ -220,7 +239,67 @@ def render():
     })
 
 
+# ----- Figures CRUD (Phase A) ----------------------------------------
+
+@app.route("/api/figures", methods=["GET"])
+def figures_list():
+    """List every figure in the local store, newest first."""
+    return jsonify({"figures": figures_store.list_all()})
+
+
+@app.route("/api/figures", methods=["POST"])
+def figures_create():
+    """Create a new figure.  Body: any subset of figure fields.  Missing
+    fields get defaults from new_figure()."""
+    body = request.get_json(silent=True) or {}
+    name = body.get("name") or "Untitled figure"
+    source_id = body.get("source_id")
+    if not source_id:
+        return jsonify({"error": "source_id required"}), 400
+    view_id = body.get("view_id") or "iso"
+    # Pull through any extra known fields the client supplied
+    extra = {k: v for k, v in body.items()
+             if k in ("camera", "selection", "styles_per_part",
+                       "layers_on", "detail", "annotations", "notes")}
+    fig = figures_store.new_figure(name=name, source_id=source_id,
+                                    view_id=view_id, **extra)
+    figures_store.save(fig)
+    return jsonify(fig), 201
+
+
+@app.route("/api/figures/<fig_id>", methods=["GET"])
+def figures_get(fig_id):
+    fig = figures_store.load(fig_id)
+    if fig is None:
+        return jsonify({"error": "figure not found"}), 404
+    return jsonify(fig)
+
+
+@app.route("/api/figures/<fig_id>", methods=["PUT"])
+def figures_update(fig_id):
+    """Replace the figure's mutable fields (everything except id /
+    created_at).  Body should be the complete figure dict."""
+    body = request.get_json(silent=True) or {}
+    existing = figures_store.load(fig_id)
+    if existing is None:
+        return jsonify({"error": "figure not found"}), 404
+    # Preserve immutable fields
+    body["id"] = existing["id"]
+    body["created_at"] = existing.get("created_at", figures_store._now_iso())
+    figures_store.save(body)
+    return jsonify(body)
+
+
+@app.route("/api/figures/<fig_id>", methods=["DELETE"])
+def figures_delete(fig_id):
+    ok = figures_store.delete(fig_id)
+    if not ok:
+        return jsonify({"error": "figure not found"}), 404
+    return ("", 204)
+
+
 @app.route("/api/render_region", methods=["POST"])
+@_occt_serialised
 def render_region():
     """Render JUST the solids inside a 2D bounding box at higher detail.
 
@@ -309,6 +388,7 @@ def render_region():
 
 
 @app.route("/api/part_footprints", methods=["POST"])
+@_occt_serialised
 def part_footprints():
     """Visible-footprint boundaries per part.
 
@@ -436,6 +516,7 @@ def _count_solids(shape):
 
 
 @app.route("/api/part_silhouettes", methods=["POST"])
+@_occt_serialised
 def part_silhouettes():
     """Per-part TRUE silhouettes for the highlighted parts, computed
     by running HLR on each requested solid IN ISOLATION (no occluders).
@@ -625,9 +706,12 @@ def main() -> int:
     print(f"  - open {url} in a browser")
     print("  - click 'generate 2D' in the 3D toolbar to render the current angle")
     print("  - Ctrl+C here to stop the server\n")
-    # threaded=False: OCCT internals aren't thread-safe; a single in-flight
-    # render is what we want anyway (the box can't HLR two at once).
-    app.run(host=args.host, port=args.port, threaded=False, debug=False)
+    # threaded=True: but OCCT-critical endpoints take _HLR_LOCK so we
+    # never run two HLR / footprint computations at once.  Cheap
+    # endpoints (healthz, figures CRUD, /) bypass the lock and respond
+    # instantly even while a render is in flight.  Without this the
+    # whole server hangs for the 2+ minutes a Presto raster takes.
+    app.run(host=args.host, port=args.port, threaded=True, debug=False)
     return 0
 
 

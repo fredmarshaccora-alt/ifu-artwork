@@ -352,9 +352,22 @@ HTML_TEMPLATE = r"""<!doctype html>
 </header>
 <main>
   <aside class="left">
-    <h2>Saved views</h2>
+    <h2>Figures</h2>
     <p style="font-size:11px; color: var(--muted); margin: 0 0 6px 0;">
-      Camera angles you've saved for this source.</p>
+      A figure = camera + selection + per-part styles, saved as a file
+      under <code>out/figures/</code>.</p>
+    <div style="display:flex; gap:4px; margin-bottom:6px;">
+      <input type="text" id="fig-name" placeholder="figure name..."
+             style="flex:1; padding:4px 6px; font-size:12px;
+                    border:1px solid var(--line); border-radius:3px;">
+      <button id="btn-fig-save"
+              title="Capture current state as a new figure">save</button>
+    </div>
+    <ul id="figures-list" class="saved-views-list"></ul>
+
+    <h2 style="margin-top: 14px;">Saved views (legacy)</h2>
+    <p style="font-size:11px; color: var(--muted); margin: 0 0 6px 0;">
+      Camera angles only (no selection/style).  Pre-Phase-A.</p>
     <div style="display:flex; gap:4px; margin-bottom:6px;">
       <input type="text" id="view-name" placeholder="name..."
              style="flex:1; padding:4px 6px; font-size:12px;
@@ -1698,6 +1711,145 @@ $('btn-save-view').addEventListener('click', () => {{
   refreshSavedViews();
 }});
 fileSel.addEventListener('change', refreshSavedViews);
+
+// --- Figures (Phase A) -----------------------------------------------
+// A figure is the full editor state (camera + selection + per-part
+// styles + layer toggles + notes) saved as a JSON file in
+// out/figures/.  Lives on the server, not in localStorage.
+
+const figuresList = document.getElementById('figures-list');
+
+async function listFigures() {{
+  if (typeof API_BASE !== 'string') return [];
+  try {{
+    const r = await fetch(API_BASE + '/api/figures');
+    if (!r.ok) return [];
+    return (await r.json()).figures || [];
+  }} catch (_e) {{ return []; }}
+}}
+
+function _gatherCurrentState() {{
+  // Snapshot everything the editor currently shows so we can rehydrate
+  // it later from the figure JSON.
+  const fid = fileSel.value;
+  const vid = viewSel.value;
+  const st = getState(fid, vid);
+  const cam = window.IFU_VIEWER?.getCameraEyeTarget?.();
+  const layersOn = {{}};
+  document.querySelectorAll('input[data-layer]').forEach(cb => {{
+    layersOn[cb.dataset.layer] = !!cb.checked;
+  }});
+  return {{
+    source_id: fid,
+    view_id: vid,
+    camera: cam ? {{
+      eye: cam.eye, target: cam.target,
+      up_axis: upAxisSel.value,
+    }} : null,
+    selection: st.highlights ? [...st.highlights] : [],
+    styles_per_part: loadPartStyles(fid),
+    layers_on: layersOn,
+    detail: parseFloat($('sty-width').value) >= 5 ? "fine" : "normal",
+    annotations: (st.annotations || []),
+  }};
+}}
+
+async function saveCurrentAsFigure() {{
+  const nameInput = $('fig-name');
+  const name = (nameInput.value || '').trim();
+  if (!name) {{ nameInput.focus(); return; }}
+  const body = {{ name, ..._gatherCurrentState() }};
+  const r = await fetch(API_BASE + '/api/figures', {{
+    method: 'POST',
+    headers: {{ 'Content-Type': 'application/json' }},
+    body: JSON.stringify(body),
+  }});
+  if (!r.ok) {{
+    alert('Save figure failed: ' + r.status);
+    return;
+  }}
+  nameInput.value = '';
+  refreshFiguresList();
+}}
+
+function _loadFigureIntoEditor(fig) {{
+  // Restore: source -> view -> camera -> selection -> styles -> layers
+  if (fig.source_id && fig.source_id !== fileSel.value) {{
+    fileSel.value = fig.source_id;
+    fileSel.dispatchEvent(new Event('change'));
+  }}
+  if (fig.view_id && fig.view_id !== viewSel.value) {{
+    viewSel.value = fig.view_id;
+    viewSel.dispatchEvent(new Event('change'));
+  }}
+  if (fig.camera && fig.camera.eye && fig.camera.target) {{
+    window.IFU_VIEWER?.snapCameraTo?.(fig.camera.eye, fig.camera.target);
+    if (fig.camera.up_axis && upAxisSel) {{
+      upAxisSel.value = fig.camera.up_axis;
+      upAxisSel.dispatchEvent(new Event('change'));
+    }}
+  }}
+  const st = getState(fig.source_id, fig.view_id || viewSel.value);
+  st.highlights = new Set(fig.selection || []);
+  if (fig.styles_per_part) {{
+    persistPartStyles(fig.source_id, fig.styles_per_part);
+  }}
+  if (fig.layers_on) {{
+    document.querySelectorAll('input[data-layer]').forEach(cb => {{
+      const want = fig.layers_on[cb.dataset.layer];
+      if (typeof want === 'boolean' && cb.checked !== want) {{
+        cb.checked = want;
+        cb.dispatchEvent(new Event('change'));
+      }}
+    }});
+  }}
+  // Refresh everything that responds to those changes
+  applyStyleSheet();
+  applyHighlights();
+}}
+
+async function refreshFiguresList() {{
+  if (!figuresList) return;
+  const figs = await listFigures();
+  figuresList.innerHTML = '';
+  if (!figs.length) {{
+    figuresList.innerHTML = '<li style="color:var(--muted); font-style:italic; padding:4px 0;">no figures yet</li>';
+    return;
+  }}
+  for (const fig of figs) {{
+    const li = document.createElement('li');
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'name';
+    nameSpan.textContent = fig.name;
+    nameSpan.title = `Source: ${{fig.source_id}}  -  ${{fig.view_id}}\\n` +
+                      `Updated: ${{fig.updated_at || '?'}}\\n` +
+                      `${{(fig.selection || []).length}} parts selected`;
+    nameSpan.addEventListener('click', () => _loadFigureIntoEditor(fig));
+    li.appendChild(nameSpan);
+
+    const delBtn = document.createElement('button');
+    delBtn.textContent = '✕';
+    delBtn.title = 'Delete this figure (cannot be undone)';
+    delBtn.style.color = '#c44';
+    delBtn.addEventListener('click', async (e) => {{
+      e.stopPropagation();
+      if (!confirm(`Delete figure "${{fig.name}}"?`)) return;
+      await fetch(API_BASE + '/api/figures/' + encodeURIComponent(fig.id),
+                   {{ method: 'DELETE' }});
+      refreshFiguresList();
+    }});
+    li.appendChild(delBtn);
+    figuresList.appendChild(li);
+  }}
+}}
+
+$('btn-fig-save').addEventListener('click', saveCurrentAsFigure);
+$('fig-name').addEventListener('keydown', (e) => {{
+  if (e.key === 'Enter') saveCurrentAsFigure();
+}});
+// Initial load (once the server probe says we're online)
+// probeServer fires its .then before this; refresh manually after a beat.
+setTimeout(refreshFiguresList, 1500);
 
 // --- Per-part styling ---------------------------------------------------
 // Per-source dict of part_idx -> {{stroke, width, opacity, dash}}

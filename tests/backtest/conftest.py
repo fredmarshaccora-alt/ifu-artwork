@@ -89,9 +89,11 @@ def server_url() -> str:
     """E2E + integration tests assume the Flask server is up locally.
     Set IFU_SERVER=http://host:port to override, or skip when unreachable."""
     url = os.environ.get("IFU_SERVER", "http://127.0.0.1:5000")
+    # 30s -- Flask is single-threaded by design (OCCT isn't thread-safe),
+    # so a long-running render in flight blocks healthz.  Be patient.
     try:
         import urllib.request
-        urllib.request.urlopen(url + "/api/healthz", timeout=3).read()
+        urllib.request.urlopen(url + "/api/healthz", timeout=30).read()
     except Exception as exc:
         pytest.skip(f"server not reachable at {url}: {exc}")
     return url

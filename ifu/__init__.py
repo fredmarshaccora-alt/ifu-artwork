@@ -28,6 +28,7 @@ from .step_tree import fetch_step_tree, count_tree
 from .onshape_tree import fetch_onshape_tree
 from .svg_bake import generate_svgs
 from .catalogue import save_catalogue, load_catalogue
+from . import figures as figures_store
 
 __all__ = [
     "HERE", "OUT",
@@ -38,4 +39,5 @@ __all__ = [
     "fetch_onshape_tree",
     "generate_svgs",
     "save_catalogue", "load_catalogue",
+    "figures_store",
 ]

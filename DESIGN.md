@@ -436,20 +436,25 @@ The HLR + footprint pipeline is solid.  Everything we're adding is
 
 ---
 
-## Open questions for the user
+## Resolved scope (from user May 2026)
 
-1. **Onshape doc layout** — do you keep IFU-relevant STEPs in dedicated
-   Onshape documents, or share with engineering's working workspaces?
-   This affects whether revision tracking is per-document or
-   per-version-snapshot.
-2. **Sign-off step** — should "lock figure" be its own action (figure
-   becomes read-only, must be cloned to edit)?  Useful for IFU
-   approval audit, optional otherwise.
-3. **Multi-user** — does anyone else at Accora author figures, or is
-   it just you?  If just you, single-user local is fine forever; if
-   multi-user, we'd want shared project storage (a shared network
-   drive is the cheap option).
-4. **Export targets** — beyond SVG/PDF, do you need DXF (for
-   InDesign), or a specific Word-compatible format?
+1. **Onshape revisions = Versions in the master doc space**, not raw
+   microversions.  Onshape "Versions" are explicit publish markers
+   (e.g. R01, R02) created by engineering when they ship a frozen
+   snapshot.  We bind figures to a Version, not a microversion;
+   polling checks "is a newer Version available".
+2. **No lock/sign-off step** — single-user, illustrator owns the figure
+   throughout its life.
+3. **Single user** (FredMarsh only).  No multi-user state, no shared
+   project storage.  All on-disk locally.
+4. **SVG export only.**  No PDF / DXF / Word formats — IFU layout tool
+   handles the rest.
 
-Answers to these shape what gets built in Phase B onward.
+These simplifications drop a bunch of work:
+  - No sign-off state machine, no clone-to-edit, no audit-trail UI
+    (per-figure audit log is still useful for the illustrator's own
+    "what changed when")
+  - No shared filesystem layer / no multi-tenant concerns
+  - No PDF pipeline (we already export SVG)
+  - Revision check uses the cheaper Versions endpoint, not microversion
+    polling
