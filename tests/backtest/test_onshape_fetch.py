@@ -7,7 +7,8 @@ the import worker depends on.
 from __future__ import annotations
 import pytest
 
-from ifu.onshape_fetch import parse_onshape_url, OnshapeURLError
+from ifu.onshape_fetch import (parse_onshape_url, OnshapeURLError,
+                                encode_configuration)
 from ifu import sources_store
 
 
@@ -135,3 +136,30 @@ class TestSourcesRegistry:
         assert sources_store.find(sid) is None
         # Second unregister returns False (idempotent)
         assert sources_store.unregister(sid) is False
+
+
+# ----- Configuration encoding ---------------------------------------
+
+class TestEncodeConfiguration:
+
+    def test_empty(self):
+        assert encode_configuration({}) == ""
+        assert encode_configuration(None) == ""
+
+    def test_single_value(self):
+        assert encode_configuration({"size": "M"}) == "size=M"
+
+    def test_multiple_values(self):
+        # Order is preserved by dict insertion in py3.7+
+        s = encode_configuration({"size": "M", "color": "red"})
+        # Either order is acceptable as long as semicolon-joined
+        parts = set(s.split(";"))
+        assert parts == {"size=M", "color=red"}
+
+    def test_skips_empty_and_none(self):
+        s = encode_configuration({"a": "1", "b": "", "c": None, "d": "4"})
+        parts = set(s.split(";"))
+        assert "a=1" in parts
+        assert "d=4" in parts
+        assert "b=" not in parts
+        assert "c=" not in parts

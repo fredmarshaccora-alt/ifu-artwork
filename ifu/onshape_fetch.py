@@ -132,8 +132,73 @@ def get_element_info(did: str, wv: str, wvid: str, eid: str) -> dict:
     }
 
 
+def get_element_configuration(did: str, wv: str, wvid: str,
+                                eid: str) -> dict:
+    """Fetch the configuration parameter definitions for an element.
+
+    Onshape's /elements/d/{did}/{wv}/{wvid}/e/{eid}/configuration returns
+    one ``configurationParameters`` list -- each entry describes a knob
+    (enum, bool, length, etc.) with its options and current default.
+
+    Returns a UI-friendly normalised shape:
+      ``{has_config: bool, parameters: [{id, name, type, default,
+                                         options}]}``
+    where ``options`` is a list of ``{value, label}`` for enum parameters,
+    and empty for other types.
+    """
+    c = _client()
+    try:
+        resp = c.get(
+            f"/elements/d/{did}/{wv}/{wvid}/e/{eid}/configuration") or {}
+    except Exception:
+        return {"has_config": False, "parameters": []}
+    params = resp.get("configurationParameters") or []
+    out_params = []
+    for p in params:
+        msg = p.get("message") or {}
+        ptype = (p.get("typeName") or "").upper()
+        param_id = msg.get("parameterId")
+        name = msg.get("parameterName") or param_id
+        default = msg.get("defaultValue")
+        opts = []
+        if ptype == "BTMCONFIGURATIONPARAMETERENUM":
+            for o in msg.get("options") or []:
+                om = o.get("message") or {}
+                opts.append({
+                    "value": om.get("option"),
+                    "label": om.get("optionName") or om.get("option"),
+                })
+        out_params.append({
+            "id": param_id,
+            "name": name,
+            "type": ptype.replace("BTMCONFIGURATIONPARAMETER", "")
+                          .lower() or "unknown",
+            "default": default,
+            "options": opts,
+        })
+    return {
+        "has_config": bool(out_params),
+        "parameters": out_params,
+    }
+
+
+def encode_configuration(values: dict) -> str:
+    """Turn ``{parameter_id: value}`` into the URL-safe string Onshape
+    expects on translation requests.  Empty dict -> empty string."""
+    if not values:
+        return ""
+    # Onshape's format: "key1=val1;key2=val2"
+    parts = []
+    for k, v in values.items():
+        if v is None or v == "":
+            continue
+        parts.append(f"{k}={v}")
+    return ";".join(parts)
+
+
 def start_step_translation(did: str, wv: str, wvid: str, eid: str,
-                            element_type: str = "ASSEMBLY") -> dict:
+                            element_type: str = "ASSEMBLY",
+                            configuration: str = "") -> dict:
     """Kick off an Onshape STEP translation job for the element.
 
     Onshape returns ``{id, requestState, ...}`` where ``id`` is the
@@ -155,6 +220,10 @@ def start_step_translation(did: str, wv: str, wvid: str, eid: str,
             "stepUnit": "millimeter",
         },
     }
+    if configuration:
+        # Onshape accepts the encoded "key1=val1;key2=val2" string under
+        # the top-level ``configuration`` field on the translation body.
+        body["configuration"] = configuration
     if element_type == "PARTSTUDIO":
         path = f"/partstudios/d/{did}/{wv}/{wvid}/e/{eid}/translations"
     else:

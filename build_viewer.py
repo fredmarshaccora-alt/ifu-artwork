@@ -1534,6 +1534,9 @@ async function ProjectScreen(container, params) {{
 
 function _openNewFigureModal(projId, sources) {{
   let nameInput, sourceSelect, viewSelect, captureCurrent;
+  let configWrap, configStatus;
+  // configInputs keys off parameter id; values are <select> or <input>
+  const configInputs = {{}};
 
   // Detect current 3D camera if the editor was open before.  Falls
   // back to null -- the figure will use its source's iso preset.
@@ -1569,6 +1572,16 @@ function _openNewFigureModal(projId, sources) {{
           h('span', "Use my current 3D camera angle as the figure's view"),
         ])
       : null,
+    // Onshape configuration block (populated when source has onshape_ids)
+    (configWrap = h('div', {{ style: {{ marginTop: '12px', display: 'none' }} }}, [
+      h('div', {{ style: {{ fontSize: 'var(--t-meta)', fontWeight: 600,
+                              color: 'var(--c-text)', marginBottom: '6px' }} }},
+        'Onshape configuration'),
+      (configStatus = h('div', {{ style: {{ fontSize: '12px',
+                                                color: 'var(--c-text-muted)',
+                                                marginBottom: '8px' }} }},
+                          'loading...')),
+    ])),
     h('div', {{ style: {{ marginTop: '12px', fontSize: '12px',
                             color: 'var(--c-text-muted)' }} }},
       'You can re-pose the camera in the editor at any time.'),
@@ -1576,7 +1589,11 @@ function _openNewFigureModal(projId, sources) {{
   // Populate source dropdown
   for (const s of (sources || [])) {{
     const opt = document.createElement('option');
-    opt.value = s.id; opt.textContent = `${{s.label}}  (${{s.id}})`;
+    opt.value = s.id;
+    let suffix = '';
+    if (s.origin === 'dynamic') suffix = '  (Onshape import)';
+    else if (!s.onshape_ids) suffix = '  (local)';
+    opt.textContent = `${{s.label}}${{suffix}}`;
     sourceSelect.appendChild(opt);
   }}
   // Starting-view presets -- this is just a default if no camera capture
@@ -1585,6 +1602,80 @@ function _openNewFigureModal(projId, sources) {{
     opt.value = vid; opt.textContent = vid;
     viewSelect.appendChild(opt);
   }});
+
+  // Fetch configuration parameters for the selected source.  Only
+  // sources with onshape_ids will return any -- everything else gets
+  // ``has_config: false`` and we hide the block.
+  async function refreshConfigForSource() {{
+    // Clear existing inputs
+    Object.keys(configInputs).forEach(k => delete configInputs[k]);
+    while (configWrap.children.length > 2) {{
+      configWrap.removeChild(configWrap.lastChild);
+    }}
+    const sid = sourceSelect.value;
+    const src = (sources || []).find(s => s.id === sid);
+    if (!src || !src.onshape_ids) {{
+      configWrap.style.display = 'none';
+      return;
+    }}
+    configWrap.style.display = 'block';
+    configStatus.textContent = 'loading parameters...';
+    try {{
+      const r = await fetch(API_BASE + '/api/sources/'
+                              + encodeURIComponent(sid) + '/configuration');
+      if (!r.ok) {{
+        configStatus.textContent = 'parameters unavailable';
+        return;
+      }}
+      const cfg = await r.json();
+      if (!cfg.has_config || !cfg.parameters?.length) {{
+        configStatus.textContent =
+          'this assembly has no configurable parameters';
+        return;
+      }}
+      configStatus.textContent =
+        cfg.parameters.length + ' parameter'
+        + (cfg.parameters.length === 1 ? '' : 's')
+        + ' available -- pick variant to render';
+      for (const p of cfg.parameters) {{
+        const row = h('div.field-row', {{
+          style: {{ display: 'grid',
+                      gridTemplateColumns: '1fr 2fr',
+                      gap: '8px',
+                      alignItems: 'center',
+                      marginTop: '6px' }} }}, [
+          h('label', {{ style: {{ marginBottom: 0 }} }}, p.name),
+        ]);
+        if (p.type === 'enum' && p.options?.length) {{
+          const sel = h('select.select', {{ style: {{ width: '100%' }} }});
+          for (const o of p.options) {{
+            const opt = document.createElement('option');
+            opt.value = o.value;
+            opt.textContent = o.label;
+            if (o.value === p.default) opt.selected = true;
+            sel.appendChild(opt);
+          }}
+          row.appendChild(sel);
+          configInputs[p.id] = sel;
+        }} else {{
+          const inp = h('input.input', {{
+            placeholder: '(default: ' + (p.default || '') + ')',
+            style: {{ width: '100%' }},
+          }});
+          if (p.default) inp.value = String(p.default);
+          row.appendChild(inp);
+          configInputs[p.id] = inp;
+        }}
+        configWrap.appendChild(row);
+      }}
+    }} catch (e) {{
+      configStatus.textContent = 'error: ' + (e.message || e);
+    }}
+  }}
+  sourceSelect.addEventListener('change', refreshConfigForSource);
+  // Kick off for whichever source is selected by default
+  setTimeout(refreshConfigForSource, 0);
+
   openModal({{
     title: 'New figure',
     body,
@@ -1596,6 +1687,16 @@ function _openNewFigureModal(projId, sources) {{
         const sourceId = sourceSelect.value;
         if (!sourceId) return;
         const useCurrent = currentCam && captureCurrent && captureCurrent.checked;
+        // Pull configuration values into the figure payload
+        const configValues = {{}};
+        let configCount = 0;
+        for (const [pid, el] of Object.entries(configInputs)) {{
+          const v = el.value;
+          if (v !== undefined && v !== null && v !== '') {{
+            configValues[pid] = v;
+            configCount++;
+          }}
+        }}
         const payload = {{
           name, source_id: sourceId, project_id: projId,
           view_id: useCurrent ? 'custom' : (viewSelect.value || 'iso'),
@@ -1605,6 +1706,9 @@ function _openNewFigureModal(projId, sources) {{
             eye: currentCam.eye, target: currentCam.target,
             up_axis: 'z',
           }};
+        }}
+        if (configCount > 0) {{
+          payload.configuration = configValues;
         }}
         try {{
           const r = await fetch(API_BASE + '/api/figures', {{

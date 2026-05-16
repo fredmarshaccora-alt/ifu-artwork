@@ -366,6 +366,32 @@ def onshape_import_status(job_id):
     return jsonify(job)
 
 
+@app.route("/api/sources/<source_id>/configuration", methods=["GET"])
+def source_configuration(source_id):
+    """List the Onshape configuration parameters for a source.  Only
+    meaningful for sources with onshape_ids; returns
+    ``{has_config: False, parameters: []}`` otherwise.
+    """
+    src = sources_store.find(source_id)
+    if src is None:
+        return jsonify({"error": "unknown source"}), 404
+    ids = src.get("onshape_ids") or {}
+    did, eid = ids.get("did"), ids.get("eid")
+    wv = ids.get("wv") or "w"
+    wvid = ids.get("wid") or ids.get("vid") or ids.get("mid")
+    if not (did and wvid and eid):
+        return jsonify({"has_config": False, "parameters": []})
+    try:
+        return jsonify(onshape_fetch.get_element_configuration(
+            did, wv, wvid, eid))
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 503
+    except Exception as exc:
+        return jsonify({"error":
+            f"configuration fetch failed: {type(exc).__name__}: {exc}"
+        }), 502
+
+
 @app.route("/api/sources/<source_id>/versions", methods=["GET"])
 def versions_list(source_id):
     """Return the cached Versions list for a source.  Empty/missing
@@ -575,7 +601,8 @@ def figures_create():
     project_id = body.get("project_id")
     extra = {k: v for k, v in body.items()
              if k in ("camera", "selection", "styles_per_part",
-                       "layers_on", "detail", "annotations", "notes")}
+                       "layers_on", "detail", "annotations", "notes",
+                       "configuration")}
     fig = figures_store.new_figure(name=name, source_id=source_id,
                                     view_id=view_id, **extra)
     figures_store.save(fig)
