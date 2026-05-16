@@ -329,7 +329,8 @@ HTML_TEMPLATE = r"""<!doctype html>
 </head>
 <body>
 <header>
-  <h1>ACCORA IFU viewer</h1>
+  <a href="#/" style="text-decoration: none; color: inherit;"
+     title="Go to the project home page"><h1>ACCORA IFU viewer</h1></a>
   <label>File: <select id="file-sel"></select></label>
   <label>View: <select id="view-sel"></select></label>
   <span class="mode-pill" id="mode-pill">smart</span>
@@ -685,10 +686,157 @@ function renderRoute() {{
 }}
 
 window.addEventListener('hashchange', renderRoute);
-// Don't fire renderRoute on first load yet -- screens aren't registered
-// until F.3+ lands.  But expose the router for the screens to use:
 window.IFU_APP = {{ AppState, h, registerRoute, renderRoute }};
 // ===== end F.2 app shell =====
+
+
+// =====================================================================
+// F.3 -- Home screen
+// =====================================================================
+//
+// Lists every project as a card grid; recent figures strip below.
+// "Open editor" link still works for the legacy single-source flow.
+
+const _HOME_CSS = `
+.home-screen {{
+  max-width: 1100px; margin: 0 auto; padding: 32px 24px;
+  font-family: Arial, sans-serif; color: #18181b;
+}}
+.home-screen .topbar {{ display: flex; align-items: baseline;
+                         margin-bottom: 24px; gap: 16px; }}
+.home-screen .topbar h1 {{ font-size: 24px; margin: 0;
+                            color: #00836a; flex: 1; }}
+.home-screen .topbar button, .home-screen .topbar a {{
+  font-size: 13px; padding: 6px 12px; border-radius: 4px;
+  border: 1px solid #d4d4d8; background: #fff; cursor: pointer;
+  text-decoration: none; color: inherit;
+}}
+.home-screen .topbar button:hover, .home-screen .topbar a:hover {{
+  background: #cce6e0;
+}}
+.home-screen h2 {{ font-size: 15px; margin: 24px 0 8px; color: #71717a;
+                    text-transform: uppercase; letter-spacing: 0.04em; }}
+.home-screen .grid {{ display: grid;
+                       grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+                       gap: 16px; }}
+.home-screen .card {{
+  border: 1px solid #d4d4d8; border-radius: 6px; padding: 16px;
+  background: #fff; cursor: pointer; transition: border-color 0.1s;
+}}
+.home-screen .card:hover {{ border-color: #00836a; }}
+.home-screen .card .name {{ font-size: 15px; font-weight: 600;
+                              margin-bottom: 4px; }}
+.home-screen .card .meta {{ font-size: 12px; color: #71717a; }}
+.home-screen .card.placeholder {{
+  display: flex; align-items: center; justify-content: center;
+  color: #71717a; border-style: dashed; min-height: 80px;
+}}
+.home-screen .empty {{ color: #71717a; font-style: italic;
+                        padding: 16px 0; }}
+.home-screen .recents {{ list-style: none; padding: 0; margin: 0; }}
+.home-screen .recents li {{ display: flex; gap: 8px; padding: 6px 0;
+                              border-bottom: 1px solid #f4f4f5;
+                              cursor: pointer; }}
+.home-screen .recents li:hover {{ background: #f4f4f5; }}
+.home-screen .recents .figname {{ flex: 1; }}
+.home-screen .recents .figmeta {{ color: #71717a; font-size: 12px; }}
+`;
+
+function _ensureHomeStyles() {{
+  if (document.getElementById('home-screen-styles')) return;
+  const s = document.createElement('style');
+  s.id = 'home-screen-styles';
+  s.textContent = _HOME_CSS;
+  document.head.appendChild(s);
+}}
+
+async function HomeScreen(container) {{
+  _ensureHomeStyles();
+  container.className = 'home-screen';
+
+  // Fetch in parallel
+  let projects = [], figures = [];
+  try {{
+    const [pr, fr] = await Promise.all([
+      fetch(API_BASE + '/api/projects'),
+      fetch(API_BASE + '/api/figures'),
+    ]);
+    if (pr.ok) projects = (await pr.json()).projects || [];
+    if (fr.ok) figures = (await fr.json()).figures || [];
+  }} catch (_e) {{}}
+
+  const recents = figures.slice(0, 5);
+
+  // Top bar
+  container.appendChild(h('div.topbar', [
+    h('h1', 'IFU Artwork'),
+    h('a', {{ href: '', title: 'Legacy single-page editor' }}, 'Open legacy editor'),
+    h('a', {{ href: '#/settings' }}, '⚙ Settings'),
+  ]));
+
+  // Projects section
+  container.appendChild(h('h2', `Projects (${{projects.length}})`));
+  const grid = h('div.grid');
+  // New-project card first
+  const newCard = h('div.card.placeholder', '+ new project');
+  newCard.addEventListener('click', async () => {{
+    const name = prompt('Project name:');
+    if (!name) return;
+    const r = await fetch(API_BASE + '/api/projects', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ name }}),
+    }});
+    if (!r.ok) {{ alert('Create failed: ' + r.status); return; }}
+    const p = await r.json();
+    location.hash = '#/project/' + encodeURIComponent(p.id);
+  }});
+  grid.appendChild(newCard);
+
+  for (const p of projects) {{
+    const card = h('div.card', [
+      h('div.name', p.name),
+      h('div.meta', `${{(p.figure_ids || []).length}} figure(s) - `
+                   + `updated ${{(p.updated_at || '').slice(0, 10)}}`),
+    ]);
+    card.addEventListener('click', () => {{
+      location.hash = '#/project/' + encodeURIComponent(p.id);
+    }});
+    grid.appendChild(card);
+  }}
+  container.appendChild(grid);
+
+  // Recents
+  container.appendChild(h('h2', 'Recent figures'));
+  if (!recents.length) {{
+    container.appendChild(h('div.empty', 'No figures yet.'));
+  }} else {{
+    const ul = h('ul.recents');
+    for (const f of recents) {{
+      const li = h('li', [
+        h('span.figname', f.name || '(untitled)'),
+        h('span.figmeta',
+          `${{f.source_id || '?'}} - ${{(f.updated_at || '').slice(0, 10)}}`),
+      ]);
+      li.addEventListener('click', () => {{
+        // Until F.4/F.5 the editor route doesn't exist yet -- fall
+        // through to the legacy editor at the source.  Set the file
+        // dropdown for the next page load.
+        if (f.project_id) {{
+          location.hash = '#/project/' + encodeURIComponent(f.project_id);
+        }} else {{
+          // Orphan figure: drop back into legacy editor
+          location.hash = '';
+        }}
+      }});
+      ul.appendChild(li);
+    }}
+    container.appendChild(ul);
+  }}
+}}
+
+registerRoute(/^#\/$/, HomeScreen);
+// ===== end F.3 Home screen =====
 
 
 const canvasWrap = $('canvas-wrap');
