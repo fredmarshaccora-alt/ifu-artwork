@@ -839,6 +839,290 @@ registerRoute(/^#\/$/, HomeScreen);
 // ===== end F.3 Home screen =====
 
 
+// =====================================================================
+// F.4 -- Project workspace screen
+// =====================================================================
+//
+// One project at a time.  Breadcrumb back to home.  Figure grid +
+// "new figure" card.  Source binding bar (shows the source + revision
+// status; refresh button hits the existing /api/sources/.../refresh
+// endpoint).
+
+async function ProjectScreen(container, params) {{
+  _ensureHomeStyles();    // reuse the same CSS
+  container.className = 'home-screen';
+  const projId = params[0];
+
+  // Fetch project + figures + sources in parallel
+  let proj = null, figs = [], sources = [];
+  try {{
+    const [pr, fr, sr] = await Promise.all([
+      fetch(API_BASE + '/api/projects/' + encodeURIComponent(projId)),
+      fetch(API_BASE + '/api/projects/' + encodeURIComponent(projId) + '/figures'),
+      fetch(API_BASE + '/api/sources'),
+    ]);
+    if (pr.ok) proj = await pr.json();
+    if (fr.ok) figs = (await fr.json()).figures || [];
+    if (sr.ok) sources = (await sr.json()).sources || [];
+  }} catch (_e) {{}}
+
+  if (!proj) {{
+    container.appendChild(h('div', [
+      h('h1', 'Project not found'),
+      h('p', [h('a', {{ href: '#/' }}, '← back to home')]),
+    ]));
+    return;
+  }}
+
+  AppState.currentProjectId = projId;
+
+  // Breadcrumb + actions
+  container.appendChild(h('div.topbar', [
+    h('h1', [
+      h('a', {{ href: '#/', style: {{ color: '#71717a', textDecoration: 'none' }} }},
+        'Home'),
+      ' / ',
+      proj.name,
+    ]),
+    h('a', {{ href: '#/settings' }}, '⚙ Settings'),
+  ]));
+  if (proj.description) {{
+    container.appendChild(h('p', {{ style: {{ color: '#71717a', margin: '0 0 16px 0' }} }},
+                             proj.description));
+  }}
+
+  // Source binding bar: which sources do figures in this project use?
+  // (Distinct source_ids across the project's figures.)
+  const usedSourceIds = [...new Set(figs.map(f => f.source_id).filter(Boolean))];
+  if (usedSourceIds.length) {{
+    const bar = h('div', {{ style: {{ marginBottom: '24px',
+                                        padding: '12px', background: '#f4f4f5',
+                                        borderRadius: '6px', fontSize: '13px' }} }});
+    bar.appendChild(h('strong', 'Sources in this project: '));
+    bar.appendChild(document.createTextNode(usedSourceIds.join(', ')));
+    bar.appendChild(h('button', {{
+      style: {{ marginLeft: '12px', padding: '4px 10px',
+                 fontSize: '12px', cursor: 'pointer' }},
+      onClick: async () => {{
+        let ok = 0, fail = 0;
+        for (const sid of usedSourceIds) {{
+          try {{
+            const r = await fetch(API_BASE + '/api/sources/'
+                                     + encodeURIComponent(sid)
+                                     + '/versions/refresh', {{ method: 'POST' }});
+            if (r.ok) ok++; else fail++;
+          }} catch (_e) {{ fail++; }}
+        }}
+        alert(`Refreshed ${{ok}} source(s); ${{fail}} failed.`);
+      }},
+    }}, '↻ refresh Onshape Versions'));
+    container.appendChild(bar);
+  }}
+
+  // Figure grid + new
+  container.appendChild(h('h2', `Figures (${{figs.length}})`));
+  const grid = h('div.grid');
+  const newCard = h('div.card.placeholder', '+ new figure');
+  newCard.addEventListener('click', async () => {{
+    const name = prompt('Figure name:');
+    if (!name) return;
+    // Default source: first one in SOURCES (legacy CATALOGUE-based)
+    let sourceId = sources[0]?.id;
+    if (sources.length > 1) {{
+      const sourceOptions = sources.map((s, i) => `${{i + 1}}. ${{s.id}} (${{s.label}})`).join('\\n');
+      const pick = prompt(
+        'Source?\\n\\n' + sourceOptions + '\\n\\nEnter number:');
+      if (!pick) return;
+      const idx = parseInt(pick) - 1;
+      sourceId = sources[idx]?.id;
+      if (!sourceId) return;
+    }}
+    const r = await fetch(API_BASE + '/api/figures', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{
+        name, source_id: sourceId, project_id: projId,
+      }}),
+    }});
+    if (!r.ok) {{ alert('Create failed: ' + r.status); return; }}
+    // Re-render this screen (refreshes the figure grid)
+    renderRoute();
+  }});
+  grid.appendChild(newCard);
+
+  for (const fig of figs) {{
+    const card = h('div.card');
+    card.appendChild(h('div.name', fig.name || '(untitled)'));
+    const metaBits = [];
+    metaBits.push(fig.source_id || '?');
+    if (fig.bound_revision) metaBits.push(fig.bound_revision.name || '?rev');
+    metaBits.push((fig.updated_at || '').slice(0, 10));
+    card.appendChild(h('div.meta', metaBits.join(' - ')));
+    card.addEventListener('click', () => {{
+      // F.5: will route into #/project/X/figure/Y editor.
+      // For now, drop into legacy editor.
+      location.hash = '';
+    }});
+    grid.appendChild(card);
+  }}
+  container.appendChild(grid);
+}}
+
+registerRoute(/^#\/project\/([^/]+)$/, ProjectScreen);
+// ===== end F.4 Project screen =====
+
+
+// =====================================================================
+// F.6 -- Settings screen
+// =====================================================================
+//
+// App-level prefs (the figure-level styling controls live in the
+// editor's right panel).  Reads from /api/settings, writes back on
+// every change via PATCH.  Single-user, so no debounce needed.
+
+async function SettingsScreen(container) {{
+  _ensureHomeStyles();
+  container.className = 'home-screen';
+
+  // Header
+  container.appendChild(h('div.topbar', [
+    h('h1', [
+      h('a', {{ href: '#/', style: {{ color: '#71717a', textDecoration: 'none' }} }},
+        'Home'),
+      ' / Settings',
+    ]),
+  ]));
+
+  // Load current settings + source list
+  let settings = {{}};
+  let sources = [];
+  try {{
+    const [sr, srcs] = await Promise.all([
+      fetch(API_BASE + '/api/settings'),
+      fetch(API_BASE + '/api/sources'),
+    ]);
+    if (sr.ok) settings = await sr.json();
+    if (srcs.ok) sources = (await srcs.json()).sources || [];
+  }} catch (_e) {{}}
+  AppState.settings = settings;
+
+  // Generic row helper: a labelled control on one line
+  function fieldRow(label, control) {{
+    return h('div', {{ style: {{ display: 'flex',
+                                    alignItems: 'center',
+                                    gap: '12px',
+                                    marginBottom: '12px' }} }},
+              [
+                h('label', {{ style: {{ width: '220px',
+                                          fontSize: '13px',
+                                          color: '#71717a' }} }}, label),
+                control,
+              ]);
+  }}
+
+  async function patchSettings(patch) {{
+    try {{
+      const r = await fetch(API_BASE + '/api/settings', {{
+        method: 'PATCH',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify(patch),
+      }});
+      if (r.ok) settings = await r.json();
+    }} catch (_e) {{}}
+  }}
+
+  // ---- General ----
+  container.appendChild(h('h2', 'General'));
+
+  const detailSelect = h('select');
+  for (const opt of ['coarse', 'normal', 'fine']) {{
+    const o = document.createElement('option');
+    o.value = opt; o.textContent = opt;
+    if ((settings.default_detail || 'normal') === opt) o.selected = true;
+    detailSelect.appendChild(o);
+  }}
+  detailSelect.addEventListener('change', () =>
+    patchSettings({{ default_detail: detailSelect.value }}));
+  container.appendChild(fieldRow('Default render detail', detailSelect));
+
+  const strokeColor = h('input', {{ type: 'color',
+    value: settings.default_stroke_color || '#00836a' }});
+  strokeColor.addEventListener('change', () =>
+    patchSettings({{ default_stroke_color: strokeColor.value }}));
+  container.appendChild(fieldRow('Default stroke colour', strokeColor));
+
+  const strokeWidth = h('input', {{ type: 'number', step: '0.5',
+    min: '0.5', max: '15',
+    value: settings.default_stroke_width_mm ?? 3.0,
+    style: {{ width: '70px' }} }});
+  strokeWidth.addEventListener('change', () =>
+    patchSettings({{ default_stroke_width_mm: parseFloat(strokeWidth.value) }}));
+  container.appendChild(fieldRow('Default stroke width (mm)', strokeWidth));
+
+  const fillColor = h('input', {{ type: 'color',
+    value: settings.default_fill_color || '#cce6e0' }});
+  fillColor.addEventListener('change', () =>
+    patchSettings({{ default_fill_color: fillColor.value }}));
+  container.appendChild(fieldRow('Default fill colour', fillColor));
+
+  const fillAlpha = h('input', {{ type: 'number', step: '0.05',
+    min: '0', max: '1',
+    value: settings.default_fill_alpha ?? 0.3,
+    style: {{ width: '70px' }} }});
+  fillAlpha.addEventListener('change', () =>
+    patchSettings({{ default_fill_alpha: parseFloat(fillAlpha.value) }}));
+  container.appendChild(fieldRow('Default fill alpha (0–1)', fillAlpha));
+
+  // ---- Sources (read-only for now; editing in F.5+) ----
+  container.appendChild(h('h2', 'Sources'));
+  const srcList = h('div', {{ style: {{ marginBottom: '24px' }} }});
+  if (!sources.length) {{
+    srcList.appendChild(h('div.empty', 'No sources configured.'));
+  }} else {{
+    for (const s of sources) {{
+      srcList.appendChild(h('div', {{ style: {{ marginBottom: '8px',
+                                                   fontSize: '13px' }} }},
+        [
+          h('strong', s.label),
+          ' (' + s.id + ') ',
+          s.onshape_ids
+            ? h('span', {{ style: {{ color: '#0a8' }} }}, 'Onshape')
+            : h('span', {{ style: {{ color: '#71717a' }} }}, 'local STEP'),
+        ]));
+    }}
+  }}
+  container.appendChild(srcList);
+
+  // ---- Storage ----
+  container.appendChild(h('h2', 'Storage'));
+  container.appendChild(h('div', {{ style: {{ fontSize: '13px',
+                                                marginBottom: '24px' }} }},
+    [
+      h('strong', 'Projects folder: '),
+      h('code', settings.projects_dir || '?'),
+    ]));
+
+  // ---- Reset ----
+  container.appendChild(h('h2', 'Danger zone'));
+  const resetBtn = h('button',
+    {{ style: {{ padding: '8px 12px', fontSize: '13px',
+                  border: '1px solid #c44', color: '#c44',
+                  background: '#fff', cursor: 'pointer',
+                  borderRadius: '4px' }} }},
+    'Reset to defaults');
+  resetBtn.addEventListener('click', async () => {{
+    if (!confirm('Reset ALL app settings to defaults?  '
+                + 'Per-figure and per-project state is untouched.')) return;
+    await fetch(API_BASE + '/api/settings/reset', {{ method: 'POST' }});
+    renderRoute();   // re-mount this screen with fresh values
+  }});
+  container.appendChild(resetBtn);
+}}
+
+registerRoute(/^#\/settings$/, SettingsScreen);
+// ===== end F.6 Settings screen =====
+
+
 const canvasWrap = $('canvas-wrap');
 const fileSel = $('file-sel');
 const viewSel = $('view-sel');
