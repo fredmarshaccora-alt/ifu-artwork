@@ -99,10 +99,12 @@ def server_url() -> str:
 
 # ---- Playwright fixture (for E2E) --------------------------------------
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def playwright_browser():
-    """One browser instance per test session.  Skip when Playwright isn't
-    installed -- E2E tests are gated separately."""
+    """One browser instance PER TEST.  Session-scope sounds tempting but
+    Chromium accumulates memory loading the 26MB viewer.html across many
+    tests and starts dropping connections.  Function-scope is slower but
+    rock-solid -- each test gets a fresh process."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -110,13 +112,19 @@ def playwright_browser():
     pw = sync_playwright().start()
     browser = pw.chromium.launch(headless=True)
     yield browser
-    browser.close()
-    pw.stop()
+    try:
+        browser.close()
+    except Exception:
+        pass
+    try:
+        pw.stop()
+    except Exception:
+        pass
 
 
 @pytest.fixture
 def page(playwright_browser, server_url):
-    """Per-test page (clean context, no cookie sharing)."""
+    """Per-test page (fresh context, no shared state)."""
     ctx = playwright_browser.new_context(
         viewport={"width": 1600, "height": 1000})
     pg = ctx.new_page()
@@ -126,4 +134,7 @@ def page(playwright_browser, server_url):
         "document.querySelector('#file-sel').options.length > 0",
         timeout=60_000)
     yield pg
-    ctx.close()
+    try:
+        ctx.close()
+    except Exception:
+        pass

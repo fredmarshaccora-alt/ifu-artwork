@@ -37,7 +37,7 @@ from build_viewer import (
 from t5_hlr_vector import (
     run_hlr_per_solid, write_svg_parts, rotate_shape,
     run_part_silhouettes, run_group_silhouette,
-    compute_visible_footprints,
+    compute_visible_footprints, run_hlr_in_region,
 )
 
 HERE = Path(__file__).parent
@@ -217,6 +217,94 @@ def render():
     return Response(svg_bytes, mimetype="image/svg+xml", headers={
         "X-Render-Seconds": f"{elapsed:.2f}",
         "X-Render-Breakdown": breakdown,
+    })
+
+
+@app.route("/api/render_region", methods=["POST"])
+def render_region():
+    """Render JUST the solids inside a 2D bounding box at higher detail.
+
+    Used by the "zoom in, give me the fine version" workflow.  Skipping
+    the parts outside the viewport means we can crank the mesh + sample
+    deflection without paying the full-assembly cost.
+
+    POST JSON:
+      {file_id, eye+target or view_dir+focal, up_axis?,
+       bbox_uv: [u_min, v_min, u_max, v_max],
+       mesh_defl?, sample_defl?, padding_mm?}
+    Returns: image/svg+xml
+    """
+    body = request.get_json(silent=True) or {}
+    file_id = body.get("file_id")
+    bbox_uv = body.get("bbox_uv")
+    mesh_defl = float(body.get("mesh_defl") or 0.4)
+    sample_defl = float(body.get("sample_defl") or 0.4)
+    padding_mm = float(body.get("padding_mm") or 10.0)
+
+    if file_id not in _SHAPES:
+        return jsonify({"error": f"unknown source: {file_id!r}",
+                        "known": list(_SHAPES.keys())}), 400
+    if not isinstance(bbox_uv, list) or len(bbox_uv) != 4:
+        return jsonify({"error":
+            "bbox_uv must be [u_min, v_min, u_max, v_max]"}), 400
+    try:
+        bbox_uv = tuple(float(x) for x in bbox_uv)
+    except Exception:
+        return jsonify({"error": "bbox_uv must be 4 floats"}), 400
+    if bbox_uv[0] >= bbox_uv[2] or bbox_uv[1] >= bbox_uv[3]:
+        return jsonify({"error": "bbox_uv must have u_min<u_max and v_min<v_max"}), 400
+
+    # Camera resolution (same as /api/render)
+    eye = body.get("eye"); target = body.get("target")
+    view_dir = body.get("view_dir"); focal = body.get("focal")
+    up_axis = body.get("up_axis")
+    if isinstance(eye, list) and isinstance(target, list) \
+            and len(eye) == 3 and len(target) == 3:
+        eye = tuple(float(x) for x in eye)
+        focal = tuple(float(x) for x in target)
+        vd = (eye[0] - focal[0], eye[1] - focal[1], eye[2] - focal[2])
+        mag = (vd[0]**2 + vd[1]**2 + vd[2]**2) ** 0.5
+        if mag < 1e-9:
+            return jsonify({"error": "eye and target coincide"}), 400
+        view_dir = (vd[0] / mag, vd[1] / mag, vd[2] / mag)
+    elif isinstance(view_dir, list) and len(view_dir) == 3:
+        view_dir = tuple(float(x) for x in view_dir)
+        focal = tuple(float(x) for x in focal) if isinstance(focal, list) else (0.0, 0.0, 0.0)
+    else:
+        return jsonify({"error":
+            "supply either {eye, target} or {view_dir, focal}"}), 400
+
+    shape, _src_hlr_kw = _SHAPES[file_id]
+    if up_axis and float(up_axis.get("angle") or 0) != 0:
+        try:
+            ax = tuple(float(c) for c in up_axis["axis"])
+            ang = float(up_axis["angle"])
+            shape = rotate_shape(shape, ax, ang)
+        except Exception as exc:
+            return jsonify({"error": f"bad up_axis: {exc}"}), 400
+
+    t0 = time.time()
+    try:
+        parts = run_hlr_in_region(
+            shape, view_dir, focal=focal,
+            bbox_uv=bbox_uv,
+            mesh_defl=mesh_defl, sample_defl=sample_defl,
+            padding_mm=padding_mm)
+    except Exception as exc:
+        import traceback; traceback.print_exc()
+        return jsonify({"error":
+            f"region render failed: {type(exc).__name__}: {exc}"}), 500
+    t_hlr = time.time() - t0
+
+    out_path = OUT / f"_region_{file_id}.svg"
+    write_svg_parts(parts, out_path, precision=1)
+    svg_bytes = out_path.read_bytes()
+    print(f"  /api/render_region {file_id:<10s} bbox={bbox_uv} "
+          f"defl=({mesh_defl},{sample_defl}) parts={len(parts)} "
+          f"hlr={t_hlr:.2f}s size={len(svg_bytes)//1024}KB")
+    return Response(svg_bytes, mimetype="image/svg+xml", headers={
+        "X-Region-Parts": str(len(parts)),
+        "X-Region-Seconds": f"{t_hlr:.2f}",
     })
 
 

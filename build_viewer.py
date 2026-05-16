@@ -345,6 +345,8 @@ HTML_TEMPLATE = r"""<!doctype html>
   <span style="flex:1"></span>
   <button id="btn-annotate">+ callout</button>
   <button id="btn-clear">clear callouts</button>
+  <button id="btn-detail" title="Re-render just the visible viewport at finer mesh + sample">↕ hi-detail</button>
+  <button id="btn-detail-clear" title="Remove the hi-detail overlay" style="display:none">clear detail</button>
   <button id="btn-export">export SVG</button>
   <button id="btn-screenshot" title="Save the current pane(s) as PNG">📸 PNG</button>
 </header>
@@ -602,6 +604,25 @@ fileSel.addEventListener('change', () => {{
   window.IFU_VIEWER?.applyUpAxisOverride?.(UP_AXIS_ROT[upStored]);
 }});
 viewSel.addEventListener('change', refreshPane);
+// P1.a: when the View dropdown changes (Iso / Front / Side / Live / saved),
+// snap the 3D camera to match that view direction.  This is the cheap
+// "make 3D match what I'm looking at in 2D" workflow Composer uses --
+// no separate "view in 3D" button needed.  Skip when the view has no
+// usable view_dir (e.g. a placeholder entry).
+function snap3DToCurrentView() {{
+  const fe = CATALOGUE.find(x => x.file_id === fileSel.value);
+  const ve = fe?.views.find(v => v.view_id === viewSel.value);
+  const vd = ve?.view_dir;
+  if (!vd || vd.length !== 3) return;
+  // Pick eye = focal + view_dir * dist; distance is fitted properly
+  // inside snapCameraTo via the ortho bounds re-fit.
+  const len = Math.hypot(vd[0], vd[1], vd[2]) || 1;
+  const dist = 4000;     // generous; ortho fit will re-tune frustum
+  const eye = [vd[0] / len * dist, vd[1] / len * dist, vd[2] / len * dist];
+  const target = [0, 0, 0];
+  window.IFU_VIEWER?.snapCameraTo?.(eye, target);
+}}
+viewSel.addEventListener('change', snap3DToCurrentView);
 refreshViews();
 
 function activePane() {{
@@ -757,9 +778,33 @@ function applyHighlights() {{
   }}
 }}
 
-// Esc clears selection
+// Keyboard shortcuts (only when no input/select/textarea has focus).
+//   Esc      -- clear selection
+//   1/2/3    -- 2D / Split / 3D layout
+//   R        -- reset 3D camera to current view's direction
+//   F        -- fit (reset pan/zoom on active 2D pane)
 window.addEventListener('keydown', (e) => {{
-  if (e.key === 'Escape') clearHighlights();
+  const t = e.target;
+  if (t && /^(INPUT|TEXTAREA|SELECT)$/i.test(t.tagName)) return;
+  if (e.key === 'Escape') return clearHighlights();
+  if (e.key === '1') return $('lay-2d').click();
+  if (e.key === '2') return $('lay-split').click();
+  if (e.key === '3') return $('lay-3d').click();
+  if (e.key.toLowerCase() === 'r') {{
+    // R = re-snap 3D camera to current 2D view direction
+    snap3DToCurrentView?.();
+    return;
+  }}
+  if (e.key.toLowerCase() === 'f') {{
+    // F = reset pan/zoom on the active 2D pane
+    const pane = activePane();
+    if (pane) {{
+      const st = getState(pane.dataset.file, pane.dataset.view);
+      st.tx = 0; st.ty = 0; st.scale = 1;
+      applyTransform(pane);
+    }}
+    return;
+  }}
 }});
 
 function applyTransform(pane) {{
@@ -1168,6 +1213,109 @@ $('btn-screenshot').addEventListener('click', () => {{
     console.error('screenshot failed:', err);
     alert('Screenshot failed: ' + err.message);
   }});
+}});
+
+// P2.b: hi-detail render of the currently-visible viewport.  We
+// compute the visible bbox in projector (u,v) space, POST it to
+// /api/render_region at a finer mesh/sample, then overlay the
+// returned SVG as a new <g class="layer-region-detail"> group inside
+// the active pane's scale-flip group.  Clicking again clears it.
+async function detailRenderActive() {{
+  if (typeof API_BASE !== 'string') return;
+  const svg = activeSvg();
+  if (!svg) return;
+  // The visible (u,v) bbox = viewBox + current pan/zoom transform.
+  // The scale-flip group has transform="scale(1,-1)" so the SVG y
+  // axis is negated.  We compute bbox in PROJECTOR space by taking
+  // the SVG's viewBox and the pan/zoom transform of the view-transform group.
+  const viewG = svg.querySelector('g.view-transform');
+  const vb = svg.getAttribute('viewBox').split(/\\s+/).map(parseFloat);
+  // viewBox is [x, y, w, h]; flip y to projector u,v
+  // For a fresh load (no pan/zoom) the viewport IS the viewBox.
+  // When zoomed, viewG has translate(tx,ty) scale(s); we invert that
+  // to find which portion of the viewBox is currently visible.
+  let bboxUv = [vb[0], -(vb[1] + vb[3]), vb[0] + vb[2], -vb[1]];
+  if (viewG) {{
+    const t = viewG.getAttribute('transform') || '';
+    const tm = t.match(/translate\\(([-\\d.]+)\\s+([-\\d.]+)\\)\\s*scale\\(([-\\d.]+)\\)/);
+    if (tm) {{
+      const tx = parseFloat(tm[1]), ty = parseFloat(tm[2]), sc = parseFloat(tm[3]);
+      // Visible area in viewBox coords = (viewBox + pan) / scale
+      const vw = vb[2] / sc, vh = vb[3] / sc;
+      const vx = vb[0] - tx / sc, vy = vb[1] - ty / sc;
+      bboxUv = [vx, -(vy + vh), vx + vw, -vy];
+    }}
+  }}
+  const fid = fileSel.value, vid = viewSel.value;
+  const fe = CATALOGUE.find(x => x.file_id === fid);
+  const ve = fe?.views.find(v => v.view_id === vid);
+  const body = {{
+    file_id: fid,
+    bbox_uv: bboxUv,
+    mesh_defl: 0.3,
+    sample_defl: 0.3,
+  }};
+  // Camera: same as fetchTrueSilhouettes
+  const liveCtx = window.IFU_VIEWER._getLiveCamCtx?.(fid);
+  if (vid === '__live__' && liveCtx) {{
+    body.eye = liveCtx.eye;
+    body.target = liveCtx.target;
+    if (liveCtx.up_axis) body.up_axis = liveCtx.up_axis;
+  }} else if (ve && ve.view_dir) {{
+    body.view_dir = ve.view_dir;
+    body.focal = [0, 0, 0];
+  }} else {{
+    alert('No view direction for the active source/view');
+    return;
+  }}
+  const btn = $('btn-detail');
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '⏳ rendering...';
+  try {{
+    const r = await fetch(API_BASE + '/api/render_region', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify(body),
+    }});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const text = await r.text();
+    // Parse and graft the new SVG's inner contents into a <g> overlay
+    const tmp = new DOMParser().parseFromString(text, 'image/svg+xml');
+    const incoming = tmp.documentElement;   // <svg>
+    const scaleG = svg.querySelector('g[transform="scale(1,-1)"]')
+                || svg.querySelector('.view-transform > g')
+                || svg.querySelector(':scope > g');
+    if (!scaleG) throw new Error('no scale group in active SVG');
+    scaleG.querySelector(':scope > g.layer-region-detail')?.remove();
+    const layer = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    layer.setAttribute('class', 'layer-region-detail');
+    // The incoming SVG has its own scale(1,-1) wrapper -- we want its
+    // INNER content placed directly into the existing scale-flip group
+    // so the wrappers don't double up.
+    const incomingScaleG = incoming.querySelector('g[transform="scale(1,-1)"]');
+    if (incomingScaleG) {{
+      Array.from(incomingScaleG.children).forEach(ch => layer.appendChild(ch.cloneNode(true)));
+    }} else {{
+      Array.from(incoming.children).forEach(ch => layer.appendChild(ch.cloneNode(true)));
+    }}
+    scaleG.appendChild(layer);
+    const nParts = r.headers.get('X-Region-Parts') || '?';
+    const seconds = r.headers.get('X-Region-Seconds') || '?';
+    btn.textContent = `✓ ${{nParts}} parts in ${{seconds}}s`;
+    $('btn-detail-clear').style.display = '';
+    setTimeout(() => {{ btn.disabled = false; btn.textContent = orig; }}, 2500);
+  }} catch (e) {{
+    btn.textContent = '✗ ' + (e.message || 'failed');
+    setTimeout(() => {{ btn.disabled = false; btn.textContent = orig; }}, 3000);
+  }}
+}}
+$('btn-detail').addEventListener('click', detailRenderActive);
+$('btn-detail-clear').addEventListener('click', () => {{
+  const svg = activeSvg();
+  if (!svg) return;
+  svg.querySelector('g.layer-region-detail')?.remove();
+  $('btn-detail-clear').style.display = 'none';
 }});
 
 $('btn-export').onclick = () => {{

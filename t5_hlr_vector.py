@@ -470,6 +470,71 @@ def compute_visible_footprints(shape, part_indices, view_dir, focal=(0, 0, 0),
     return out
 
 
+def run_hlr_in_region(shape, view_dir, focal=(0, 0, 0),
+                       bbox_uv=None,
+                       mesh_defl=0.4, sample_defl=0.4,
+                       padding_mm=10.0):
+    """HLR on JUST the solids whose projected bbox overlaps ``bbox_uv``.
+
+    Used by the "render this zoom window at higher detail" workflow.
+    A few thousand parts get cut down to (typically) tens, and we can
+    run at fine mesh/sample without paying the full-assembly cost.
+
+    Args:
+      bbox_uv    : (u_min, v_min, u_max, v_max) in projector space, or
+                   None to keep every solid (= same as run_hlr_per_solid
+                   but with the finer detail defaults).
+      padding_mm : Extend bbox_uv outward by this much when filtering, so
+                   occluders just outside the visible window still cull
+                   correctly.  10mm is enough for a thin bracket lip.
+
+    Trade-off: occluders OUTSIDE bbox_uv + padding are ignored, so a
+    big plate fully outside the window won't hide a tube inside it.
+    For typical "zoom in to inspect a feature" use, the padding handles
+    it.  Document if you hit a case where it matters.
+    """
+    from OCP.TopoDS import TopoDS_Compound
+    from OCP.BRep import BRep_Builder
+
+    proj, x_axis, y_axis, focal_pt = build_projector(view_dir, focal)
+    all_solids = split_solids(shape)
+
+    # Project each solid's 3D bbox to (u,v) and filter
+    if bbox_uv is not None:
+        u_min, v_min, u_max, v_max = bbox_uv
+        u_min -= padding_mm; v_min -= padding_mm
+        u_max += padding_mm; v_max += padding_mm
+        solid_bboxes = _project_solid_bboxes(all_solids, x_axis, y_axis, focal_pt)
+        kept_idxs = set()
+        for idx, _label, su0, sv0, su1, sv1 in solid_bboxes:
+            # Bbox intersection test
+            if su1 < u_min or su0 > u_max or sv1 < v_min or sv0 > v_max:
+                continue
+            kept_idxs.add(idx)
+        solids = [s for s in all_solids if s[0] in kept_idxs]
+    else:
+        solids = all_solids
+
+    if not solids:
+        return []
+
+    # Build a compound of just the kept solids -- this is what HLR runs on
+    if len(solids) == 1:
+        compound = solids[0][2]
+    else:
+        compound = TopoDS_Compound()
+        builder = BRep_Builder()
+        builder.MakeCompound(compound)
+        for _idx, _label, solid in solids:
+            builder.Add(compound, solid)
+
+    # Run the full per-solid HLR pipeline on the filtered compound at
+    # the requested fine detail.  Reuses existing dedup + DP simplify.
+    return run_hlr_per_solid(compound, view_dir, focal=focal,
+                              mesh_defl=mesh_defl, sample_defl=sample_defl,
+                              progress=False)
+
+
 def run_group_silhouette(shape, part_indices, view_dir, focal=(0, 0, 0),
                           mesh_defl=0.4, sample_defl=0.3):
     """Single TRUE silhouette of the COMPOUND of the selected solids.
