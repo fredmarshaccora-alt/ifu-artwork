@@ -9,7 +9,9 @@ def test_home_route_is_reachable(page):
     page.evaluate("location.hash = '#/'")
     page.wait_for_timeout(400)
     has_home = page.evaluate(
-        "() => !!document.querySelector('.home-screen h1')")
+        "() => !!document.querySelector('.app-topbar .crumbs .current') && "
+        "document.querySelector('.app-topbar .crumbs .current').textContent "
+        "=== 'Home'")
     assert has_home, "navigating to '#/' should mount the Home screen"
 
 

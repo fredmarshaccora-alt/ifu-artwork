@@ -1402,7 +1402,17 @@ async function ProjectScreen(container, params) {{
 }}
 
 function _openNewFigureModal(projId, sources) {{
-  let nameInput, sourceSelect;
+  let nameInput, sourceSelect, viewSelect, captureCurrent;
+
+  // Detect current 3D camera if the editor was open before.  Falls
+  // back to null -- the figure will use its source's iso preset.
+  const currentCam = (() => {{
+    try {{
+      const c = window.IFU_VIEWER && window.IFU_VIEWER.getCameraEyeTarget?.();
+      return c || null;
+    }} catch (_e) {{ return null; }}
+  }})();
+
   const body = h('div', [
     h('div.field-row', [
       h('label', 'Figure name'),
@@ -1413,11 +1423,24 @@ function _openNewFigureModal(projId, sources) {{
       h('label', 'Source'),
       (sourceSelect = h('select.select', {{ style: {{ width: '100%' }} }})),
     ]),
+    h('div.field-row', [
+      h('label', 'Starting view'),
+      (viewSelect = h('select.select', {{ style: {{ width: '100%' }} }})),
+    ]),
+    currentCam
+      ? h('div', {{ style: {{ marginTop: '8px', padding: '8px 12px',
+                                background: 'var(--c-accora-pale)',
+                                borderRadius: 'var(--radius-1)',
+                                fontSize: 'var(--t-meta)',
+                                color: 'var(--c-accora-dark)' }} }}, [
+          (captureCurrent = h('input', {{ type: 'checkbox', checked: true,
+                                            style: {{ marginRight: '6px' }} }})),
+          h('span', "Use my current 3D camera angle as the figure's view"),
+        ])
+      : null,
     h('div', {{ style: {{ marginTop: '12px', fontSize: '12px',
                             color: 'var(--c-text-muted)' }} }},
-      "The figure will open in the editor; pose your camera and apply " +
-      "styling there.  You can always re-bind to a different source " +
-      "revision later."),
+      'You can re-pose the camera in the editor at any time.'),
   ]);
   // Populate source dropdown
   for (const s of (sources || [])) {{
@@ -1425,6 +1448,12 @@ function _openNewFigureModal(projId, sources) {{
     opt.value = s.id; opt.textContent = `${{s.label}}  (${{s.id}})`;
     sourceSelect.appendChild(opt);
   }}
+  // Starting-view presets -- this is just a default if no camera capture
+  ['iso', 'front', 'side'].forEach(vid => {{
+    const opt = document.createElement('option');
+    opt.value = vid; opt.textContent = vid;
+    viewSelect.appendChild(opt);
+  }});
   openModal({{
     title: 'New figure',
     body,
@@ -1435,17 +1464,28 @@ function _openNewFigureModal(projId, sources) {{
         if (!name) {{ nameInput.focus(); return; }}
         const sourceId = sourceSelect.value;
         if (!sourceId) return;
+        const useCurrent = currentCam && captureCurrent && captureCurrent.checked;
+        const payload = {{
+          name, source_id: sourceId, project_id: projId,
+          view_id: useCurrent ? 'custom' : (viewSelect.value || 'iso'),
+        }};
+        if (useCurrent) {{
+          payload.camera = {{
+            eye: currentCam.eye, target: currentCam.target,
+            up_axis: 'z',
+          }};
+        }}
         try {{
           const r = await fetch(API_BASE + '/api/figures', {{
             method: 'POST',
             headers: {{ 'Content-Type': 'application/json' }},
-            body: JSON.stringify({{ name, source_id: sourceId,
-                                      project_id: projId }}),
+            body: JSON.stringify(payload),
           }});
           if (!r.ok) throw new Error('HTTP ' + r.status);
           const f = await r.json();
           close();
-          toast('Figure created', 'success');
+          toast('Figure created' + (useCurrent ? ' with current 3D pose' : ''),
+                'success');
           location.hash = '#/project/' + encodeURIComponent(projId)
                         + '/figure/' + encodeURIComponent(f.id);
         }} catch (e) {{
