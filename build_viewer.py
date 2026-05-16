@@ -3015,6 +3015,8 @@ setLayout('2d');
 // Python-side STD_VIEWS / VIEWS list.
 
 import * as THREE from 'three';
+// Expose for debugging + tests (the ES-module scope is otherwise sealed)
+window.THREE = THREE;
 import {{ OrbitControls }} from 'three/addons/controls/OrbitControls.js';
 import {{ GLTFLoader }} from 'three/addons/loaders/GLTFLoader.js';
 import {{ ViewHelper }} from 'three/addons/helpers/ViewHelper.js';
@@ -3225,11 +3227,18 @@ function animate() {{
     resize();
   }}
   // Main scene, then overlay the orientation gizmo on top.
+  // ViewHelper.render() leaves the WebGL viewport pointing at its
+  // tiny corner region; if we don't restore it, the next frame's main
+  // render ends up scribbling into the corner instead of filling the
+  // canvas.  Save+restore explicitly to avoid the regression.
   renderer.autoClear = true;
   renderer.render(scene, camera);
   if (viewHelper) {{
     renderer.autoClear = false;
     viewHelper.render(renderer);
+    const r = canvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    renderer.setViewport(0, 0, r.width * dpr, r.height * dpr);
   }}
   updateReadout();
 }}
