@@ -23,3 +23,11 @@ Thumbs.db
 
 # Claude / agent scratch
 .claude/
+
+# Server / scratch logs
+server.log
+debug_compare/
+
+# Ad-hoc dev test scripts (legitimate tests will live under tests/)
+_diag_*.py
+_test_*.py

@@ -36,6 +36,8 @@ from build_viewer import (
 )
 from t5_hlr_vector import (
     run_hlr_per_solid, write_svg_parts, rotate_shape,
+    run_part_silhouettes, run_group_silhouette,
+    compute_visible_footprints,
 )
 
 HERE = Path(__file__).parent
@@ -68,6 +70,24 @@ _SHAPES: dict[str, tuple] = {}
 # (~80s for Presto), so memoising lets the user revisit an angle for free.
 _RENDER_CACHE: dict[tuple, bytes] = {}
 _RENDER_CACHE_MAX = 20    # rough cap on memory
+
+# Per-part silhouette cache: (file_id, vd_key, focal_key, up_axis_key, idx)
+# -> list of polylines in (u,v).  Each entry is one PolyAlgo on a single
+# solid (cheap-ish: ~0.1-2s depending on part complexity), but if the
+# user keeps the same angle and re-selects, the cache means instant.
+_SIL_CACHE: dict[tuple, list] = {}
+_SIL_CACHE_MAX = 2000
+
+# Visible-footprint cache: (file_id, vd_key, focal_key, up_axis_key, idx)
+# -> list of closed polylines tracing the part's visible 2D footprint.
+# Cost is dominated by the single rasterize pass (all parts at once);
+# results are returned per requested idx so caching is per-idx-per-view.
+_FOOT_CACHE: dict[tuple, list] = {}
+_FOOT_CACHE_MAX = 2000
+# Rasterize-once tracker: bool keyed by (file_id, vd_key, focal_key,
+# up_axis_key) so we don't redo the assembly raster within the same view
+# when extra parts are requested.
+_FOOT_RASTER_DONE: dict[tuple, bool] = {}
 
 
 def boot():
@@ -198,6 +218,285 @@ def render():
         "X-Render-Seconds": f"{elapsed:.2f}",
         "X-Render-Breakdown": breakdown,
     })
+
+
+@app.route("/api/part_footprints", methods=["POST"])
+def part_footprints():
+    """Visible-footprint boundaries per part.
+
+    For each part_idx in the request, returns the closed polyline(s)
+    outlining the part's actually-visible 2D region in the current view
+    (occluder cuts drawn along the occluder's boundary).  Same camera
+    grammar as /api/render.
+
+    Implementation rasterizes the whole assembly into an ID buffer
+    once per view, then extracts contours for every part.  All results
+    cached, so subsequent requests in the same view are cache hits.
+    """
+    body = request.get_json(silent=True) or {}
+    file_id = body.get("file_id")
+    part_indices = body.get("part_indices") or []
+    eye = body.get("eye")
+    target = body.get("target")
+    view_dir = body.get("view_dir")
+    focal = body.get("focal")
+    up_axis = body.get("up_axis")
+
+    if file_id not in _SHAPES:
+        return jsonify({"error": f"unknown source: {file_id!r}",
+                        "known": list(_SHAPES.keys())}), 400
+    if not isinstance(part_indices, list) or not part_indices:
+        return jsonify({"error": "part_indices must be a non-empty list"}), 400
+    try:
+        part_indices = [int(i) for i in part_indices]
+    except Exception:
+        return jsonify({"error": "part_indices must be a list of ints"}), 400
+
+    # Camera resolution (same logic as /api/render)
+    if isinstance(eye, list) and isinstance(target, list) \
+            and len(eye) == 3 and len(target) == 3:
+        eye = tuple(float(x) for x in eye)
+        focal = tuple(float(x) for x in target)
+        vd = (eye[0] - focal[0], eye[1] - focal[1], eye[2] - focal[2])
+        mag = (vd[0] ** 2 + vd[1] ** 2 + vd[2] ** 2) ** 0.5
+        if mag < 1e-9:
+            return jsonify({"error": "eye and target coincide"}), 400
+        view_dir = (vd[0] / mag, vd[1] / mag, vd[2] / mag)
+    elif isinstance(view_dir, list) and len(view_dir) == 3:
+        view_dir = tuple(float(x) for x in view_dir)
+        if isinstance(focal, list) and len(focal) == 3:
+            focal = tuple(float(x) for x in focal)
+        else:
+            focal = (0.0, 0.0, 0.0)
+    else:
+        return jsonify({"error":
+            "supply either {eye, target} or {view_dir, focal}"}), 400
+
+    shape, hlr_kw = _SHAPES[file_id]
+    up_axis_key: tuple = ()
+    if up_axis and float(up_axis.get("angle") or 0) != 0:
+        try:
+            ax = tuple(float(c) for c in up_axis["axis"])
+            ang = float(up_axis["angle"])
+            shape = rotate_shape(shape, ax, ang)
+            up_axis_key = (round(ax[0], 3), round(ax[1], 3),
+                           round(ax[2], 3), round(ang, 1))
+        except Exception as exc:
+            return jsonify({"error": f"bad up_axis: {exc}"}), 400
+
+    vd_key = tuple(round(x, 3) for x in view_dir)
+    focal_key = tuple(round(x, 1) for x in focal)
+    view_key = (file_id, vd_key, focal_key, up_axis_key)
+
+    out_polys: dict[int, list] = {}
+    misses: list[int] = []
+    for idx in part_indices:
+        ck = view_key + (idx,)
+        cached = _FOOT_CACHE.get(ck)
+        if cached is not None:
+            out_polys[idx] = cached
+        else:
+            misses.append(idx)
+
+    t_raster = 0.0
+    if misses and not _FOOT_RASTER_DONE.get(view_key):
+        # First request in this view: rasterize the WHOLE assembly so
+        # we get every part's footprint in one go.  Subsequent requests
+        # in this view hit the cache regardless of which parts are asked.
+        all_indices = list(range(len(_count_solids(shape))))
+        t0 = time.time()
+        try:
+            full = compute_visible_footprints(
+                shape, all_indices, view_dir, focal=focal,
+                mesh_defl=hlr_kw.get("mesh_defl", 0.8),
+            )
+        except Exception as exc:
+            import traceback; traceback.print_exc()
+            return jsonify({"error":
+                f"footprint failed: {type(exc).__name__}: {exc}"}), 500
+        t_raster = time.time() - t0
+        for idx, polys in full.items():
+            ck = view_key + (idx,)
+            if len(_FOOT_CACHE) >= _FOOT_CACHE_MAX:
+                _FOOT_CACHE.pop(next(iter(_FOOT_CACHE)))
+            _FOOT_CACHE[ck] = polys
+        _FOOT_RASTER_DONE[view_key] = True
+        for idx in misses:
+            out_polys[idx] = full.get(idx, [])
+
+    payload = {
+        "part_indices": part_indices,
+        "polylines": {str(i): out_polys.get(i, []) for i in part_indices},
+        "stats": {
+            "hits": len(part_indices) - len(misses),
+            "misses": len(misses),
+            "raster_seconds": round(t_raster, 3),
+        },
+    }
+    print(f"  /api/part_footprints {file_id:<10s} "
+          f"parts={part_indices[:8]}{'...' if len(part_indices)>8 else ''} "
+          f"hits={len(part_indices)-len(misses)} misses={len(misses)} "
+          f"raster={t_raster:.2f}s")
+    return jsonify(payload)
+
+
+def _count_solids(shape):
+    """Return list of all solid indices in shape order (matches the
+    indexing used everywhere else in this pipeline)."""
+    from t5_hlr_vector import split_solids
+    return [idx for idx, _label, _solid in split_solids(shape)]
+
+
+@app.route("/api/part_silhouettes", methods=["POST"])
+def part_silhouettes():
+    """Per-part TRUE silhouettes for the highlighted parts, computed
+    by running HLR on each requested solid IN ISOLATION (no occluders).
+
+    POST JSON: {file_id, part_indices: [int, ...], eye, target, up_axis?}
+    Returns:   {part_indices: [...], polylines: {idx: [[[u,v], ...], ...]}}
+
+    Polyline (u,v) is in the same projection frame as /api/render, so
+    the client can drop them straight into the SVG layer at the same
+    scale(1,-1) coordinate space.
+    """
+    body = request.get_json(silent=True) or {}
+    file_id = body.get("file_id")
+    part_indices = body.get("part_indices") or []
+    eye = body.get("eye")
+    target = body.get("target")
+    view_dir = body.get("view_dir")
+    focal = body.get("focal")
+    up_axis = body.get("up_axis")
+    group_mode = bool(body.get("group"))
+
+    if file_id not in _SHAPES:
+        return jsonify({"error": f"unknown source: {file_id!r}",
+                        "known": list(_SHAPES.keys())}), 400
+    if not isinstance(part_indices, list) or not part_indices:
+        return jsonify({"error": "part_indices must be a non-empty list"}), 400
+    try:
+        part_indices = [int(i) for i in part_indices]
+    except Exception:
+        return jsonify({"error": "part_indices must be a list of ints"}), 400
+
+    # Same camera-resolution logic as /api/render
+    if isinstance(eye, list) and isinstance(target, list) \
+            and len(eye) == 3 and len(target) == 3:
+        eye = tuple(float(x) for x in eye)
+        focal = tuple(float(x) for x in target)
+        vd = (eye[0] - focal[0], eye[1] - focal[1], eye[2] - focal[2])
+        mag = (vd[0] ** 2 + vd[1] ** 2 + vd[2] ** 2) ** 0.5
+        if mag < 1e-9:
+            return jsonify({"error": "eye and target coincide"}), 400
+        view_dir = (vd[0] / mag, vd[1] / mag, vd[2] / mag)
+    elif isinstance(view_dir, list) and len(view_dir) == 3:
+        view_dir = tuple(float(x) for x in view_dir)
+        if isinstance(focal, list) and len(focal) == 3:
+            focal = tuple(float(x) for x in focal)
+        else:
+            focal = (0.0, 0.0, 0.0)
+    else:
+        return jsonify({"error":
+            "supply either {eye, target} or {view_dir, focal}"}), 400
+
+    shape, hlr_kw = _SHAPES[file_id]
+    up_axis_key: tuple = ()
+    if up_axis and float(up_axis.get("angle") or 0) != 0:
+        try:
+            ax = tuple(float(c) for c in up_axis["axis"])
+            ang = float(up_axis["angle"])
+            shape = rotate_shape(shape, ax, ang)
+            up_axis_key = (round(ax[0], 3), round(ax[1], 3),
+                           round(ax[2], 3), round(ang, 1))
+        except Exception as exc:
+            return jsonify({"error": f"bad up_axis: {exc}"}), 400
+
+    vd_key = tuple(round(x, 3) for x in view_dir)
+    focal_key = tuple(round(x, 1) for x in focal)
+    base_key = (file_id, vd_key, focal_key, up_axis_key)
+
+    # Group mode: ONE silhouette around the compound of every selected
+    # part.  Cache key is the full sorted index tuple so different group
+    # compositions don't share results.
+    if group_mode:
+        gkey = base_key + ("group", tuple(sorted(part_indices)))
+        cached = _SIL_CACHE.get(gkey)
+        if cached is not None:
+            print(f"  /api/part_silhouettes {file_id:<10s} GROUP "
+                  f"parts={part_indices} CACHE HIT")
+            return jsonify({
+                "part_indices": part_indices,
+                "group": True,
+                "polylines": {"group": cached},
+                "stats": {"hits": 1, "misses": 0, "hlr_seconds": 0.0},
+            })
+        t0 = time.time()
+        try:
+            polys = run_group_silhouette(
+                shape, part_indices, view_dir, focal=focal,
+                mesh_defl=hlr_kw.get("mesh_defl", 0.4),
+                sample_defl=hlr_kw.get("sample_defl", 0.3),
+            )
+        except Exception as exc:
+            return jsonify({"error":
+                f"group silhouette failed: {type(exc).__name__}: {exc}"}), 500
+        t_hlr = time.time() - t0
+        if len(_SIL_CACHE) >= _SIL_CACHE_MAX:
+            _SIL_CACHE.pop(next(iter(_SIL_CACHE)))
+        _SIL_CACHE[gkey] = polys
+        print(f"  /api/part_silhouettes {file_id:<10s} GROUP "
+              f"parts={part_indices} hlr={t_hlr:.2f}s polys={len(polys)}")
+        return jsonify({
+            "part_indices": part_indices,
+            "group": True,
+            "polylines": {"group": polys},
+            "stats": {"hits": 0, "misses": 1, "hlr_seconds": round(t_hlr, 3)},
+        })
+
+    # Split into cached vs uncached so we only pay HLR for the misses.
+    out_polys: dict[int, list] = {}
+    misses: list[int] = []
+    for idx in part_indices:
+        ck = base_key + (idx,)
+        cached = _SIL_CACHE.get(ck)
+        if cached is not None:
+            out_polys[idx] = cached
+        else:
+            misses.append(idx)
+
+    t_hlr = 0.0
+    if misses:
+        t0 = time.time()
+        try:
+            fresh = run_part_silhouettes(
+                shape, misses, view_dir, focal=focal,
+                mesh_defl=hlr_kw.get("mesh_defl", 0.4),
+                sample_defl=hlr_kw.get("sample_defl", 0.3),
+            )
+        except Exception as exc:
+            return jsonify({"error":
+                f"silhouette failed: {type(exc).__name__}: {exc}"}), 500
+        t_hlr = time.time() - t0
+        for idx, polys in fresh.items():
+            ck = base_key + (idx,)
+            if len(_SIL_CACHE) >= _SIL_CACHE_MAX:
+                _SIL_CACHE.pop(next(iter(_SIL_CACHE)))
+            _SIL_CACHE[ck] = polys
+            out_polys[idx] = polys
+
+    payload = {
+        "part_indices": part_indices,
+        "polylines": {str(i): out_polys.get(i, []) for i in part_indices},
+        "stats": {
+            "hits": len(part_indices) - len(misses),
+            "misses": len(misses),
+            "hlr_seconds": round(t_hlr, 3),
+        },
+    }
+    print(f"  /api/part_silhouettes {file_id:<10s} "
+          f"parts={part_indices} hits={len(part_indices)-len(misses)} "
+          f"misses={len(misses)} hlr={t_hlr:.2f}s")
+    return jsonify(payload)
 
 
 def main() -> int:

@@ -69,7 +69,7 @@ except Exception as _e:
 SOURCES = [
     ("siderail",  "Folding siderail",
      Path(r"C:\Users\FredMarshAccora\Downloads\P194-03-00 Folding siderail ASSE.STEP"),
-     {"mesh_defl": 0.4, "sample_defl": 0.4},
+     {"mesh_defl": 0.8, "sample_defl": 1.0},
      None,
      None),
     ("presto",    "Presto bed (top assembly)",
@@ -710,15 +710,25 @@ HTML_TEMPLATE = r"""<!doctype html>
   .svg-pane svg {{ width: 100%; height: 100%; cursor: grab; }}
   .svg-pane svg.panning {{ cursor: grabbing; }}
   .svg-pane svg.annotate-mode {{ cursor: crosshair; }}
+  /* Hovering a part: switch to the pointing-hand cursor so it's obvious
+     where the click-target is.  The .layer-hit pads each part out to a
+     3 mm hit area, so the cursor flips well before you reach the thin
+     visible stroke. */
+  .svg-pane svg .part {{ cursor: pointer; }}
+  .svg-pane svg.panning .part {{ cursor: grabbing; }}
   /* layer visibility classes (toggled on <svg>) */
   svg.hide-smooth_v .layer-smooth_v {{ display: none; }}
   svg.hide-sharp_v .layer-sharp_v {{ display: none; }}
   svg.hide-outline_v .layer-outline_v {{ display: none; }}
   svg.hide-hidden_sharp .layer-hidden_sharp {{ display: none; }}
   svg.hide-hidden_outline .layer-hidden_outline {{ display: none; }}
-  /* part highlight */
-  svg .part.highlight path {{ stroke: var(--accora-teal) !important;
-                               stroke-width: 1.4 !important; }}
+  /* part highlight: NO automatic stroke change.  The silhouette layer
+     (drawn by applySilhouetteFill) is responsible for the bold outer
+     edge using the user's chosen colour/width.  Without this rule,
+     internal features (slits, screw cuts, mount lines) stay at their
+     normal stroke -- otherwise a complex part looks like "loads of
+     bits" all bolded.  We still pull non-highlighted parts back to
+     0.18 opacity so the selected part stands out. */
   svg .part.dim path {{ opacity: 0.18; }}
   /* annotations */
   .annotation-layer {{ pointer-events: all; }}
@@ -842,9 +852,9 @@ HTML_TEMPLATE = r"""<!doctype html>
       </label>
       <label style="display:flex; align-items:center; gap:6px; margin:4px 0;">
         Width
-        <input type="range" id="sty-width" min="0.1" max="3" step="0.1"
-               value="0.7" style="flex:1;">
-        <span id="sty-width-val">0.7</span>
+        <input type="range" id="sty-width" min="0.5" max="15" step="0.5"
+               value="3" style="flex:1;">
+        <span id="sty-width-val">3.0</span>
       </label>
       <label style="display:flex; align-items:center; gap:6px; margin:4px 0;">
         Opacity
@@ -860,11 +870,32 @@ HTML_TEMPLATE = r"""<!doctype html>
           <option value="1 1.5">dotted</option>
         </select>
       </label>
+      <label style="display:flex; align-items:center; gap:6px; margin:8px 0 4px 0;">
+        Fill
+        <input type="color" id="sty-fill" value="#cce6e0" style="width:30px;">
+        <label style="font-size:11px; display:flex; align-items:center; gap:3px;">
+          <input type="checkbox" id="sty-fill-on" style="margin:0;"> shade
+        </label>
+      </label>
+      <label style="display:flex; align-items:center; gap:6px; margin:4px 0;">
+        Fill α
+        <input type="range" id="sty-fill-opacity" min="0.05" max="1" step="0.05"
+               value="0.3" style="flex:1;">
+        <span id="sty-fill-opacity-val">0.30</span>
+      </label>
+      <label style="display:flex; align-items:center; gap:6px; margin:6px 0; font-size:11px;">
+        <input type="checkbox" id="sty-group-mode" checked style="margin:0;">
+        outline as group (combined profile for multi-select)
+      </label>
       <div style="display:flex; gap:4px; margin-top:6px; flex-wrap:wrap;">
         <button id="btn-apply-style" title="Apply to highlighted parts">apply</button>
         <button id="btn-reset-style" title="Clear style for highlighted parts">reset</button>
         <button id="btn-reset-all-style" title="Clear all style overrides for this source">reset all</button>
       </div>
+      <h3 style="margin: 12px 0 4px 0; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px;">
+        Applied styles
+      </h3>
+      <ol id="applied-styles-list" style="list-style: none; padding: 0; margin: 0; font-size: 11px; max-height: 220px; overflow-y: auto;"></ol>
       <div style="display:flex; gap:4px; margin-top:8px; flex-wrap:wrap;">
         <button id="btn-expand-parent" title="Add all siblings under the same Onshape Assembly to the selection">+ Onshape group</button>
         <button id="btn-cycle-deeper" title="In 3D mode, next click at the same pixel goes one layer deeper">depth-click ↻</button>
@@ -1045,18 +1076,79 @@ function clearHighlights() {{
   applyHighlights();
 }}
 
+let _lastSilHighlightSig = '';
+// Lightweight perf HUD: floats top-right, shows last-call durations
+// for the hot paths.  Add ?dbg=1 to URL to enable, or set window._DBG = true.
+const _DBG_ON = (new URLSearchParams(location.search)).get('dbg') === '1';
+let _dbgEl = null;
+function _dbgLine(label, ms, extra) {{
+  if (!_DBG_ON) return;
+  if (!_dbgEl) {{
+    _dbgEl = document.createElement('div');
+    _dbgEl.id = '_dbg_hud';
+    _dbgEl.style.cssText = 'position:fixed;top:8px;right:8px;z-index:99999;'
+      + 'background:rgba(0,0,0,.82);color:#0f0;font:11px/1.4 ui-monospace,Consolas;'
+      + 'padding:6px 9px;border-radius:6px;pointer-events:none;'
+      + 'white-space:pre;max-width:340px';
+    document.body.appendChild(_dbgEl);
+    _dbgEl._lines = {{}};
+  }}
+  _dbgEl._lines[label] = `${{label.padEnd(22)}} ${{ms.toFixed(1).padStart(7)}}ms${{extra?'  '+extra:''}}`;
+  _dbgEl.textContent = Object.values(_dbgEl._lines).join('\n');
+}}
+function _dbgTime(label, fn, extra) {{
+  if (!_DBG_ON) return fn();
+  const t0 = performance.now();
+  try {{ return fn(); }}
+  finally {{ _dbgLine(label, performance.now() - t0, extra); }}
+}}
+
 function applyHighlights() {{
+  const _t0 = _DBG_ON ? performance.now() : 0;
   const st = getState(fileSel.value, viewSel.value);
   const set = st.highlights || new Set();
   const any = set.size > 0;
   const svg = activeSvg();
+  if (_DBG_ON) {{
+    const preview = [...set].slice(0, 12).join(',');
+    _dbgLine('SELECTED', 0, set.size + ': ' + preview);
+  }}
   if (svg) {{
-    svg.querySelectorAll('.part').forEach(p => {{
-      const idx = parseInt(p.dataset.part);
-      const hit = set.has(idx);
-      p.classList.toggle('highlight', hit);
-      p.classList.toggle('dim', any && !hit);
-    }});
+    const partCount = svg.querySelectorAll('.part').length;
+    _dbgTime('toggle-classes', () => {{
+      svg.querySelectorAll('.part').forEach(p => {{
+        const idx = parseInt(p.dataset.part);
+        const hit = set.has(idx);
+        p.classList.toggle('highlight', hit);
+        p.classList.toggle('dim', any && !hit);
+      }});
+    }}, `${{partCount}} parts`);
+    // Closed-silhouette fill / bold-outline overlay.  Uses the local
+    // outline_v polylines as an immediate approximation; in parallel,
+    // fetchTrueSilhouettes() asks the server for per-part HLR (no
+    // occluders) and re-runs applyHighlights when the response arrives.
+    _dbgTime('applySilhouetteFill', () => applySilhouetteFill(
+      svg, set,
+      $('sty-fill-on').checked,
+      $('sty-fill').value,
+      parseFloat($('sty-fill-opacity').value),
+      $('sty-stroke').value,
+      parseFloat($('sty-width').value),
+    ), `${{set.size}} sel`);
+    // Kick the server fetches ONLY when the highlight set has actually
+    // changed (style-only refreshes are routed through
+    // restyleSilhouetteOnly and don't get here).  Bold edge now uses
+    // the rasterized footprint, so we fetch it on demand for the
+    // selected parts; old silhouette fetch is gated on the shade
+    // checkbox inside fetchTrueSilhouettes.
+    const sig = set.size ? [...set].sort((a,b)=>a-b).join(',') : '';
+    if (sig !== _lastSilHighlightSig) {{
+      _lastSilHighlightSig = sig;
+      if (set.size > 0) {{
+        setTimeout(fetchSelectedFootprints, 0);
+        setTimeout(fetchTrueSilhouettes, 0);
+      }}
+    }}
   }}
   partList.querySelectorAll('li').forEach(li => {{
     li.classList.toggle('highlighted', set.has(parseInt(li.dataset.part)));
@@ -1080,7 +1172,12 @@ function applyHighlights() {{
     selectionInfo.innerHTML = `<b>${{set.size}} parts</b> selected<br>` +
       `<span style="font-family: ui-monospace, Consolas, monospace; font-size: 11px;">${{preview}}</span>`;
   }}
-  window.IFU_VIEWER?.applyHighlights3D?.(set);
+  _dbgTime('applyHighlights3D', () =>
+    window.IFU_VIEWER?.applyHighlights3D?.(set), `${{set.size}} sel`);
+  if (_DBG_ON) {{
+    _dbgLine('applyHighlights TOTAL', performance.now() - _t0,
+      `${{set.size}} sel`);
+  }}
 }}
 
 // Esc clears selection
@@ -1194,17 +1291,21 @@ function attachInteractivity(pane) {{
 }}
 
 function refreshPane() {{
+  const _t0 = _DBG_ON ? performance.now() : 0;
   document.querySelectorAll('.svg-pane').forEach(p => p.classList.remove('active'));
   const pane = activePane();
   if (!pane) return;
   pane.classList.add('active');
-  attachInteractivity(pane);
-  refreshPartList();
-  applyMode();
-  // re-apply highlights (Set) onto the new pane's DOM
-  applyHighlights();
-  refreshAnnotations(pane);
-  updateCalloutCount();
+  _dbgTime('attachInteractivity', () => attachInteractivity(pane));
+  _dbgTime('refreshPartList', () => refreshPartList());
+  _dbgTime('applyMode', () => applyMode());
+  _dbgTime('injectHitHullsLayer', () => injectHitHullsLayer());
+  _dbgTime('renderPersistentSilhouettes', () => renderPersistentSilhouettes());
+  _dbgTime('applyHighlights (in refreshPane)', () => applyHighlights());
+  _dbgTime('refreshAnnotations', () => refreshAnnotations(pane));
+  _dbgTime('updateCalloutCount', () => updateCalloutCount());
+  if (_DBG_ON) _dbgLine('refreshPane TOTAL',
+    performance.now() - _t0, fileSel.value + '/' + viewSel.value);
 }}
 
 // --- Mode + layer toggles ---
@@ -1652,6 +1753,13 @@ function refreshTree() {{
 // Inject a freshly-rendered SVG (from the local server's /api/render) as a
 // "live" view for the given source.  Per-source: each source has its own
 // __live__ slot that gets overwritten on every generate.
+// camera context (eye/target/up_axis) attached when a Live render fires;
+// the silhouette endpoint reuses these so the per-part HLR projects into
+// the EXACT same (u,v) space as the baked SVG.
+const _liveCamCtx = {{}};  // file_id -> {{eye, target, up_axis}}
+function _setLiveCamCtx(file_id, ctx) {{ _liveCamCtx[file_id] = ctx; }}
+function _getLiveCamCtx(file_id) {{ return _liveCamCtx[file_id] || null; }}
+
 function injectLiveSVG(file_id, view_dir, svgText) {{
   // Strip any XML prolog and stamp an id on the <svg> so existing helpers
   // (applyTransform / attachInteractivity) can find it.
@@ -1712,6 +1820,8 @@ window.IFU_VIEWER = {{
   getActiveUpAxis: () => UP_AXIS_ROT[upAxisSel.value],
   onFileChange: (cb) => fileSel.addEventListener('change', cb),
   onViewChange: (cb) => viewSel.addEventListener('change', cb),
+  _setLiveCamCtx,
+  _getLiveCamCtx,
 }};
 
 // Tree refresh on source change
@@ -1878,6 +1988,75 @@ function loadPartStyles(fid) {{
 function persistPartStyles(fid, m) {{
   localStorage.setItem(_styleKey(fid), JSON.stringify(m));
 }}
+
+// Persistent silhouette overlay: for each applied part, draw the SAME
+// closed-loop polygon the live highlight uses (from footprint cache or
+// fallback to outline_v / sharp_v paths), at the user's chosen stroke
+// & fill.  Stays on screen across selections, layered just under the
+// transient silhouette overlay so live selection still wins on top.
+function renderPersistentSilhouettes() {{
+  document.querySelectorAll('.svg-pane').forEach(pane => {{
+    const svg = pane.querySelector('svg');
+    if (!svg) return;
+    const scaleG = svg.querySelector('g[transform="scale(1,-1)"]')
+                || svg.querySelector('.view-transform > g')
+                || svg.querySelector(':scope > g');
+    if (!scaleG) return;
+    scaleG.querySelector(':scope > g.layer-persistent-silhouette')?.remove();
+
+    const fid = pane.dataset.file;
+    const vid = pane.dataset.view;
+    const m = loadPartStyles(fid);
+    if (!Object.keys(m).length) return;
+
+    const layer = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    layer.setAttribute('class', 'layer-persistent-silhouette');
+    layer.setAttribute('pointer-events', 'none');
+
+    for (const [idxStr, style] of Object.entries(m)) {{
+      const idx = parseInt(idxStr);
+      // Polygon source: prefer cached server footprint, fall back to
+      // assembly-HLR outline_v + sharp_v paths from THIS pane's SVG.
+      let subpaths = [];
+      const fp = _getFootprint(fid, vid, idx);
+      if (fp && fp.length) {{
+        fp.forEach(pl => {{
+          if (!pl || pl.length < 2) return;
+          subpaths.push(
+            'M ' + pl.map(p => p[0].toFixed(2) + ' ' + p[1].toFixed(2))
+                    .join(' L ') + ' Z'
+          );
+        }});
+      }} else {{
+        const partCls = '.part-' + String(idx).padStart(3, '0');
+        svg.querySelectorAll(
+          '.layer-outline_v ' + partCls + ' path, '
+          + '.layer-sharp_v ' + partCls + ' path'
+        ).forEach(p => {{
+          const d = (p.getAttribute('d') || '').trim();
+          if (d) subpaths.push(d);
+        }});
+      }}
+      if (!subpaths.length) continue;
+      const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      path.setAttribute('d', subpaths.join(' '));
+      path.setAttribute('fill', style.fillOn ? (style.fillColor || '#cce6e0') : 'none');
+      path.setAttribute('fill-opacity', String(style.fillAlpha ?? 0.3));
+      path.setAttribute('fill-rule', 'evenodd');
+      path.setAttribute('stroke', style.stroke || '#00836a');
+      path.setAttribute('stroke-width', String(style.width ?? 3));
+      path.setAttribute('stroke-opacity', String(style.opacity ?? 1));
+      if (style.dash) path.setAttribute('stroke-dasharray', style.dash);
+      path.setAttribute('stroke-linejoin', 'round');
+      path.setAttribute('stroke-linecap', 'round');
+      layer.appendChild(path);
+    }}
+    // Place near the front: just before the transient silhouette layer
+    // and click-hit layers so it draws on top of the line art.
+    scaleG.appendChild(layer);
+  }});
+}}
+
 function applyStyleSheet() {{
   const fid = fileSel.value;
   const m = loadPartStyles(fid);
@@ -1885,10 +2064,12 @@ function applyStyleSheet() {{
   for (const [idx, st] of Object.entries(m)) {{
     const sel = `.svg-pane[data-file="${{fid}}"] svg .part.part-${{String(idx).padStart(3, '0')}} path`;
     const rules = [];
-    if (st.stroke)  rules.push(`stroke: ${{st.stroke}}`);
-    if (st.width != null)  rules.push(`stroke-width: ${{st.width}}`);
-    if (st.opacity != null) rules.push(`opacity: ${{st.opacity}}`);
-    if (st.dash)    rules.push(`stroke-dasharray: ${{st.dash}}`);
+    // No automatic stroke override -- the persistent silhouette layer
+    // handles colour + width.  We still let opacity override here so
+    // applied styles can also fade an individual part.
+    if (st.opacity != null && st.opacity !== 1) {{
+      rules.push(`opacity: ${{st.opacity}}`);
+    }}
     if (rules.length) {{
       css += `${{sel}} {{ ${{rules.join('; ')}} !important; }}\n`;
     }}
@@ -1902,6 +2083,9 @@ function applyStyleSheet() {{
   styleEl.textContent = css;
   // Push to 3D pane too
   window.IFU_VIEWER?.applyPartStyles3D?.(m);
+  // Re-render the persistent silhouette overlays and refresh the list
+  renderPersistentSilhouettes();
+  renderAppliedStylesList();
 }}
 
 $('sty-width').addEventListener('input', (e) => {{
@@ -1910,17 +2094,634 @@ $('sty-width').addEventListener('input', (e) => {{
 $('sty-opacity').addEventListener('input', (e) => {{
   $('sty-opacity-val').textContent = parseFloat(e.target.value).toFixed(2);
 }});
+$('sty-fill-opacity').addEventListener('input', (e) => {{
+  $('sty-fill-opacity-val').textContent = parseFloat(e.target.value).toFixed(2);
+  restyleSilhouetteOnly();
+}});
+// Style-control changes refresh ONLY the silhouette overlay -- we don't
+// re-walk all 678 part nodes on every slider input.  rAF-coalesce so
+// drag events get a single update per frame.
+let _restylePending = false;
+function restyleSilhouetteOnly() {{
+  if (_restylePending) return;
+  _restylePending = true;
+  requestAnimationFrame(() => {{
+    _restylePending = false;
+    const svg = activeSvg();
+    if (!svg) return;
+    const st = getState(fileSel.value, viewSel.value);
+    const set = st.highlights || new Set();
+    if (!set.size) return;
+    applySilhouetteFill(
+      svg, set,
+      $('sty-fill-on').checked,
+      $('sty-fill').value,
+      parseFloat($('sty-fill-opacity').value),
+      $('sty-stroke').value,
+      parseFloat($('sty-width').value),
+    );
+  }});
+}}
+['sty-stroke', 'sty-width', 'sty-fill', 'sty-fill-on'].forEach(id => {{
+  $(id).addEventListener('input', restyleSilhouetteOnly);
+  $(id).addEventListener('change', restyleSilhouetteOnly);
+}});
+
+// --- Convex hull silhouette for fill / closed-profile highlighting --------
+// IFU-style highlighting: fill the part with a tint and bold its outline,
+// including the borders shared with occluding parts (so the profile is a
+// CLOSED loop).  Approximated by the convex hull of all the part's
+// polyline points -- exact for tube/panel/bracket shapes, slightly
+// generous for concave parts.
+// Server-fetched true silhouettes (per-part HLR with NO occluders).
+// Keyed by (file_id|view_id|idx).  When present, used INSTEAD of the
+// local outline_v polylines so the bold edge is closed even where the
+// part is partially blocked by neighbours.  Populated by
+// fetchTrueSilhouettes() and refreshed whenever camera changes.
+const _trueSilCache = new Map();
+function _silCacheKey(fid, vid, idx) {{ return fid + '|' + vid + '|' + idx; }}
+function _setTrueSil(fid, vid, idx, polys) {{
+  _trueSilCache.set(_silCacheKey(fid, vid, idx), polys || []);
+}}
+function _getTrueSil(fid, vid, idx) {{
+  return _trueSilCache.get(_silCacheKey(fid, vid, idx)) || null;
+}}
+// Visible-footprint cache (server-rasterized).  Keyed by (fid, vid, idx).
+// Used for BOTH (a) the bold-edge closed loop tracing the part's actually
+// visible 2D region, and (b) the click-anywhere hit area.
+const _footprintCache = new Map();
+function _fpKey(fid, vid, idx) {{ return fid + '|' + vid + '|' + idx; }}
+function _setFootprint(fid, vid, idx, polys) {{
+  _footprintCache.set(_fpKey(fid, vid, idx), polys || []);
+}}
+function _getFootprint(fid, vid, idx) {{
+  return _footprintCache.get(_fpKey(fid, vid, idx)) || null;
+}}
+// Track which views we've already fetched the assembly raster for so we
+// don't re-request when the user clicks more parts in the same view.
+const _footprintViewFetched = new Set();
+function _fpViewKey(fid, vid) {{ return fid + '|' + vid; }}
+
+// Group-mode silhouette cache: keyed by (fid, vid, sorted-index-tuple)
+const _groupSilCache = new Map();
+function _groupKey(fid, vid, idxList) {{
+  return fid + '|' + vid + '|' + idxList.slice().sort((a,b)=>a-b).join(',');
+}}
+function _setGroupSil(fid, vid, idxList, polys) {{
+  _groupSilCache.set(_groupKey(fid, vid, idxList), polys || []);
+}}
+function _getGroupSil(fid, vid, idxList) {{
+  return _groupSilCache.get(_groupKey(fid, vid, idxList)) || null;
+}}
+
+// Inject (or refresh) a filled silhouette + bold edge for every
+// highlighted part.  Prefers the server-fetched TRUE silhouette (closed
+// loops, no occlusion holes); falls back to the local outline_v
+// polylines from the baked SVG when the server hasn't responded yet
+// (or isn't running at all).
+function applySilhouetteFill(svg, highlights, fillOn, fillColor, fillAlpha,
+                              strokeColor, strokeWidth) {{
+  // applyTransform() wraps everything in <g class="view-transform">
+  // around the original <g transform="scale(1,-1)">.  The silhouette
+  // layer has to sit *inside* the scale-flip group, otherwise its
+  // raw (u,v) coordinates draw off-screen.
+  const scaleG = svg.querySelector('g[transform="scale(1,-1)"]')
+              || svg.querySelector('.view-transform > g')
+              || svg.querySelector(':scope > g');
+  if (!scaleG) return;
+  scaleG.querySelector(':scope > g.layer-silhouette')?.remove();
+  if (!highlights || !highlights.size) return;
+
+  const layer = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+  layer.setAttribute('class', 'layer-silhouette');
+  layer.setAttribute('pointer-events', 'none');
+
+  const fid = fileSel.value, vid = viewSel.value;
+  const groupOn = $('sty-group-mode')?.checked ?? false;
+  const idxList = [...highlights];
+
+  // ---- 1) FILL polygon (only if shade is on) -----------------------
+  // The fill uses the per-part visible-footprint polygon (closed
+  // boundary tracing only what the user actually sees), so the fill
+  // never bleeds into occluder areas.  Same data already cached for
+  // the bold-edge stroke -- no extra fetch.
+  if (fillOn) {{
+    const fillSubpaths = [];
+    const pushPolylines = (polys) => {{
+      polys.forEach(pl => {{
+        if (!pl || pl.length < 2) return;
+        const d = 'M ' + pl.map(p => p[0].toFixed(2) + ' ' + p[1].toFixed(2))
+                          .join(' L ') + ' Z';
+        fillSubpaths.push(d);
+      }});
+    }};
+    for (const idx of idxList) {{
+      const fp = _getFootprint(fid, vid, idx);
+      if (fp && fp.length) pushPolylines(fp);
+    }}
+    if (fillSubpaths.length) {{
+      const fillPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      fillPath.setAttribute('d', fillSubpaths.join(' '));
+      fillPath.setAttribute('fill', fillColor);
+      fillPath.setAttribute('fill-opacity', String(fillAlpha));
+      fillPath.setAttribute('fill-rule', 'evenodd');
+      fillPath.setAttribute('stroke', 'none');
+      layer.appendChild(fillPath);
+    }}
+  }}
+
+  // ---- 2) BOLD EDGE stroke (always) -------------------------------
+  // Prefer the rasterized FOOTPRINT polygon (one closed loop per
+  // visible piece -- so a part occluded in 3 places gets 3 separate
+  // bold loops, exactly what you'd expect).  Falls back to the local
+  // HLR paths if the server hasn't responded yet.
+  const strokeSubpaths = [];
+  let useFootprint = false;
+  for (const idx of idxList) {{
+    const fp = _getFootprint(fid, vid, idx);
+    if (fp && fp.length) {{
+      useFootprint = true;
+      fp.forEach(pl => {{
+        if (!pl || pl.length < 2) return;
+        strokeSubpaths.push(
+          'M ' + pl.map(p => p[0].toFixed(2) + ' ' + p[1].toFixed(2))
+                  .join(' L ') + ' Z'
+        );
+      }});
+    }}
+  }}
+  if (!useFootprint) {{
+    // Fallback: open polylines from assembly HLR (immediate, no fetch
+    // round trip).  These are visibility-aware but never closed.
+    for (const idx of idxList) {{
+      const partCls = '.part-' + String(idx).padStart(3, '0');
+      svg.querySelectorAll(
+        '.layer-outline_v ' + partCls + ' path, '
+        + '.layer-sharp_v ' + partCls + ' path'
+      ).forEach(pathEl => {{
+        const d = (pathEl.getAttribute('d') || '').trim();
+        if (d) strokeSubpaths.push(d);
+      }});
+    }}
+  }}
+  if (strokeSubpaths.length) {{
+    const strokePath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    strokePath.setAttribute('d', strokeSubpaths.join(' '));
+    strokePath.setAttribute('fill', 'none');
+    strokePath.setAttribute('stroke', strokeColor);
+    strokePath.setAttribute('stroke-width', String(strokeWidth));
+    strokePath.setAttribute('stroke-linejoin', 'round');
+    strokePath.setAttribute('stroke-linecap', 'round');
+    layer.appendChild(strokePath);
+  }}
+
+  // Sit BEHIND visible edge layers so the rest of the edges still draw
+  // on top, but in front of the hidden layers.
+  scaleG.insertBefore(layer, scaleG.firstChild);
+}}
+
+// Pre-fetch the visible-footprint polygons for EVERY part in the current
+// view.  Server rasterizes the assembly once per view (~2-5s), then
+// every per-part lookup is cached.  We then inject a transparent
+// hit-fill layer so clicks land anywhere inside a part, not just on
+// its edges.  Closed-loop bold stroke uses the same data.
+// Fetch the visible-footprint polygon for ONLY the currently-selected
+// parts.  First request in a view pays the full assembly raster
+// cost (~5-30s depending on source) but the server caches every
+// part's footprint after that, so further calls are instant.  This
+// is what powers the bold-edge "broken into pieces" rendering.
+async function fetchSelectedFootprints() {{
+  const fid = fileSel.value, vid = viewSel.value;
+  const st = getState(fid, vid);
+  if (!st.highlights || !st.highlights.size) return;
+  if (typeof API_BASE !== 'string') return;
+  const apiBase = API_BASE;
+
+  const missing = [];
+  for (const idx of st.highlights) {{
+    if (!_getFootprint(fid, vid, idx)) missing.push(idx);
+  }}
+  if (!missing.length) return;
+
+  // Camera body (same logic as the other fetchers)
+  const fe = CATALOGUE.find(x => x.file_id === fid);
+  const ve = fe?.views.find(v => v.view_id === vid);
+  const body = {{ file_id: fid }};
+  const liveCtx = window.IFU_VIEWER._getLiveCamCtx?.(fid);
+  if (vid === '__live__' && liveCtx) {{
+    body.eye = liveCtx.eye;
+    body.target = liveCtx.target;
+    if (liveCtx.up_axis) body.up_axis = liveCtx.up_axis;
+  }} else if (ve && ve.view_dir) {{
+    body.view_dir = ve.view_dir;
+    body.focal = [0, 0, 0];
+  }} else {{
+    return;
+  }}
+  body.part_indices = missing;
+  try {{
+    const r = await fetch(apiBase + '/api/part_footprints', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify(body),
+    }});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+    if (fileSel.value !== fid || viewSel.value !== vid) return;
+    for (const [idxStr, polys] of Object.entries(data.polylines || {{}})) {{
+      _setFootprint(fid, vid, parseInt(idxStr), polys);
+    }}
+    applyHighlights();   // re-render bold edge with the new footprints
+  }} catch (e) {{
+    console.warn('[footprint] fetch failed:', e.message || e);
+  }}
+}}
+
+async function prefetchFootprintsForCurrentView() {{
+  const fid = fileSel.value, vid = viewSel.value;
+  const vkey = _fpViewKey(fid, vid);
+  if (_footprintViewFetched.has(vkey)) return;
+  if (typeof API_BASE !== 'string') return;
+  const apiBase = API_BASE;
+  // Resolve camera body (same logic as fetchTrueSilhouettes)
+  const fe = CATALOGUE.find(x => x.file_id === fid);
+  const ve = fe?.views.find(v => v.view_id === vid);
+  const body = {{ file_id: fid }};
+  const liveCtx = window.IFU_VIEWER._getLiveCamCtx?.(fid);
+  if (vid === '__live__' && liveCtx) {{
+    body.eye = liveCtx.eye;
+    body.target = liveCtx.target;
+    if (liveCtx.up_axis) body.up_axis = liveCtx.up_axis;
+  }} else if (ve && ve.view_dir) {{
+    body.view_dir = ve.view_dir;
+    body.focal = [0, 0, 0];
+  }} else {{
+    return;
+  }}
+  body.part_indices = fe.parts.map(p => p.idx);
+  _footprintViewFetched.add(vkey);   // claim BEFORE the await
+  try {{
+    const r = await fetch(apiBase + '/api/part_footprints', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify(body),
+    }});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+    if (fileSel.value !== fid || viewSel.value !== vid) return;   // stale
+    for (const [idxStr, polys] of Object.entries(data.polylines || {{}})) {{
+      _setFootprint(fid, vid, parseInt(idxStr), polys);
+    }}
+    injectHitFillLayer(fid, vid);
+    applyHighlights();   // re-render bold stroke using footprints
+  }} catch (e) {{
+    console.warn('[footprint] prefetch failed:', e.message || e);
+    _footprintViewFetched.delete(vkey);
+  }}
+}}
+
+// Hit-fill click-anywhere layer was here -- removed because the
+// rasterized footprints sometimes leak pixels into neighbour parts,
+// which made clicks land on the wrong part.  Click targeting now goes
+// through the existing 3mm-stroke hit layer (always present in the
+// baked SVG); user clicks near any visible edge to select.  The
+// FOOTPRINT data is still used for the bold-edge closed loop --
+// that's read-only display, no click logic depends on it.
+function injectHitFillLayer(_fid, _vid) {{ /* no-op (reverted) */ }}
+
+// Andrew's monotone-chain convex hull on a list of (x, y) pairs.
+function _convexHull(points) {{
+  if (points.length < 3) return points.slice();
+  const pts = points.slice().sort((a, b) =>
+    a[0] === b[0] ? a[1] - b[1] : a[0] - b[0]);
+  const cross = (o, a, b) =>
+    (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const lower = [];
+  for (const p of pts) {{
+    while (lower.length >= 2 &&
+           cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) {{
+      lower.pop();
+    }}
+    lower.push(p);
+  }}
+  const upper = [];
+  for (let i = pts.length - 1; i >= 0; i--) {{
+    const p = pts[i];
+    while (upper.length >= 2 &&
+           cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) {{
+      upper.pop();
+    }}
+    upper.push(p);
+  }}
+  upper.pop();
+  lower.pop();
+  return lower.concat(upper);
+}}
+
+// Build a per-part convex-hull hit layer so clicks land anywhere inside
+// a part, not just near its edges.  Hulls are computed from the visible
+// polyline points in the baked SVG -- so each hull only contains THIS
+// part's points, never a neighbour's.  Sorted biggest-first so small
+// parts paint last and win clicks where their hulls overlap (e.g. a
+// pivot pin sitting on top of a plate).
+function injectHitHullsLayer() {{
+  const svg = activeSvg();
+  if (!svg) return;
+  const scaleG = svg.querySelector('g[transform="scale(1,-1)"]')
+              || svg.querySelector('.view-transform > g')
+              || svg.querySelector(':scope > g');
+  if (!scaleG) return;
+  scaleG.querySelector(':scope > g.layer-hit-hull')?.remove();
+
+  // Collect points per idx from outline_v + sharp_v + smooth_v
+  const partPoints = new Map();
+  ['.layer-outline_v', '.layer-sharp_v', '.layer-smooth_v'].forEach(sel => {{
+    svg.querySelectorAll(sel + ' .part').forEach(partG => {{
+      const idx = parseInt(partG.dataset.part);
+      if (Number.isNaN(idx)) return;
+      partG.querySelectorAll('path').forEach(p => {{
+        const d = p.getAttribute('d') || '';
+        const toks = d.match(/-?\d+(?:\.\d+)?/g);
+        if (!toks) return;
+        if (!partPoints.has(idx)) partPoints.set(idx, []);
+        const arr = partPoints.get(idx);
+        for (let i = 0; i + 1 < toks.length; i += 2) {{
+          arr.push([parseFloat(toks[i]), parseFloat(toks[i + 1])]);
+        }}
+      }});
+    }});
+  }});
+
+  // Per-idx hull + area for sort
+  const hulls = [];
+  const fe = CATALOGUE.find(x => x.file_id === fileSel.value);
+  const labelOf = idx => fe?.parts.find(p => p.idx === idx)?.label || '';
+  for (const [idx, pts] of partPoints) {{
+    if (pts.length < 3) continue;
+    const hull = _convexHull(pts);
+    if (hull.length < 3) continue;
+    let s = 0;
+    for (let i = 0; i < hull.length; i++) {{
+      const j = (i + 1) % hull.length;
+      s += hull[i][0] * hull[j][1] - hull[j][0] * hull[i][1];
+    }}
+    hulls.push({{ idx, hull, area: Math.abs(s) * 0.5 }});
+  }}
+  hulls.sort((a, b) => b.area - a.area);
+
+  const layer = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+  layer.setAttribute('class', 'layer-hit-hull');
+  layer.setAttribute('fill', 'rgba(0,0,0,0)');
+  layer.setAttribute('stroke', 'none');
+  layer.setAttribute('pointer-events', 'fill');
+  for (const e of hulls) {{
+    const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    g.setAttribute('class', 'part part-' + String(e.idx).padStart(3, '0'));
+    g.setAttribute('data-part', String(e.idx));
+    g.setAttribute('data-label', labelOf(e.idx));
+    const d = 'M ' + e.hull.map(p => p[0].toFixed(1) + ' ' + p[1].toFixed(1))
+                            .join(' L ') + ' Z';
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    path.setAttribute('d', d);
+    g.appendChild(path);
+    layer.appendChild(g);
+  }}
+  // Append last so the hull layer is on top of every visible-edge layer
+  // AND the 3mm stroke hit layer.  Filled hull catches the click
+  // anywhere inside the convex hull of the part.
+  scaleG.appendChild(layer);
+}}
+
+// Request true per-part silhouettes from the server for any highlighted
+// parts we don't already have cached.  When the response arrives, the
+// cache is populated and applyHighlights() is re-run to swap the local
+// approximation for the closed-loop server polylines.
+let _silFetchToken = 0;
+async function fetchTrueSilhouettes() {{
+  const fid = fileSel.value, vid = viewSel.value;
+  const st = getState(fid, vid);
+  if (!st.highlights || !st.highlights.size) return;
+  if (typeof API_BASE !== 'string') return;             // viewer-only build (no server)
+  const apiBase = API_BASE;
+  // Only fetch closed-profile silhouettes when the fill (shade) is on --
+  // the bold edge uses the local assembly-HLR paths so occluded parts
+  // are correctly chopped without needing the server.
+  if (!$('sty-fill-on').checked) return;
+
+  // Resolve the camera body for THIS view -- preset views use the
+  // catalogue view_dir + focal=(0,0,0); the Live view reuses the eye/
+  // target cached when /api/render fired.
+  const fe = CATALOGUE.find(x => x.file_id === fid);
+  const ve = fe?.views.find(v => v.view_id === vid);
+  const body = {{ file_id: fid }};
+  const liveCtx = window.IFU_VIEWER._getLiveCamCtx?.(fid);
+  if (vid === '__live__' && liveCtx) {{
+    body.eye = liveCtx.eye;
+    body.target = liveCtx.target;
+    if (liveCtx.up_axis) body.up_axis = liveCtx.up_axis;
+  }} else if (ve && ve.view_dir) {{
+    body.view_dir = ve.view_dir;
+    body.focal = [0, 0, 0];
+  }} else {{
+    return;
+  }}
+
+  const groupOn = $('sty-group-mode')?.checked ?? false;
+  const idxList = [...st.highlights];
+
+  // GROUP REQUEST: when "outline as group" is on and 2+ parts are
+  // selected, ask the server for a single compound silhouette.  Falls
+  // back to per-part fetch below if disabled or single-select.
+  if (groupOn && idxList.length >= 2) {{
+    if (_getGroupSil(fid, vid, idxList)) {{
+      applyHighlights();   // already cached -- just re-render
+      return;
+    }}
+    const body2 = Object.assign({{}}, body);
+    body2.part_indices = idxList;
+    body2.group = true;
+    const token = ++_silFetchToken;
+    try {{
+      const r = await fetch(apiBase + '/api/part_silhouettes', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify(body2),
+      }});
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+      if (token !== _silFetchToken) return;
+      if (fileSel.value !== fid || viewSel.value !== vid) return;
+      _setGroupSil(fid, vid, idxList, data.polylines?.group || []);
+      applyHighlights();
+    }} catch (e) {{
+      console.warn('[silhouette] group fetch failed:', e.message || e);
+    }}
+    return;
+  }}
+
+  // PER-PART REQUEST (single-select or group mode disabled).
+  const missing = [];
+  for (const idx of st.highlights) {{
+    if (!_getTrueSil(fid, vid, idx)) missing.push(idx);
+  }}
+  if (!missing.length) return;
+  body.part_indices = missing;
+
+  const token = ++_silFetchToken;
+  try {{
+    const r = await fetch(apiBase + '/api/part_silhouettes', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify(body),
+    }});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+    if (token !== _silFetchToken) return;
+    if (fileSel.value !== fid || viewSel.value !== vid) return;
+    for (const [idxStr, polys] of Object.entries(data.polylines || {{}})) {{
+      _setTrueSil(fid, vid, parseInt(idxStr), polys);
+    }}
+    applyHighlights();   // re-render silhouette layer with the new data
+  }} catch (e) {{
+    console.warn('[silhouette] fetch failed:', e.message || e);
+  }}
+}}
+
+// Invalidate cache + refetch when the view (camera) changes, since the
+// (u,v) space differs per projection.
+function _invalidateSilCache() {{
+  _trueSilCache.clear();
+  _groupSilCache.clear();
+  _footprintCache.clear();
+  _footprintViewFetched.clear();
+}}
+viewSel.addEventListener('change', () => {{
+  _invalidateSilCache();
+  // Silhouette fetch only fires if shade is on (guarded inside).
+  setTimeout(fetchTrueSilhouettes, 0);
+}});
+fileSel.addEventListener('change', () => {{
+  _invalidateSilCache();
+}});
+// Group-mode toggle: re-render immediately (uses cached data if any),
+// then fetch the missing form (group vs per-part) on the side.
+$('sty-group-mode')?.addEventListener('change', () => {{
+  applyHighlights();
+  setTimeout(fetchTrueSilhouettes, 0);
+}});
+// Turning shade ON triggers the closed-silhouette fetch (the fill needs
+// a closed profile from server-side per-part HLR).
+$('sty-fill-on')?.addEventListener('change', () => {{
+  applyHighlights();
+  if ($('sty-fill-on').checked) setTimeout(fetchTrueSilhouettes, 0);
+}});
+// Render the "Applied styles" list in the sidebar.  Each row shows a
+// colour swatch + part label + width, plus inline "edit" (select that
+// part + load its style into the controls) and "delete" (remove).
+function renderAppliedStylesList() {{
+  const listEl = document.getElementById('applied-styles-list');
+  if (!listEl) return;
+  const fid = fileSel.value;
+  const m = loadPartStyles(fid);
+  const fe = CATALOGUE.find(x => x.file_id === fid);
+  const entries = Object.entries(m);
+  if (!entries.length) {{
+    listEl.innerHTML = '<li style="color: var(--muted); padding: 4px 0; font-style: italic;">none yet</li>';
+    return;
+  }}
+  entries.sort((a, b) => parseInt(a[0]) - parseInt(b[0]));
+  listEl.innerHTML = '';
+  for (const [idxStr, style] of entries) {{
+    const idx = parseInt(idxStr);
+    const part = fe?.parts.find(p => p.idx === idx);
+    const label = part ? part.label : ('part_' + idxStr);
+    const li = document.createElement('li');
+    li.style.cssText = 'display:flex; align-items:center; gap:6px; padding:3px 4px; '
+      + 'border-radius:3px; cursor:pointer;';
+    li.title = `part_${{idxStr}} - ${{label}}`;
+
+    const swatch = document.createElement('span');
+    swatch.style.cssText = 'display:inline-block; width:14px; height:10px; '
+      + `background:${{style.fillOn ? style.fillColor : '#fff'}}; `
+      + `border:2px solid ${{style.stroke || '#00836a'}};`;
+    li.appendChild(swatch);
+
+    const text = document.createElement('span');
+    text.style.cssText = 'flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;';
+    text.textContent = `[${{idxStr}}] ${{label}}`;
+    li.appendChild(text);
+
+    const wInfo = document.createElement('span');
+    wInfo.style.cssText = 'color: var(--muted); font-size:10px;';
+    wInfo.textContent = `${{(style.width ?? 3).toFixed(1)}}mm`;
+    li.appendChild(wInfo);
+
+    const editBtn = document.createElement('button');
+    editBtn.textContent = '✎';
+    editBtn.title = 'Select this part and load its style into the editor';
+    editBtn.style.cssText = 'padding:0 5px; font-size:12px; line-height:1.4;';
+    editBtn.addEventListener('click', (e) => {{
+      e.stopPropagation();
+      // Load the style into the controls so the user sees the values
+      if (style.stroke) $('sty-stroke').value = style.stroke;
+      if (style.width != null) {{
+        $('sty-width').value = String(style.width);
+        $('sty-width-val').textContent = style.width.toFixed(1);
+      }}
+      if (style.opacity != null) {{
+        $('sty-opacity').value = String(style.opacity);
+        $('sty-opacity-val').textContent = style.opacity.toFixed(2);
+      }}
+      if (style.dash != null) $('sty-dash').value = style.dash || '';
+      if (style.fillOn != null) $('sty-fill-on').checked = !!style.fillOn;
+      if (style.fillColor) $('sty-fill').value = style.fillColor;
+      if (style.fillAlpha != null) {{
+        $('sty-fill-opacity').value = String(style.fillAlpha);
+        $('sty-fill-opacity-val').textContent = style.fillAlpha.toFixed(2);
+      }}
+      // Select that part
+      togglePartHighlight(idx, {{append: false}});
+    }});
+    li.appendChild(editBtn);
+
+    const delBtn = document.createElement('button');
+    delBtn.textContent = '✕';
+    delBtn.title = 'Remove this applied style';
+    delBtn.style.cssText = 'padding:0 5px; font-size:12px; line-height:1.4; color:#c44;';
+    delBtn.addEventListener('click', (e) => {{
+      e.stopPropagation();
+      const m2 = loadPartStyles(fid);
+      delete m2[idxStr];
+      persistPartStyles(fid, m2);
+      applyStyleSheet();
+    }});
+    li.appendChild(delBtn);
+
+    // Whole-row click also selects the part (without loading style)
+    li.addEventListener('click', () => togglePartHighlight(idx, {{append: false}}));
+    li.addEventListener('mouseenter', () => li.style.background = '#eef4f2');
+    li.addEventListener('mouseleave', () => li.style.background = '');
+
+    listEl.appendChild(li);
+  }}
+}}
+
 $('btn-apply-style').addEventListener('click', () => {{
   const st = getState(fileSel.value, viewSel.value);
   if (!st.highlights || !st.highlights.size) {{
     alert('Select one or more parts first.');
     return;
   }}
+  // Capture EVERY silhouette/fill control so the persistent overlay
+  // matches the live highlight pixel-for-pixel.
   const style = {{
-    stroke:  $('sty-stroke').value,
-    width:   parseFloat($('sty-width').value),
-    opacity: parseFloat($('sty-opacity').value),
-    dash:    $('sty-dash').value || null,
+    stroke:    $('sty-stroke').value,
+    width:     parseFloat($('sty-width').value),
+    opacity:   parseFloat($('sty-opacity').value),
+    dash:      $('sty-dash').value || null,
+    fillOn:    $('sty-fill-on').checked,
+    fillColor: $('sty-fill').value,
+    fillAlpha: parseFloat($('sty-fill-opacity').value),
   }};
   const m = loadPartStyles(fileSel.value);
   for (const idx of st.highlights) m[idx] = style;
@@ -2526,10 +3327,13 @@ const btnGen = document.getElementById('btn-generate');
 
 // Server URL: same-origin when viewer is loaded via http://, else hop to
 // the standard local server.  Works whether the user opened
-// http://localhost:5000/ or a file:// build.
+// http://localhost:5000/ or a file:// build.  Promoted to window so the
+// classic-script silhouette fetcher (in the other <script> block) can
+// reach it too.
 const API_BASE = (location.protocol === 'http:' || location.protocol === 'https:')
   ? ''
   : 'http://localhost:5000';
+window.API_BASE = API_BASE;
 
 async function probeServer() {{
   try {{
@@ -2587,6 +3391,11 @@ async function generateLiveSVG() {{
     const _vdx = eye[0] - target[0], _vdy = eye[1] - target[1], _vdz = eye[2] - target[2];
     const _vdL = Math.hypot(_vdx, _vdy, _vdz) || 1;
     const view_dir = [_vdx / _vdL, _vdy / _vdL, _vdz / _vdL];
+    // Cache the camera context for the silhouette endpoint (it has to
+    // project into the same (u,v) space as the SVG we just received).
+    window.IFU_VIEWER._setLiveCamCtx?.(fid, {{
+      eye, target, up_axis: body.up_axis || null,
+    }});
     window.IFU_VIEWER.injectLiveSVG(fid, view_dir, svgText);
     // Auto-switch to Split so the new SVG appears on the left next to the 3D
     window.IFU_VIEWER.setLayout?.('split');
@@ -2616,6 +3425,12 @@ probeServer().then((alive) => {{
                    + "  python serve.py\\n"
                    + "then open http://localhost:5000";
   }}
+  // Footprint prefetch is NO LONGER fired here -- it's slow (~2 min
+  // for siderail z-buffer raster, and click-anywhere now works via
+  // the client-side convex-hull layer with no server roundtrip).
+  // The shade-fill flow triggers the prefetch lazily when the user
+  // toggles shade on, so we only pay the rasterization cost when
+  // shading is actually needed.
 }});
 </script>
 </body>

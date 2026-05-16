@@ -36,7 +36,9 @@ def parts_from_svg(svg_path: Path):
 
 def main():
     catalogue = []
-    for file_id, file_label, sp, _hlr, _rot in SOURCES:
+    for entry in SOURCES:
+        file_id, file_label, sp = entry[0], entry[1], entry[2]
+        del entry
         view_filter = SOURCE_VIEW_SUBSET.get(file_id)
         # use the first available view to scrape parts
         parts = []

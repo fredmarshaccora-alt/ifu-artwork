@@ -251,6 +251,324 @@ def split_solids(shape):
     return solids
 
 
+def compute_visible_footprints(shape, part_indices, view_dir, focal=(0, 0, 0),
+                                mesh_defl=0.4, resolution=3000):
+    """For each selected part, return the boundary polyline(s) of its
+    VISIBLE 2D footprint -- i.e. the closed polygon outlining what the
+    user actually sees of that part on screen, with occluder cuts
+    correctly drawn along the occluder's boundary.
+
+    Method:
+      1. Mesh the assembly via BRepMesh_IncrementalMesh.
+      2. Project every triangle to (u, v) and compute its mean depth.
+      3. Sort triangles back-to-front (painter's algorithm).
+      4. Rasterize each triangle into an int32 ID buffer using cv2.fillPoly
+         -- pixel value = part_idx of the front-most triangle covering it.
+      5. For each requested part_idx, threshold the buffer to a binary
+         mask and trace closed contours via cv2.findContours.
+      6. Convert pixel coords back to (u, v) and DP-simplify the result.
+
+    Returns: dict {idx: [polyline, ...]} where each polyline is a closed
+    list of (u, v) tuples in the same projection space as the baked SVG.
+    """
+    import numpy as np
+    import cv2
+    from OCP.BRepMesh import BRepMesh_IncrementalMesh
+    from OCP.BRep import BRep_Tool
+    from OCP.TopAbs import TopAbs_FACE
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopLoc import TopLoc_Location
+    from OCP.TopoDS import TopoDS
+
+    proj, x_axis, y_axis, focal_pt = build_projector(view_dir, focal)
+    fx, fy, fz = focal_pt
+    ax, ay, az = x_axis
+    bx, by, bz = y_axis
+    cx, cy, cz = view_dir   # depth axis (toward camera)
+
+    BRepMesh_IncrementalMesh(shape, mesh_defl, False, 0.5, True)
+    solids = split_solids(shape)
+    want = set(part_indices)
+    if not want:
+        return {}
+
+    # ---- 1) gather projected triangles with per-vertex depth ----------
+    # tri_data: list of (idx, u1, v1, d1, u2, v2, d2, u3, v3, d3).
+    # Per-vertex depth lets us do correct z-test via barycentric
+    # interpolation -- mean-depth painter's algorithm fails at the
+    # hinge-end where bracket / pivot / tube eye sit at similar means.
+    tri_data = []
+    for idx, _label, solid in solids:
+        face_exp = TopExp_Explorer(solid, TopAbs_FACE)
+        while face_exp.More():
+            face = TopoDS.Face_s(face_exp.Current())
+            loc = TopLoc_Location()
+            tri = BRep_Tool.Triangulation_s(face, loc)
+            face_exp.Next()
+            if tri is None:
+                continue
+            trsf = loc.Transformation()
+            nodes_2d = [None] * (tri.NbNodes() + 1)   # 1-indexed
+            for i in range(1, tri.NbNodes() + 1):
+                p = tri.Node(i).Transformed(trsf)
+                px, py, pz = p.X() - fx, p.Y() - fy, p.Z() - fz
+                u = px * ax + py * ay + pz * az
+                v = px * bx + py * by + pz * bz
+                d = px * cx + py * cy + pz * cz
+                nodes_2d[i] = (u, v, d)
+            for i in range(1, tri.NbTriangles() + 1):
+                t = tri.Triangle(i)
+                a, b, c = t.Get()
+                p1 = nodes_2d[a]; p2 = nodes_2d[b]; p3 = nodes_2d[c]
+                tri_data.append((idx,
+                                  p1[0], p1[1], p1[2],
+                                  p2[0], p2[1], p2[2],
+                                  p3[0], p3[1], p3[2]))
+    if not tri_data:
+        return {i: [] for i in part_indices}
+
+    # bbox from all triangle vertices
+    all_u = np.array([t[1] for t in tri_data] +
+                     [t[4] for t in tri_data] +
+                     [t[7] for t in tri_data])
+    all_v = np.array([t[2] for t in tri_data] +
+                     [t[5] for t in tri_data] +
+                     [t[8] for t in tri_data])
+    u_min, u_max = float(all_u.min()), float(all_u.max())
+    v_min, v_max = float(all_v.min()), float(all_v.max())
+    span = max(u_max - u_min, v_max - v_min, 1.0)
+    px_per_mm = (resolution - 2) / span
+    w_px = int((u_max - u_min) * px_per_mm) + 2
+    h_px = int((v_max - v_min) * px_per_mm) + 2
+
+    id_buf = np.zeros((h_px, w_px), dtype=np.int32)
+    # z_buf: depth of the currently-winning triangle per pixel.  Init
+    # to -inf so the FIRST triangle paints unconditionally.  Higher
+    # depth = closer to camera = wins.
+    z_buf = np.full((h_px, w_px), -np.inf, dtype=np.float64)
+
+    for (idx, u1, v1, d1, u2, v2, d2, u3, v3, d3) in tri_data:
+        # Pixel-space vertices
+        x1 = (u1 - u_min) * px_per_mm
+        y1 = (v1 - v_min) * px_per_mm
+        x2 = (u2 - u_min) * px_per_mm
+        y2 = (v2 - v_min) * px_per_mm
+        x3 = (u3 - u_min) * px_per_mm
+        y3 = (v3 - v_min) * px_per_mm
+
+        # Bounding box (clipped)
+        x_lo = max(int(np.floor(min(x1, x2, x3))), 0)
+        x_hi = min(int(np.ceil(max(x1, x2, x3))) + 1, w_px)
+        y_lo = max(int(np.floor(min(y1, y2, y3))), 0)
+        y_hi = min(int(np.ceil(max(y1, y2, y3))) + 1, h_px)
+        if x_hi <= x_lo or y_hi <= y_lo:
+            continue
+
+        # 2x signed area; degenerate triangle => skip
+        area2 = (x2 - x1) * (y3 - y1) - (x3 - x1) * (y2 - y1)
+        if area2 == 0:
+            continue
+        inv_area2 = 1.0 / area2
+
+        # Pixel grid in the bbox (integer centres at +0.5 conventionally;
+        # using pixel-corner is fine for this resolution).
+        xs = np.arange(x_lo, x_hi, dtype=np.float64) + 0.5
+        ys = np.arange(y_lo, y_hi, dtype=np.float64) + 0.5
+        XX, YY = np.meshgrid(xs, ys)  # YY: rows, XX: cols
+
+        # Barycentric weights via edge functions
+        w1 = ((x2 - XX) * (y3 - YY) - (x3 - XX) * (y2 - YY)) * inv_area2
+        w2 = ((x3 - XX) * (y1 - YY) - (x1 - XX) * (y3 - YY)) * inv_area2
+        w3 = 1.0 - w1 - w2
+
+        inside = (w1 >= 0) & (w2 >= 0) & (w3 >= 0)
+        if not inside.any():
+            continue
+
+        # Interpolated depth at each pixel
+        depths = w1 * d1 + w2 * d2 + w3 * d3
+        # Z-test: paint where inside AND closer (higher depth) than buf
+        sub_z = z_buf[y_lo:y_hi, x_lo:x_hi]
+        win = inside & (depths > sub_z)
+        if not win.any():
+            continue
+        sub_z[win] = depths[win]
+        id_buf[y_lo:y_hi, x_lo:x_hi][win] = idx + 1
+
+    # DEBUG: save the ID buffer as a coloured PNG so we can eyeball
+    # what the rasterizer is actually producing.  Each part gets a
+    # distinct deterministic colour; empty space is white.
+    import os
+    if os.environ.get("FOOTPRINT_DEBUG") == "1":
+        debug_path = Path(__file__).parent / "out" / "_footprint_debug.png"
+        h, w = id_buf.shape
+        rgb = np.full((h, w, 3), 255, dtype=np.uint8)
+        # Hash idx -> distinct RGB.  +1 offset so 0 stays white.
+        ids_present = np.unique(id_buf)
+        for raw_id in ids_present:
+            if raw_id == 0:
+                continue
+            # Simple deterministic hash for visual contrast
+            r = (raw_id * 73) % 255
+            g = (raw_id * 151) % 255
+            b = (raw_id * 211) % 255
+            mask = (id_buf == raw_id)
+            rgb[mask] = (r, g, b)
+        # OpenCV expects BGR
+        cv2.imwrite(str(debug_path), rgb[:, :, ::-1])
+        print(f"  [DEBUG] wrote {debug_path}  ({w}x{h}, "
+              f"{len(ids_present)-1} parts rasterized)", flush=True)
+
+    # ---- 3) extract closed contours per requested part ---------------
+    # Cleanup kernel: 1-pixel erode then dilate (MORPH_OPEN) removes
+    # single-pixel slivers at part boundaries that pixel-rounding
+    # leaks into neighbours, then a final 1-pixel erode shrinks the
+    # contour so adjacent parts' outlines never overlap.
+    kernel = np.ones((3, 3), np.uint8)
+    out = {}
+    for idx in part_indices:
+        mask = (id_buf == idx + 1).astype(np.uint8) * 255
+        if not mask.any():
+            out[idx] = []
+            continue
+        # MORPH_OPEN drops stray pixel islands; MORPH_ERODE shrinks the
+        # mask 1 px inward so neighbour outlines stay clear of each
+        # other.  Net effect: ~0.5-1 mm tighter at the boundary.
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        mask = cv2.erode(mask, kernel, iterations=1)
+        if not mask.any():
+            out[idx] = []
+            continue
+        # CCOMP gives external boundaries + 1 level of internal holes,
+        # so a part whose visible region has occluder shadows comes back
+        # with the outer outline PLUS a small closed loop around each
+        # hidden region.  The bold edge can then trace both, showing
+        # "the part is here -- but cut by occluder loops there".
+        contours, _hier = cv2.findContours(
+            mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        # Drop tiny pixel-island contours that survived the morph open
+        # (= big connected components that genuinely belong to this part
+        # but happen to span < 9 pixels are also dropped -- accept that
+        # trade-off, those are noise we don't want to outline).
+        MIN_AREA_PX = 9
+        polys = []
+        for cnt in contours:
+            if len(cnt) < 3:
+                continue
+            if cv2.contourArea(cnt) < MIN_AREA_PX:
+                continue
+            pl = [(float(px) / px_per_mm + u_min,
+                   float(py) / px_per_mm + v_min)
+                  for [[px, py]] in cnt]
+            pl.append(pl[0])
+            polys.append(pl)
+        # DP simplify so the boundary doesn't carry 100 pts per pixel-step
+        dp_tol = max(0.5, 1.0 / px_per_mm)
+        polys = [_dp_simplify(pl, dp_tol) for pl in polys]
+        polys = [pl for pl in polys if len(pl) >= 3]
+        out[idx] = polys
+    return out
+
+
+def run_group_silhouette(shape, part_indices, view_dir, focal=(0, 0, 0),
+                          mesh_defl=0.4, sample_defl=0.3):
+    """Single TRUE silhouette of the COMPOUND of the selected solids.
+
+    Builds a compound of the named solids, runs PolyAlgo on it in
+    isolation (no other parts), and returns the visible silhouette +
+    sharp edges that form the outer profile of the GROUP -- not the
+    individual parts.  Used for "outline as group" mode in the viewer.
+
+    Returns: list of polylines (each a list of (u,v) tuples).
+    """
+    from OCP.TopoDS import TopoDS_Compound
+    from OCP.BRep import BRep_Builder
+
+    proj, _x, _y, _f = build_projector(view_dir, focal)
+    all_solids = split_solids(shape)
+    by_idx = {idx: solid for idx, _label, solid in all_solids}
+    chosen = [by_idx[i] for i in part_indices if i in by_idx]
+    if not chosen:
+        return []
+    if len(chosen) == 1:
+        # Single-solid compound is just the solid -- reuse the per-part path
+        compound = chosen[0]
+    else:
+        compound = TopoDS_Compound()
+        builder = BRep_Builder()
+        builder.MakeCompound(compound)
+        for s in chosen:
+            builder.Add(compound, s)
+    try:
+        BRepMesh_IncrementalMesh(compound, mesh_defl, False, 0.5, True)
+        algo = HLRBRep_PolyAlgo()
+        algo.Load(compound)
+        algo.Projector(proj)
+        algo.Update()
+        extr = HLRBRep_PolyHLRToShape()
+        extr.Update(algo)
+        v_outline = filter_outliers(
+            sample_edges(extr.OutLineVCompound(), sample_defl))
+        v_sharp = sample_edges(extr.VCompound(), sample_defl)
+        dp_tol = sample_defl * 0.5
+        polys = [_dp_simplify(pl, dp_tol) for pl in (v_outline + v_sharp)]
+        return [pl for pl in polys if len(pl) >= 2]
+    except Exception as exc:
+        print(f"  group silhouette failed: {type(exc).__name__}: {exc}")
+        return []
+
+
+def run_part_silhouettes(shape, part_indices, view_dir, focal=(0, 0, 0),
+                         mesh_defl=0.4, sample_defl=0.3):
+    """Per-part TRUE silhouettes, ignoring occlusion from other parts.
+
+    Runs PolyAlgo on each requested solid IN ISOLATION, so the returned
+    outline polylines form the full closed profile the part would have
+    if no neighbouring parts existed.  This is what we need for a clean
+    bold edge + closed fill in the viewer.
+
+    Returns: dict {idx: [polyline, ...]} where each polyline is a list
+    of (u, v) tuples in the same projection space as run_hlr_per_solid,
+    so the SVG (u,v) coordinates line up exactly.
+    """
+    proj, _x, _y, _f = build_projector(view_dir, focal)
+    all_solids = split_solids(shape)
+    by_idx = {idx: solid for idx, _label, solid in all_solids}
+    out = {}
+    for idx in part_indices:
+        solid = by_idx.get(idx)
+        if solid is None:
+            out[idx] = []
+            continue
+        try:
+            BRepMesh_IncrementalMesh(solid, mesh_defl, False, 0.5, True)
+            algo = HLRBRep_PolyAlgo()
+            algo.Load(solid)
+            algo.Projector(proj)
+            algo.Update()
+            extr = HLRBRep_PolyHLRToShape()
+            extr.Update(algo)
+            # Outline-V alone misses parts viewed end-on (cylinders' long
+            # edges are sharp_v, not silhouette).  Combine BOTH visible
+            # categories so the bold profile covers tubes, plates, every
+            # thin geometry.  We filter outliers on outline only (sharp
+            # edges are real model edges and shouldn't be culled).
+            v_outline = filter_outliers(
+                sample_edges(extr.OutLineVCompound(), sample_defl))
+            v_sharp = sample_edges(extr.VCompound(), sample_defl)
+            # DP-simplify so single-part silhouettes are as light as the
+            # baked SVG polylines.
+            dp_tol = sample_defl * 0.5
+            polys = [_dp_simplify(pl, dp_tol) for pl in (v_outline + v_sharp)]
+            polys = [pl for pl in polys if len(pl) >= 2]
+        except Exception as exc:
+            print(f"  silhouette part {idx} failed: "
+                  f"{type(exc).__name__}: {exc}")
+            polys = []
+        out[idx] = polys
+    return out
+
+
 def _build_full_hlr(shape, solids, proj, mesh_defl):
     """Run a SINGLE assembly-wide HLR by adding the COMPOUND (not each solid
     individually).  After Update+Hide, extr.VCompound(sub_solid) still works
@@ -375,10 +693,17 @@ def run_hlr_per_solid(shape, view_dir, focal=(0, 0, 0),
                 print(f"    ...{idx + 1}/{len(solids)}  "
                       f"({time.time()-t1:.1f}s extract)", flush=True)
         n_total, n_kept, n_degen = _dedup_polylines_in_place(parts)
+        # Douglas-Peucker simplification at half the sample tolerance.
+        # Drops collinear runs from straight tubes / plates (most of an
+        # assembly's geometry) without visible change at typical zoom.
+        dp_tol = sample_defl * 0.5
+        pb, pa = _simplify_polylines_in_place(parts, dp_tol)
         if progress:
             print(f"  per-solid extract done {time.time()-t1:.1f}s  "
                   f"({len(parts)} parts with edges; "
-                  f"deduped {n_total}->{n_kept}, dropped {n_degen} degenerate)",
+                  f"deduped {n_total}->{n_kept}, dropped {n_degen} degenerate; "
+                  f"DP@{dp_tol:.2f}mm pts {pb}->{pa} "
+                  f"({100*(pb-pa)//max(pb,1)}%))",
                   flush=True)
         return parts
 
@@ -406,10 +731,13 @@ def run_hlr_per_solid(shape, view_dir, focal=(0, 0, 0),
     solid_bboxes_2d = _project_solid_bboxes(solids, x_axis, y_axis, focal_pt)
     parts = _tag_by_bbox(all_polys, solid_bboxes_2d)
     nT, nK, nD = _dedup_polylines_in_place(parts)
+    dp_tol = sample_defl * 0.5
+    pb, pa = _simplify_polylines_in_place(parts, dp_tol)
     if progress:
         print(f"  bbox-tagged {n_total} polylines into {len(parts)} parts "
               f"in {time.time()-t2:.1f}s (deduped {nT}->{nK}, "
-              f"dropped {nD} degenerate)", flush=True)
+              f"dropped {nD} degenerate; DP@{dp_tol:.2f}mm pts "
+              f"{pb}->{pa} ({100*(pb-pa)//max(pb,1)}%))", flush=True)
     return parts
 
 
@@ -458,6 +786,76 @@ def _dedup_polylines_in_place(parts, precision=1):
             part["polys"][cat] = kept
             n_kept += len(kept)
     return n_total, n_kept, n_degen
+
+
+def _dp_simplify(pl, tol):
+    """Douglas-Peucker polyline simplification (iterative, stack-based).
+
+    Drops collinear runs within `tol` of the chord.  Preserves endpoints,
+    keeps the polyline's shape at the chosen viewing scale.  Iterative
+    to avoid Python's 1000-deep recursion limit on long polylines.
+    """
+    n = len(pl)
+    if n < 3:
+        return list(pl)
+    keep = [False] * n
+    keep[0] = True
+    keep[-1] = True
+    stack = [(0, n - 1)]
+    tol2 = tol * tol
+    while stack:
+        i0, i1 = stack.pop()
+        if i1 - i0 < 2:
+            continue
+        ax, ay = pl[i0]
+        bx, by = pl[i1]
+        dx = bx - ax
+        dy = by - ay
+        seg_len2 = dx * dx + dy * dy
+        max_d2 = -1.0
+        max_i = -1
+        if seg_len2 <= 1e-20:
+            # zero-length chord: distance == sqrt((x-ax)^2+(y-ay)^2)
+            for i in range(i0 + 1, i1):
+                px, py = pl[i]
+                d2 = (px - ax) ** 2 + (py - ay) ** 2
+                if d2 > max_d2:
+                    max_d2 = d2
+                    max_i = i
+        else:
+            for i in range(i0 + 1, i1):
+                px, py = pl[i]
+                # perpendicular distance squared from point to chord
+                cross = (px - ax) * dy - (py - ay) * dx
+                d2 = (cross * cross) / seg_len2
+                if d2 > max_d2:
+                    max_d2 = d2
+                    max_i = i
+        if max_d2 > tol2:
+            keep[max_i] = True
+            stack.append((i0, max_i))
+            stack.append((max_i, i1))
+    return [pl[i] for i, k in enumerate(keep) if k]
+
+
+def _simplify_polylines_in_place(parts, tol):
+    """Run DP simplification on every polyline of every part.
+
+    Returns (n_total_pts_before, n_total_pts_after).
+    """
+    n_before = 0
+    n_after = 0
+    for part in parts:
+        for cat, pls in part.get("polys", {}).items():
+            kept = []
+            for pl in pls:
+                n_before += len(pl)
+                simp = _dp_simplify(pl, tol)
+                if len(simp) >= 2:
+                    n_after += len(simp)
+                    kept.append(simp)
+            part["polys"][cat] = kept
+    return n_before, n_after
 
 
 def _project_solid_bboxes(solids, x_axis, y_axis, focal_pt):
@@ -651,6 +1049,16 @@ def write_svg_parts(parts, out_path: Path,
              '<g transform="scale(1,-1)" fill="none" '
              'stroke-linecap="round" stroke-linejoin="round">']
 
+    # Merge every polyline of a (part, layer) into ONE <path> via repeated
+    # M ... L ... subpaths.  Visually identical (each "M" lifts the pen)
+    # but ~200x fewer DOM nodes, which is the real bottleneck for the
+    # 80MB+ Presto/Contesa bundle's pan/zoom and selection performance.
+    def _merge_d(polylines):
+        return " ".join(
+            "M " + " L ".join(f"{fmt % x} {fmt % y}" for x, y in pl)
+            for pl in polylines if len(pl) >= 2
+        )
+
     for cat in active_cats:
         st = styles[cat]
         dash = f' stroke-dasharray="{st["dash"]}"' if st["dash"] else ""
@@ -662,14 +1070,14 @@ def write_svg_parts(parts, out_path: Path,
             pls = p["polys"].get(cat, [])
             if not pls:
                 continue
+            d = _merge_d(pls)
+            if not d:
+                continue
             lines.append(
                 f'<g class="part part-{p["idx"]:03d}" '
                 f'data-part="{p["idx"]}" data-label="{p["label"]}">'
+                f'<path d="{d}"/></g>'
             )
-            for pl in pls:
-                d = "M " + " L ".join(f"{fmt % x} {fmt % y}" for x, y in pl)
-                lines.append(f'<path d="{d}"/>')
-            lines.append('</g>')
         lines.append('</g>')
 
     # Hit-area layer: invisible thick strokes per part for reliable clicking.
@@ -690,14 +1098,14 @@ def write_svg_parts(parts, out_path: Path,
             all_polys.extend(p["polys"].get(cat, []))
         if not all_polys:
             continue
+        d = _merge_d(all_polys)
+        if not d:
+            continue
         lines.append(
             f'<g class="part part-{p["idx"]:03d}" '
             f'data-part="{p["idx"]}" data-label="{p["label"]}">'
+            f'<path d="{d}"/></g>'
         )
-        for pl in all_polys:
-            d = "M " + " L ".join(f"{fmt % x} {fmt % y}" for x, y in pl)
-            lines.append(f'<path d="{d}"/>')
-        lines.append('</g>')
     lines.append('</g>')
 
     lines.append('</g></svg>')
