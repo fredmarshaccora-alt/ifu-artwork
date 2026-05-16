@@ -281,10 +281,20 @@ def compute_visible_footprints(shape, part_indices, view_dir, focal=(0, 0, 0),
     from OCP.TopoDS import TopoDS
 
     proj, x_axis, y_axis, focal_pt = build_projector(view_dir, focal)
-    fx, fy, fz = focal_pt
+    # CRITICAL: OCCT's HLRAlgo_Projector.Project(P) returns ROTATION-only
+    # coordinates -- u = P · x_axis, v = P · y_axis, NOT (P - focal) · axes.
+    # The "focal" set on gp_Ax2 controls the camera's view direction
+    # frame, but the projector itself does not subtract focal from
+    # projected points.  If we DO subtract focal here, our footprint
+    # polylines come out offset from HLR's SVG by exactly (focal · x_axis,
+    # focal · y_axis), and the bold outline lands in completely the wrong
+    # place when overlaid.  Project P directly -- skip the (P - focal)
+    # subtraction so footprint (u, v) matches HLR (u, v) exactly.
     ax, ay, az = x_axis
     bx, by, bz = y_axis
-    cx, cy, cz = view_dir   # depth axis (toward camera)
+    cx, cy, cz = view_dir   # depth axis (toward camera).  Offset by
+                              # focal cancels in depth ORDERING, so the
+                              # back-to-front sort is unaffected by this.
 
     BRepMesh_IncrementalMesh(shape, mesh_defl, False, 0.5, True)
     solids = split_solids(shape)
@@ -311,7 +321,10 @@ def compute_visible_footprints(shape, part_indices, view_dir, focal=(0, 0, 0),
             nodes_2d = [None] * (tri.NbNodes() + 1)   # 1-indexed
             for i in range(1, tri.NbNodes() + 1):
                 p = tri.Node(i).Transformed(trsf)
-                px, py, pz = p.X() - fx, p.Y() - fy, p.Z() - fz
+                # NB: project P directly (no focal subtraction) so we
+                # land in OCCT HLR's coordinate frame.  See comment at
+                # top of this function.
+                px, py, pz = p.X(), p.Y(), p.Z()
                 u = px * ax + py * ay + pz * az
                 v = px * bx + py * by + pz * bz
                 d = px * cx + py * cy + pz * cz
@@ -924,11 +937,17 @@ def _simplify_polylines_in_place(parts, tol):
 
 
 def _project_solid_bboxes(solids, x_axis, y_axis, focal_pt):
-    """Return list of (idx, label, u_min, v_min, u_max, v_max) per solid."""
+    """Return list of (idx, label, u_min, v_min, u_max, v_max) per solid.
+
+    NB: OCCT's HLR projector is rotation-only (u = P · axis, no focal
+    subtraction).  We project bbox corners the same way so the (u, v)
+    bbox is in the SAME frame as HLR's polylines and the
+    point-in-rectangle test in _tag_by_bbox works.  ``focal_pt`` is
+    kept in the signature for API stability but no longer used.
+    """
     from OCP.Bnd import Bnd_Box
     from OCP.BRepBndLib import BRepBndLib
     out = []
-    fx, fy, fz = focal_pt
     ax_x, ay_x, az_x = x_axis
     ax_y, ay_y, az_y = y_axis
     for idx, label, solid in solids:
@@ -944,9 +963,8 @@ def _project_solid_bboxes(solids, x_axis, y_axis, focal_pt):
         for x in (xmin, xmax):
             for y in (ymin, ymax):
                 for z in (zmin, zmax):
-                    dx = x - fx; dy = y - fy; dz = z - fz
-                    us.append(dx * ax_x + dy * ay_x + dz * az_x)
-                    vs.append(dx * ax_y + dy * ay_y + dz * az_y)
+                    us.append(x * ax_x + y * ay_x + z * az_x)
+                    vs.append(x * ax_y + y * ay_y + z * az_y)
         out.append((idx, label, min(us), min(vs), max(us), max(vs)))
     return out
 
