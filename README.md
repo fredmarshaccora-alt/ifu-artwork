@@ -119,15 +119,27 @@ instance names from the STEP product structure.
 
 ## Running
 
+### Quick start (Windows)
+
+Double-click **`Start IFU Artwork.bat`** in the repo folder.  It
+starts the server (1-3 minutes on first boot while the STEP files
+load into memory) and opens the tool in your default browser
+automatically.  Close the window when you're done.
+
+To get a desktop shortcut + Start-menu entry, right-click
+**`install-shortcut.ps1`** -> "Run with PowerShell" once.  After that
+you can launch the tool from your desktop or by typing "IFU Artwork"
+in the Start menu.
+
+### Manual / development
+
 ```bash
-# Render everything in SOURCES and build the viewer
-python build_viewer.py
+python serve.py          # starts server at http://localhost:5000
 
-# Re-build the viewer HTML without re-running HLR (fast)
-python rebuild_html.py
-
-# Single STEP smoke test (just iso)
-python t5_hlr_vector.py
+# Pipeline operations (rarely needed in normal use)
+python build_viewer.py   # full HLR rebuild of viewer.html (~5 min)
+python rebuild_html.py   # re-bundle from cached SVGs (fast)
+python t5_hlr_vector.py  # single STEP smoke test
 ```
 
 Outputs land in `out/` (gitignored).
