@@ -32,6 +32,8 @@ from . import figures as figures_store
 from . import projects as projects_store
 from . import revisions as revisions_store
 from . import settings as settings_store
+from . import sources as sources_store
+from . import onshape_fetch as onshape_fetch
 
 __all__ = [
     "HERE", "OUT",
@@ -43,5 +45,5 @@ __all__ = [
     "generate_svgs",
     "save_catalogue", "load_catalogue",
     "figures_store", "projects_store", "revisions_store",
-    "settings_store",
+    "settings_store", "sources_store", "onshape_fetch",
 ]

@@ -45,8 +45,15 @@ def project_path(proj_id: str) -> Path:
     return PROJECTS_DIR / f"{safe}.json"
 
 
-def new_project(name: str, description: str = "") -> dict:
-    return {
+def new_project(name: str, description: str = "",
+                 primary_source_id: Optional[str] = None,
+                 onshape_ids: Optional[dict] = None) -> dict:
+    """Build a fresh project dict.  ``primary_source_id`` lets the
+    project remember which source it was created against (typically
+    the result of a G.2 Onshape import) so the figure-creation modal
+    can pre-select it.  ``onshape_ids`` records the document the
+    project was imported from for provenance."""
+    proj = {
         "id": uuid.uuid4().hex[:12],
         "name": name,
         "description": description,
@@ -54,6 +61,11 @@ def new_project(name: str, description: str = "") -> dict:
         "updated_at": _now_iso(),
         "figure_ids": [],
     }
+    if primary_source_id:
+        proj["primary_source_id"] = primary_source_id
+    if onshape_ids:
+        proj["onshape_ids"] = onshape_ids
+    return proj
 
 
 def save(proj: dict) -> Path:

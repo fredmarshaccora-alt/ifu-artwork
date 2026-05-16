@@ -39,7 +39,8 @@ from t5_hlr_vector import (
     run_part_silhouettes, run_group_silhouette,
     compute_visible_footprints, run_hlr_in_region,
 )
-from ifu import figures_store, projects_store, revisions_store, settings_store
+from ifu import (figures_store, projects_store, revisions_store,
+                  settings_store, sources_store, onshape_fetch)
 from ifu.config import SOURCES
 import threading
 import functools
@@ -109,21 +110,44 @@ _FOOT_CACHE_MAX = 2000
 _FOOT_RASTER_DONE: dict[tuple, bool] = {}
 
 
+def _load_source_into_memory(*, file_id: str, step_path: Path,
+                                hlr_kw: dict,
+                                pre_rotate=None) -> bool:
+    """Import a STEP into the shape cache.  Returns True on success.
+    Used by boot() for static sources AND the Onshape-import worker
+    for dynamic sources.  Skips silently if the STEP is missing."""
+    if not step_path.exists():
+        print(f"  skip {file_id}: {step_path} missing")
+        return False
+    print(f"  {file_id:<28s} ", end="", flush=True)
+    t0 = time.time()
+    try:
+        shape = cq.importers.importStep(str(step_path)).val().wrapped
+        if pre_rotate is not None:
+            axis, angle = pre_rotate
+            shape = rotate_shape(shape, axis, angle)
+        _SHAPES[file_id] = (shape, hlr_kw or {"mesh_defl": 1.5,
+                                                 "sample_defl": 1.0})
+        print(f"loaded in {time.time()-t0:.1f}s")
+        return True
+    except Exception as exc:
+        print(f"FAILED: {exc}")
+        return False
+
+
 def boot():
     print("Loading sources into memory (one-time cost) ...")
     for entry in SOURCES:
         file_id, label, sp, hlr_kw, pre_rotate = entry[:5]
-        if not sp.exists():
-            print(f"  skip {file_id}: {sp} missing")
-            continue
-        print(f"  {file_id:<10s} ", end="", flush=True)
-        t0 = time.time()
-        shape = cq.importers.importStep(str(sp)).val().wrapped
-        if pre_rotate is not None:
-            axis, angle = pre_rotate
-            shape = rotate_shape(shape, axis, angle)
-        _SHAPES[file_id] = (shape, hlr_kw)
-        print(f"loaded in {time.time()-t0:.1f}s")
+        _load_source_into_memory(file_id=file_id, step_path=sp,
+                                  hlr_kw=hlr_kw, pre_rotate=pre_rotate)
+    # Dynamic sources persisted to out/sources/dynamic.json
+    for s in sources_store.list_dynamic():
+        pre_rot = s.get("pre_rotation")
+        _load_source_into_memory(
+            file_id=s["id"], step_path=Path(s["step_path"]),
+            hlr_kw=s.get("hlr_kwargs") or {},
+            pre_rotate=pre_rot if pre_rot else None)
     print(f"Cached {len(_SHAPES)} source(s).\n")
 
 
@@ -272,17 +296,74 @@ def settings_reset():
 
 @app.route("/api/sources", methods=["GET"])
 def sources_list():
-    """List configured sources -- read-only.  Tells the UI which sources
-    have Onshape backing (and so support refresh / revision tracking)."""
+    """List configured sources -- static (baked) and dynamic (imported
+    from Onshape).  Tells the UI which sources have Onshape backing (and
+    so support refresh / revision tracking) and which are loaded in
+    memory (i.e. /api/render will work without a server restart)."""
     out = []
-    for entry in SOURCES:
+    for s in sources_store.all_sources():
         out.append({
-            "id": entry[0],
-            "label": entry[1],
-            "step_path": str(entry[2]),
-            "onshape_ids": entry[5] if len(entry) > 5 else None,
+            "id": s["id"],
+            "label": s["label"],
+            "step_path": s["step_path"],
+            "onshape_ids": s.get("onshape_ids"),
+            "origin": s.get("origin", "static"),
+            "loaded": s["id"] in _SHAPES,
         })
     return jsonify({"sources": out})
+
+
+# ----- Onshape import (Phase G.2) ------------------------------------
+
+@app.route("/api/onshape/import", methods=["POST"])
+def onshape_import_start():
+    """Kick off an Onshape STEP import.  Body: ``{url: "<doc URL>"}``.
+    Returns ``{job_id, status, ...}`` immediately; the actual work
+    runs on a daemon thread.  Poll /api/onshape/import/<job_id>."""
+    body = request.get_json(silent=True) or {}
+    url = (body.get("url") or "").strip()
+    if not url:
+        return jsonify({"error": "url required"}), 400
+    try:
+        # Eager URL-parse so we can reject obviously bad input
+        # before spawning a thread
+        onshape_fetch.parse_onshape_url(url)
+    except onshape_fetch.OnshapeURLError as exc:
+        return jsonify({"error": str(exc)}), 400
+    job = onshape_fetch.start_import(url)
+    return jsonify(job), 202
+
+
+@app.route("/api/onshape/import/<job_id>", methods=["GET"])
+def onshape_import_status(job_id):
+    """Poll an in-flight import.  Returns the job dict, or 404 if no
+    such job is being tracked (server restart -> jobs are wiped)."""
+    job = onshape_fetch.get_job(job_id)
+    if job is None:
+        return jsonify({"error": "job not found"}), 404
+    # Once a job reports "ready" but the source isn't in _SHAPES yet,
+    # load it now -- this is the moment between download completing
+    # and the next render call.  Done synchronously so the UI sees a
+    # consistent 'loaded' flag.
+    if job.get("status") == "ready":
+        sid = job.get("source_id")
+        if sid and sid not in _SHAPES:
+            existing = sources_store.find(sid)
+            if existing is None:
+                # First time -- register the dynamic source
+                sources_store.register(
+                    source_id=sid,
+                    label=job.get("document_name") or sid,
+                    step_path=job["step_path"],
+                    onshape_ids=job.get("onshape_ids"),
+                    imported_from=job.get("url"))
+                existing = sources_store.find(sid)
+            # Load into the in-memory cache so /api/render works
+            _load_source_into_memory(
+                file_id=sid, step_path=Path(job["step_path"]),
+                hlr_kw=(existing or {}).get("hlr_kwargs") or {},
+                pre_rotate=None)
+    return jsonify(job)
 
 
 @app.route("/api/sources/<source_id>/versions", methods=["GET"])
@@ -395,7 +476,12 @@ def projects_create():
     body = request.get_json(silent=True) or {}
     name = body.get("name") or "Untitled project"
     description = body.get("description") or ""
-    proj = projects_store.new_project(name=name, description=description)
+    primary_source_id = body.get("primary_source_id")
+    onshape_ids = body.get("onshape_ids")
+    proj = projects_store.new_project(
+        name=name, description=description,
+        primary_source_id=primary_source_id,
+        onshape_ids=onshape_ids)
     projects_store.save(proj)
     return jsonify(proj), 201
 

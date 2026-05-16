@@ -1218,11 +1218,16 @@ async function HomeScreen(container) {{
 
 registerRoute(/^#\/$/, HomeScreen);
 
-// New-project wizard.  G.2 upgrades this with Onshape URL ingestion;
-// for now it collects a name + optional description and creates an
-// empty project.
+// New-project wizard.  G.2: collects a name + optional Onshape URL.
+// If a URL is supplied, the modal flips to a "translating" progress
+// state, polls /api/onshape/import/<id>, and only creates the project
+// once the STEP is downloaded.  If the URL is blank, we create an
+// empty project right away.
 function _openNewProjectModal() {{
-  let nameInput, descInput;
+  let nameInput, descInput, urlInput, errorBox;
+  let progressWrap, progressBar, progressLabel, progressDetail;
+  let cancelBtn, createBtn;
+
   const body = h('div', [
     h('div.field-row', [
       h('label', 'Project name'),
@@ -1238,39 +1243,165 @@ function _openNewProjectModal() {{
         style: {{ width: '100%' }},
       }})),
     ]),
-    h('div', {{ style: {{ marginTop: '16px', fontSize: '12px',
+    h('div.field-row', [
+      h('label', 'Onshape document URL (optional)'),
+      (urlInput = h('input.input', {{
+        placeholder: 'https://cad.onshape.com/documents/...',
+        style: {{ width: '100%', fontFamily: 'var(--font-mono)',
+                    fontSize: '12px' }},
+        autocomplete: 'off',
+        spellcheck: false,
+      }})),
+    ]),
+    (errorBox = h('div', {{ style: {{ display: 'none',
+                                          padding: '8px 12px',
+                                          marginTop: '4px',
+                                          background: '#fef2f2',
+                                          border: '1px solid #fecaca',
+                                          color: '#991b1b',
+                                          borderRadius: 'var(--radius-1)',
+                                          fontSize: '12px' }} }})),
+
+    // Progress block, shown only during import
+    (progressWrap = h('div', {{ style: {{ display: 'none',
+                                              marginTop: '16px',
+                                              padding: '16px',
+                                              background: 'var(--c-accora-pale)',
+                                              borderRadius: 'var(--radius-1)' }} }}, [
+      (progressLabel = h('div', {{ style: {{ fontWeight: 600,
+                                                  marginBottom: '6px',
+                                                  color: 'var(--c-accora-dark)' }} }},
+                          'Connecting to Onshape...')),
+      (progressDetail = h('div', {{ style: {{ fontSize: '12px',
+                                                   color: 'var(--c-text-muted)',
+                                                   marginBottom: '10px' }} }}, '')),
+      h('div', {{ style: {{ height: '6px',
+                              background: 'var(--c-surface-1)',
+                              borderRadius: '3px',
+                              overflow: 'hidden' }} }}, [
+        (progressBar = h('div', {{ style: {{ height: '100%',
+                                                  width: '0%',
+                                                  background: 'var(--c-accora)',
+                                                  transition: 'width 0.3s ease' }} }})),
+      ]),
+    ])),
+
+    h('div', {{ style: {{ marginTop: '12px', fontSize: '12px',
                             color: 'var(--c-text-muted)' }} }},
-      'After creation you can attach figures from any configured source. ' +
-      'Onshape document import is coming in the next iteration.'),
+      "Paste an Onshape document URL to import its assembly as the " +
+      "project's primary source.  Leave blank to start with the bundled " +
+      "demo sources only."),
   ]);
+
+  function showError(msg) {{
+    errorBox.textContent = msg;
+    errorBox.style.display = 'block';
+  }}
+  function hideError() {{
+    errorBox.style.display = 'none';
+  }}
+  function setProgress(pct, label, detail) {{
+    progressWrap.style.display = 'block';
+    progressBar.style.width = Math.max(0, Math.min(100, pct)) + '%';
+    if (label != null) progressLabel.textContent = label;
+    if (detail != null) progressDetail.textContent = detail;
+  }}
+
+  async function pollImport(jobId) {{
+    while (true) {{
+      await new Promise(res => setTimeout(res, 1500));
+      const r = await fetch(API_BASE + '/api/onshape/import/'
+                              + encodeURIComponent(jobId));
+      if (!r.ok) throw new Error('poll failed: HTTP ' + r.status);
+      const job = await r.json();
+      setProgress(job.progress || 0,
+                    _labelForImportStatus(job),
+                    job.message || '');
+      if (job.status === 'ready') return job;
+      if (job.status === 'error') {{
+        throw new Error(job.error || job.message || 'import failed');
+      }}
+    }}
+  }}
+
   const modal = openModal({{
     title: 'New project',
     body,
     footer: [
-      {{ label: 'Cancel', onClick: (close) => close() }},
-      {{ label: 'Create', primary: true, onClick: async (close) => {{
+      (cancelBtn = {{ label: 'Cancel', onClick: (close) => close() }}),
+      (createBtn = {{ label: 'Create', primary: true,
+                       onClick: async (close) => {{
         const name = (nameInput.value || '').trim();
         if (!name) {{ nameInput.focus(); return; }}
         const description = (descInput.value || '').trim();
+        const url = (urlInput.value || '').trim();
+        hideError();
+
+        // Disable inputs once we start
+        nameInput.disabled = true;
+        descInput.disabled = true;
+        urlInput.disabled = true;
+
+        let importedSourceId = null;
+        let onshape_ids = null;
+
         try {{
-          const r = await fetch(API_BASE + '/api/projects', {{
+          if (url) {{
+            // Start the import job
+            setProgress(2, 'Starting import...', url);
+            const r0 = await fetch(API_BASE + '/api/onshape/import', {{
+              method: 'POST',
+              headers: {{ 'Content-Type': 'application/json' }},
+              body: JSON.stringify({{ url }}),
+            }});
+            if (!r0.ok) {{
+              const j = await r0.json().catch(() => ({{}}));
+              throw new Error(j.error || ('HTTP ' + r0.status));
+            }}
+            const job0 = await r0.json();
+            const ready = await pollImport(job0.id);
+            importedSourceId = ready.source_id || null;
+            onshape_ids = ready.onshape_ids || null;
+            setProgress(100, 'Import complete', importedSourceId);
+          }}
+
+          // Create the project record
+          const pr = await fetch(API_BASE + '/api/projects', {{
             method: 'POST',
             headers: {{ 'Content-Type': 'application/json' }},
-            body: JSON.stringify({{ name, description }}),
+            body: JSON.stringify({{ name, description,
+                                      primary_source_id: importedSourceId,
+                                      onshape_ids }}),
           }});
-          if (!r.ok) throw new Error('HTTP ' + r.status);
-          const p = await r.json();
+          if (!pr.ok) throw new Error('project create failed: HTTP ' + pr.status);
+          const p = await pr.json();
           close();
-          toast('Project created', 'success');
+          toast(url ? 'Project created from Onshape document'
+                     : 'Project created', 'success');
           location.hash = '#/project/' + encodeURIComponent(p.id);
         }} catch (e) {{
-          toast('Create failed: ' + (e.message || 'unknown'), 'error');
+          showError(e.message || String(e));
+          nameInput.disabled = false;
+          descInput.disabled = false;
+          urlInput.disabled = false;
         }}
-      }} }},
+      }} }}),
     ],
   }});
   setTimeout(() => nameInput.focus(), 50);
   return modal;
+}}
+
+function _labelForImportStatus(job) {{
+  switch (job.status) {{
+    case 'queued':      return 'Queued';
+    case 'resolving':   return 'Reading document metadata...';
+    case 'translating': return 'Onshape is converting your assembly to STEP...';
+    case 'downloading': return 'Downloading STEP geometry...';
+    case 'ready':       return 'Done';
+    case 'error':       return 'Import failed';
+    default:            return job.status || '...';
+  }}
 }}
 // ===== end F.3 Home screen =====
 
