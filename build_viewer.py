@@ -1351,22 +1351,66 @@ async function HomeScreen(container) {{
 
 registerRoute(/^#\/$/, HomeScreen);
 
-// New-project wizard.  G.2: collects a name + optional Onshape URL.
-// If a URL is supplied, the modal flips to a "translating" progress
-// state, polls /api/onshape/import/<id>, and only creates the project
-// once the STEP is downloaded.  If the URL is blank, we create an
-// empty project right away.
+// New-project wizard.  A project is a CAD model + the figures
+// authored against it -- the model has to be chosen BEFORE any
+// figures exist, so the modal won't create the project until the
+// user has either imported an Onshape document OR picked one of
+// the existing sources.
 function _openNewProjectModal() {{
   let nameInput, descInput, urlInput, errorBox;
   let progressWrap, progressBar, progressLabel, progressDetail;
-  let probeHint;
-  let cancelBtn, createBtn;
+  let probeHint, sourceSelect;
+  let modeTabImport, modeTabExisting;
+  let importPane, existingPane;
   // True after the user has typed in the name field at all, so we
-  // don't clobber their text with the auto-probed document name.
+  // don't clobber their text with the auto-probed document name OR
+  // existing-source choice.
   let nameTouched = false;
   let probeTimer = null;
   let lastProbedUrl = null;
+  let mode = 'import';   // 'import' | 'existing'
+  // List of source dicts returned by /api/sources
+  let availableSources = [];
 
+  // The "Model" section is a tabbed control: either bring in a new
+  // Onshape document or pick one that has already been imported /
+  // is part of the bundled demo set.
+  modeTabImport   = h('button.tab', 'Import from Onshape');
+  modeTabExisting = h('button.tab', 'Use an existing model');
+
+  // ---- Import pane ----------------------------------------------------
+  importPane = h('div', [
+    h('div.field-row', [
+      h('label', 'Onshape document URL'),
+      (urlInput = h('input.input', {{
+        placeholder: 'https://cad.onshape.com/documents/...',
+        style: {{ width: '100%', fontFamily: 'var(--font-mono)',
+                    fontSize: '12px' }},
+        autocomplete: 'off',
+        spellcheck: false,
+      }})),
+      (probeHint = h('div', {{ style: {{ fontSize: '11px',
+                                              color: 'var(--c-text-muted)',
+                                              marginTop: '4px',
+                                              minHeight: '14px' }} }}, '')),
+    ]),
+  ]);
+
+  // ---- Existing pane --------------------------------------------------
+  existingPane = h('div', {{ style: {{ display: 'none' }} }}, [
+    h('div.field-row', [
+      h('label', 'Model'),
+      (sourceSelect = h('select.select', {{
+        style: {{ width: '100%' }},
+      }})),
+      h('div', {{ style: {{ fontSize: '11px',
+                              color: 'var(--c-text-muted)',
+                              marginTop: '4px' }} }},
+        'Demo assemblies and previously imported Onshape documents.'),
+    ]),
+  ]);
+
+  // ---- Modal body -----------------------------------------------------
   const body = h('div', [
     h('div.field-row', [
       h('label', 'Project name'),
@@ -1382,20 +1426,18 @@ function _openNewProjectModal() {{
         style: {{ width: '100%' }},
       }})),
     ]),
-    h('div.field-row', [
-      h('label', 'Onshape document URL (optional)'),
-      (urlInput = h('input.input', {{
-        placeholder: 'https://cad.onshape.com/documents/...',
-        style: {{ width: '100%', fontFamily: 'var(--font-mono)',
-                    fontSize: '12px' }},
-        autocomplete: 'off',
-        spellcheck: false,
-      }})),
-      (probeHint = h('div', {{ style: {{ fontSize: '11px',
-                                              color: 'var(--c-text-muted)',
-                                              marginTop: '4px',
-                                              minHeight: '14px' }} }}, '')),
-    ]),
+    h('div', {{ style: {{ marginTop: '8px',
+                            fontSize: 'var(--t-meta)',
+                            fontWeight: 600,
+                            color: 'var(--c-text)' }} }},
+      'Model'),
+    h('div', {{ style: {{ display: 'flex',
+                            gap: '4px',
+                            borderBottom: '1px solid var(--c-line)',
+                            marginBottom: '12px' }} }},
+        [modeTabImport, modeTabExisting]),
+    importPane,
+    existingPane,
     (errorBox = h('div', {{ style: {{ display: 'none',
                                           padding: '8px 12px',
                                           marginTop: '4px',
@@ -1428,13 +1470,76 @@ function _openNewProjectModal() {{
                                                   transition: 'width 0.3s ease' }} }})),
       ]),
     ])),
-
-    h('div', {{ style: {{ marginTop: '12px', fontSize: '12px',
-                            color: 'var(--c-text-muted)' }} }},
-      "Paste an Onshape document URL to import its assembly as the " +
-      "project's primary source.  Leave blank to start with the bundled " +
-      "demo sources only."),
   ]);
+
+  // ---- Tab styling + switching ----------------------------------------
+  function _styleTab(btn, active) {{
+    btn.style.background = 'transparent';
+    btn.style.border = 'none';
+    btn.style.borderBottom = active
+      ? '2px solid var(--c-accora)'
+      : '2px solid transparent';
+    btn.style.color = active ? 'var(--c-accora-dark)' : 'var(--c-text-muted)';
+    btn.style.fontWeight = active ? '600' : '400';
+    btn.style.fontSize = 'var(--t-body)';
+    btn.style.padding = '8px 12px';
+    btn.style.cursor = 'pointer';
+    btn.style.marginBottom = '-1px';
+  }}
+  function _setMode(next) {{
+    mode = next;
+    _styleTab(modeTabImport,   mode === 'import');
+    _styleTab(modeTabExisting, mode === 'existing');
+    importPane.style.display   = mode === 'import'   ? 'block' : 'none';
+    existingPane.style.display = mode === 'existing' ? 'block' : 'none';
+    // Update auto-name from the freshly active pane
+    if (!nameTouched) {{
+      if (mode === 'existing' && sourceSelect.value) {{
+        const src = availableSources.find(s => s.id === sourceSelect.value);
+        if (src) nameInput.value = src.label || src.id;
+      }} else if (mode === 'import' && lastProbedUrl) {{
+        // Leave whatever the probe set
+      }}
+    }}
+  }}
+  modeTabImport.addEventListener('click', (e) => {{
+    e.preventDefault(); _setMode('import');
+  }});
+  modeTabExisting.addEventListener('click', (e) => {{
+    e.preventDefault(); _setMode('existing');
+  }});
+  _setMode('import');
+
+  // ---- Load existing-source list (async) ------------------------------
+  fetch(API_BASE + '/api/sources').then(r => r.json()).then(data => {{
+    availableSources = data.sources || [];
+    sourceSelect.innerHTML = '';
+    if (!availableSources.length) {{
+      const opt = document.createElement('option');
+      opt.disabled = true; opt.textContent = '(no models available)';
+      sourceSelect.appendChild(opt);
+      return;
+    }}
+    for (const s of availableSources) {{
+      const opt = document.createElement('option');
+      opt.value = s.id;
+      const tag = s.origin === 'dynamic' ? ' (Onshape)' : ' (demo)';
+      opt.textContent = s.label + tag;
+      sourceSelect.appendChild(opt);
+    }}
+    // If user is on the Existing tab and hasn't typed a name yet,
+    // seed it from the default-selected source.
+    if (mode === 'existing' && !nameTouched && availableSources[0]) {{
+      nameInput.value = availableSources[0].label || availableSources[0].id;
+    }}
+  }}).catch(() => {{}});
+
+  sourceSelect.addEventListener('change', () => {{
+    if (mode === 'existing' && !nameTouched) {{
+      const src = availableSources.find(s => s.id === sourceSelect.value);
+      if (src) nameInput.value = src.label || src.id;
+    }}
+  }});
 
   function showError(msg) {{
     errorBox.textContent = msg;
@@ -1531,20 +1636,28 @@ function _openNewProjectModal() {{
         const name = (nameInput.value || '').trim();
         if (!name) {{ nameInput.focus(); return; }}
         const description = (descInput.value || '').trim();
-        const url = (urlInput.value || '').trim();
         hideError();
 
-        // Disable inputs once we start
-        nameInput.disabled = true;
-        descInput.disabled = true;
-        urlInput.disabled = true;
-
-        let importedSourceId = null;
+        // Enforce: the user must have chosen a model
+        let primary_source_id = null;
         let onshape_ids = null;
+        let importedJob = null;
 
-        try {{
-          if (url) {{
-            // Start the import job
+        if (mode === 'import') {{
+          const url = (urlInput.value || '').trim();
+          if (!url) {{
+            showError('Paste an Onshape document URL, or switch to '
+                        + '"Use an existing model".');
+            urlInput.focus();
+            return;
+          }}
+          // Disable inputs once we start
+          nameInput.disabled = true;
+          descInput.disabled = true;
+          urlInput.disabled = true;
+          modeTabImport.disabled = true;
+          modeTabExisting.disabled = true;
+          try {{
             setProgress(2, 'Starting import...', url);
             const r0 = await fetch(API_BASE + '/api/onshape/import', {{
               method: 'POST',
@@ -1556,31 +1669,52 @@ function _openNewProjectModal() {{
               throw new Error(j.error || ('HTTP ' + r0.status));
             }}
             const job0 = await r0.json();
-            const ready = await pollImport(job0.id);
-            importedSourceId = ready.source_id || null;
-            onshape_ids = ready.onshape_ids || null;
-            setProgress(100, 'Import complete', importedSourceId);
+            importedJob = await pollImport(job0.id);
+            primary_source_id = importedJob.source_id || null;
+            onshape_ids = importedJob.onshape_ids || null;
+            setProgress(100, 'Import complete', primary_source_id);
+          }} catch (e) {{
+            showError(e.message || String(e));
+            nameInput.disabled = false;
+            descInput.disabled = false;
+            urlInput.disabled = false;
+            modeTabImport.disabled = false;
+            modeTabExisting.disabled = false;
+            return;
           }}
+        }} else {{
+          // mode === 'existing'
+          primary_source_id = sourceSelect.value || null;
+          if (!primary_source_id) {{
+            showError('Pick a model from the list.');
+            return;
+          }}
+          const src = availableSources.find(s => s.id === primary_source_id);
+          if (src && src.onshape_ids) onshape_ids = src.onshape_ids;
+        }}
 
-          // Create the project record
+        // Create the project record (model is now committed)
+        try {{
           const pr = await fetch(API_BASE + '/api/projects', {{
             method: 'POST',
             headers: {{ 'Content-Type': 'application/json' }},
             body: JSON.stringify({{ name, description,
-                                      primary_source_id: importedSourceId,
-                                      onshape_ids }}),
+                                      primary_source_id, onshape_ids }}),
           }});
           if (!pr.ok) throw new Error('project create failed: HTTP ' + pr.status);
           const p = await pr.json();
           close();
-          toast(url ? 'Project created from Onshape document'
-                     : 'Project created', 'success');
+          toast(importedJob
+                  ? 'Project created from Onshape document'
+                  : 'Project created', 'success');
           location.hash = '#/project/' + encodeURIComponent(p.id);
         }} catch (e) {{
           showError(e.message || String(e));
           nameInput.disabled = false;
           descInput.disabled = false;
-          urlInput.disabled = false;
+          if (urlInput) urlInput.disabled = false;
+          modeTabImport.disabled = false;
+          modeTabExisting.disabled = false;
         }}
       }} }}),
     ],
@@ -1661,8 +1795,23 @@ async function ProjectScreen(container, params) {{
                         proj.description));
   }}
 
-  // Source status bar
-  const usedSourceIds = [...new Set(figs.map(f => f.source_id).filter(Boolean))];
+  // Source status bar.  Prefer the project's primary source -- that
+  // is the model the project IS.  Fall back to the union of figure
+  // sources for legacy projects that don't have a primary set.
+  let usedSourceIds;
+  if (proj.primary_source_id) {{
+    usedSourceIds = [proj.primary_source_id];
+    // Include any orphan sources used by older figures so the user
+    // still sees them in the bar (rare).
+    for (const f of figs) {{
+      if (f.source_id && f.source_id !== proj.primary_source_id
+          && !usedSourceIds.includes(f.source_id)) {{
+        usedSourceIds.push(f.source_id);
+      }}
+    }}
+  }} else {{
+    usedSourceIds = [...new Set(figs.map(f => f.source_id).filter(Boolean))];
+  }}
   if (usedSourceIds.length) {{
     const bar = h('div', {{ style: {{
         background: 'var(--c-surface)', border: '1px solid var(--c-line)',
@@ -1704,7 +1853,7 @@ async function ProjectScreen(container, params) {{
   main.appendChild(h('div.section-title', `Figures (${{figs.length}})`));
   const grid = h('div.card-grid');
   const newCard = h('div.card.placeholder', '+ new figure');
-  newCard.addEventListener('click', () => _openNewFigureModal(projId, sources));
+  newCard.addEventListener('click', () => _openNewFigureModal(projId, sources, proj));
   grid.appendChild(newCard);
 
   for (const fig of figs) {{
@@ -1735,11 +1884,20 @@ async function ProjectScreen(container, params) {{
   main.appendChild(grid);
 }}
 
-function _openNewFigureModal(projId, sources) {{
+function _openNewFigureModal(projId, sources, proj) {{
   let nameInput, sourceSelect, viewSelect, captureCurrent;
   let configWrap, configStatus;
   // configInputs keys off parameter id; values are <select> or <input>
   const configInputs = {{}};
+
+  // The project owns its model -- figures inherit it.  Only legacy
+  // projects (created before this constraint) fall back to letting
+  // the user pick.
+  const projSourceId = proj && proj.primary_source_id;
+  const projSource = projSourceId
+    ? (sources || []).find(s => s.id === projSourceId) || null
+    : null;
+  const legacyMode = !projSourceId;
 
   // Detect current 3D camera if the editor was open before.  Falls
   // back to null -- the figure will use its source's iso preset.
@@ -1750,16 +1908,33 @@ function _openNewFigureModal(projId, sources) {{
     }} catch (_e) {{ return null; }}
   }})();
 
+  // Source-area renders differently depending on whether the project
+  // already has a model bound.
+  const sourceArea = legacyMode
+    ? h('div.field-row', [
+        h('label', 'Source'),
+        (sourceSelect = h('select.select', {{ style: {{ width: '100%' }} }})),
+      ])
+    : h('div', {{ style: {{ padding: '10px 12px',
+                              background: 'var(--c-surface-1)',
+                              borderRadius: 'var(--radius-1)',
+                              fontSize: 'var(--t-body)',
+                              display: 'flex', alignItems: 'center',
+                              gap: '8px' }} }}, [
+        h('span', {{ style: {{ color: 'var(--c-text-muted)' }} }}, 'Model:'),
+        h('strong', projSource ? projSource.label : projSourceId),
+        h('span.badge.ok',
+          (projSource && projSource.origin === 'dynamic')
+            ? 'Onshape' : 'demo'),
+      ]);
+
   const body = h('div', [
     h('div.field-row', [
       h('label', 'Figure name'),
       (nameInput = h('input.input', {{ placeholder: 'e.g. Side rail close-up',
                                          style: {{ width: '100%' }} }})),
     ]),
-    h('div.field-row', [
-      h('label', 'Source'),
-      (sourceSelect = h('select.select', {{ style: {{ width: '100%' }} }})),
-    ]),
+    sourceArea,
     h('div.field-row', [
       h('label', 'Starting view'),
       (viewSelect = h('select.select', {{ style: {{ width: '100%' }} }})),
@@ -1789,15 +1964,17 @@ function _openNewFigureModal(projId, sources) {{
                             color: 'var(--c-text-muted)' }} }},
       'You can re-pose the camera in the editor at any time.'),
   ]);
-  // Populate source dropdown
-  for (const s of (sources || [])) {{
-    const opt = document.createElement('option');
-    opt.value = s.id;
-    let suffix = '';
-    if (s.origin === 'dynamic') suffix = '  (Onshape import)';
-    else if (!s.onshape_ids) suffix = '  (local)';
-    opt.textContent = `${{s.label}}${{suffix}}`;
-    sourceSelect.appendChild(opt);
+  // Populate source dropdown only in legacy mode
+  if (legacyMode && sourceSelect) {{
+    for (const s of (sources || [])) {{
+      const opt = document.createElement('option');
+      opt.value = s.id;
+      let suffix = '';
+      if (s.origin === 'dynamic') suffix = '  (Onshape import)';
+      else if (!s.onshape_ids) suffix = '  (local)';
+      opt.textContent = `${{s.label}}${{suffix}}`;
+      sourceSelect.appendChild(opt);
+    }}
   }}
   // Starting-view presets -- this is just a default if no camera capture
   ['iso', 'front', 'side'].forEach(vid => {{
@@ -1806,7 +1983,14 @@ function _openNewFigureModal(projId, sources) {{
     viewSelect.appendChild(opt);
   }});
 
-  // Fetch configuration parameters for the selected source.  Only
+  // Resolve the active source id at any moment -- driven by the
+  // dropdown in legacy mode, or by the project binding otherwise.
+  function _activeSourceId() {{
+    if (legacyMode && sourceSelect) return sourceSelect.value;
+    return projSourceId;
+  }}
+
+  // Fetch configuration parameters for the active source.  Only
   // sources with onshape_ids will return any -- everything else gets
   // ``has_config: false`` and we hide the block.
   async function refreshConfigForSource() {{
@@ -1815,7 +1999,7 @@ function _openNewFigureModal(projId, sources) {{
     while (configWrap.children.length > 2) {{
       configWrap.removeChild(configWrap.lastChild);
     }}
-    const sid = sourceSelect.value;
+    const sid = _activeSourceId();
     const src = (sources || []).find(s => s.id === sid);
     if (!src || !src.onshape_ids) {{
       configWrap.style.display = 'none';
@@ -1875,8 +2059,10 @@ function _openNewFigureModal(projId, sources) {{
       configStatus.textContent = 'error: ' + (e.message || e);
     }}
   }}
-  sourceSelect.addEventListener('change', refreshConfigForSource);
-  // Kick off for whichever source is selected by default
+  if (legacyMode && sourceSelect) {{
+    sourceSelect.addEventListener('change', refreshConfigForSource);
+  }}
+  // Kick off for whichever source is active by default
   setTimeout(refreshConfigForSource, 0);
 
   openModal({{
@@ -1887,7 +2073,7 @@ function _openNewFigureModal(projId, sources) {{
       {{ label: 'Create + open editor', primary: true, onClick: async (close) => {{
         const name = (nameInput.value || '').trim();
         if (!name) {{ nameInput.focus(); return; }}
-        const sourceId = sourceSelect.value;
+        const sourceId = _activeSourceId();
         if (!sourceId) return;
         const useCurrent = currentCam && captureCurrent && captureCurrent.checked;
         // Pull configuration values into the figure payload
