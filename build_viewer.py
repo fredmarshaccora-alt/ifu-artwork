@@ -2833,6 +2833,15 @@ function activeSvg() {{ return activePane()?.querySelector('svg'); }}
 function refreshPartList() {{
   partList.innerHTML = '';
   const fe = CATALOGUE.find(x => x.file_id === fileSel.value);
+  // Dynamic Onshape sources don't have a baked parts list -- show
+  // a placeholder rather than crashing.
+  if (!fe || !fe.parts || !fe.parts.length) {{
+    const li = document.createElement('li');
+    li.style.cssText = 'color:var(--muted);font-style:italic;padding:4px 0;';
+    li.textContent = '(no parts list for live source)';
+    partList.appendChild(li);
+    return;
+  }}
   fe.parts.forEach(p => {{
     const li = document.createElement('li');
     li.textContent = `[${{String(p.idx).padStart(3, '0')}}] ${{p.label}}`;
@@ -3844,24 +3853,37 @@ function injectLiveSVG(file_id, view_dir, svgText) {{
   pane.querySelector('svg')?.removeAttribute('data-attached');
 
   // Add or update the "Live" option in the View dropdown (per-source).
-  const fe = CATALOGUE.find(x => x.file_id === file_id);
-  if (fe) {{
-    let existing = fe.views.find(v => v.view_id === '__live__');
-    if (existing) {{
-      existing.view_dir = view_dir;
-    }} else {{
-      fe.views.push({{
-        view_id: '__live__',
-        label: '⚡ Live (from 3D)',
-        view_dir: view_dir,
-      }});
-    }}
+  // Dynamic Onshape imports aren't in the baked CATALOGUE -- create
+  // a stub entry on the fly so refreshViews() can populate the View
+  // dropdown and refreshPane() can find the newly-injected pane.
+  let fe = CATALOGUE.find(x => x.file_id === file_id);
+  if (!fe) {{
+    fe = {{
+      file_id: file_id,
+      file_label: file_id,
+      parts: [],
+      views: [],
+    }};
+    CATALOGUE.push(fe);
+  }}
+  let existing = fe.views.find(v => v.view_id === '__live__');
+  if (existing) {{
+    existing.view_dir = view_dir;
+  }} else {{
+    fe.views.push({{
+      view_id: '__live__',
+      label: '⚡ Live (from 3D)',
+      view_dir: view_dir,
+    }});
   }}
   // Refresh the View dropdown if this is the active source
   if (fileSel.value === file_id) {{
     refreshViews();
     viewSel.value = '__live__';
     refreshPane();
+  }} else {{
+    console.warn('[injectLiveSVG] file_id mismatch: fileSel=',
+                  fileSel.value, ' got=', file_id);
   }}
 }}
 
