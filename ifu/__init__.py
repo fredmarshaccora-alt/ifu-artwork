@@ -30,6 +30,7 @@ from .svg_bake import generate_svgs
 from .catalogue import save_catalogue, load_catalogue
 from . import figures as figures_store
 from . import projects as projects_store
+from . import revisions as revisions_store
 
 __all__ = [
     "HERE", "OUT",
@@ -40,5 +41,5 @@ __all__ = [
     "fetch_onshape_tree",
     "generate_svgs",
     "save_catalogue", "load_catalogue",
-    "figures_store", "projects_store",
+    "figures_store", "projects_store", "revisions_store",
 ]

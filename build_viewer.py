@@ -363,6 +363,12 @@ HTML_TEMPLATE = r"""<!doctype html>
       <button id="btn-project-new" title="Create a new project">+</button>
       <button id="btn-project-del" title="Delete current project (keeps figures)">✕</button>
     </div>
+    <div style="display:flex; gap:4px; margin-bottom:6px; font-size:11px;">
+      <button id="btn-revs-refresh"
+              title="Pull the latest Versions list from Onshape for the active source. Updates the 'behind by N' badge on every figure bound to that source."
+              style="font-size:11px;">↻ refresh versions</button>
+      <span id="revs-status" style="color:var(--muted); align-self:center;"></span>
+    </div>
 
     <h2>Figures</h2>
     <p style="font-size:11px; color: var(--muted); margin: 0 0 6px 0;">
@@ -1832,6 +1838,7 @@ async function refreshFiguresList() {{
     const li = document.createElement('li');
     const nameSpan = document.createElement('span');
     nameSpan.className = 'name';
+    nameSpan.dataset.figId = fig.id;
     nameSpan.textContent = fig.name;
     nameSpan.title = `Source: ${{fig.source_id}}  -  ${{fig.view_id}}\\n` +
                       `Updated: ${{fig.updated_at || '?'}}\\n` +
@@ -1924,6 +1931,7 @@ refreshFiguresList = async function() {{
     const li = document.createElement('li');
     const nameSpan = document.createElement('span');
     nameSpan.className = 'name';
+    nameSpan.dataset.figId = fig.id;
     nameSpan.textContent = fig.name;
     nameSpan.title = `Source: ${{fig.source_id}}  -  ${{fig.view_id}}\\n` +
                       `Updated: ${{fig.updated_at || '?'}}\\n` +
@@ -2001,6 +2009,81 @@ $('btn-project-del').addEventListener('click', async () => {{
 projectSel.addEventListener('change', refreshFiguresList);
 
 setTimeout(refreshProjectsList, 1200);
+
+// --- Revisions (Phase C) ---------------------------------------------
+// Per-figure revision-status badge.  The figure JSON carries an
+// optional ``bound_revision`` (set at save time -- Phase D for full
+// wiring); the server computes "versions behind" by comparing the
+// bound id to the cached Versions list.
+
+const revsStatus = document.getElementById('revs-status');
+
+async function refreshVersionsForActiveSource() {{
+  const fid = fileSel.value;
+  if (!fid) return;
+  if (revsStatus) revsStatus.textContent = '…';
+  try {{
+    const r = await fetch(API_BASE + '/api/sources/'
+                           + encodeURIComponent(fid)
+                           + '/versions/refresh', {{ method: 'POST' }});
+    if (!r.ok) {{
+      const err = await r.json().catch(() => ({{}}));
+      if (revsStatus) revsStatus.textContent =
+        '✗ ' + (err.error || ('HTTP ' + r.status));
+      return;
+    }}
+    const env = await r.json();
+    const n = (env.versions || []).length;
+    if (revsStatus) revsStatus.textContent =
+      `✓ ${{n}} versions cached`;
+    // Re-render figures list to update badges
+    refreshFiguresList();
+  }} catch (e) {{
+    if (revsStatus) revsStatus.textContent = '✗ ' + (e.message || 'failed');
+  }}
+}}
+
+$('btn-revs-refresh').addEventListener('click', refreshVersionsForActiveSource);
+
+// Re-render the figures list with revision badges.  Wraps the prior
+// refresh so we can stamp a small ⬆/✓ on each <li>.
+const _refreshFiguresList_phaseC = refreshFiguresList;
+refreshFiguresList = async function() {{
+  await _refreshFiguresList_phaseC();
+  // For each rendered li, fetch its revision_status and append a badge
+  if (!figuresList) return;
+  const lis = figuresList.querySelectorAll('li');
+  for (const li of lis) {{
+    const nameSpan = li.querySelector('.name');
+    if (!nameSpan || !nameSpan.dataset.figId) continue;
+    try {{
+      const r = await fetch(API_BASE + '/api/figures/'
+                              + encodeURIComponent(nameSpan.dataset.figId)
+                              + '/revision_status');
+      if (!r.ok) continue;
+      const s = await r.json();
+      const badge = document.createElement('span');
+      badge.style.fontSize = '10px';
+      badge.style.marginRight = '4px';
+      if (s.versions_behind === null || s.versions_behind === undefined) {{
+        // No bound revision OR no cache -- nothing to say
+        continue;
+      }} else if (s.versions_behind === 0) {{
+        badge.textContent = '✓';
+        badge.style.color = '#0a8';
+        badge.title = 'Up to date with the latest Version';
+      }} else {{
+        badge.textContent = '⬆' + s.versions_behind;
+        badge.style.color = '#c70';
+        badge.title = `Figure is bound to ${{s.bound_revision?.name || '?'}}; latest is ${{s.latest_revision?.name || '?'}}`;
+      }}
+      li.insertBefore(badge, li.firstChild);
+    }} catch (_e) {{}}
+  }}
+}};
+
+// nameSpan.dataset.figId is set inside each list-builder so the
+// phaseC wrapper above can look up revision status by id.
 
 // --- Per-part styling ---------------------------------------------------
 // Per-source dict of part_idx -> {{stroke, width, opacity, dash}}

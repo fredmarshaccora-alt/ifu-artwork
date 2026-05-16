@@ -39,7 +39,8 @@ from t5_hlr_vector import (
     run_part_silhouettes, run_group_silhouette,
     compute_visible_footprints, run_hlr_in_region,
 )
-from ifu import figures_store, projects_store
+from ifu import figures_store, projects_store, revisions_store
+from ifu.config import SOURCES
 import threading
 import functools
 
@@ -236,6 +237,72 @@ def render():
     return Response(svg_bytes, mimetype="image/svg+xml", headers={
         "X-Render-Seconds": f"{elapsed:.2f}",
         "X-Render-Breakdown": breakdown,
+    })
+
+
+# ----- Sources + Revisions (Phase C) ---------------------------------
+
+@app.route("/api/sources", methods=["GET"])
+def sources_list():
+    """List configured sources -- read-only.  Tells the UI which sources
+    have Onshape backing (and so support refresh / revision tracking)."""
+    out = []
+    for entry in SOURCES:
+        out.append({
+            "id": entry[0],
+            "label": entry[1],
+            "step_path": str(entry[2]),
+            "onshape_ids": entry[5] if len(entry) > 5 else None,
+        })
+    return jsonify({"sources": out})
+
+
+@app.route("/api/sources/<source_id>/versions", methods=["GET"])
+def versions_list(source_id):
+    """Return the cached Versions list for a source.  Empty/missing
+    means never refreshed -- the caller should POST to .../refresh."""
+    cached = revisions_store.cached_versions(source_id)
+    if cached is None:
+        return jsonify({"source_id": source_id, "versions": [],
+                         "last_fetched_at": None})
+    return jsonify(cached)
+
+
+@app.route("/api/sources/<source_id>/versions/refresh", methods=["POST"])
+def versions_refresh(source_id):
+    """Hit Onshape to refresh the cached Versions list for this source."""
+    try:
+        env = revisions_store.refresh_versions(source_id)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 503
+    except Exception as exc:
+        return jsonify({"error":
+            f"refresh failed: {type(exc).__name__}: {exc}"}), 502
+    return jsonify(env)
+
+
+@app.route("/api/figures/<fig_id>/revision_status", methods=["GET"])
+def figure_revision_status(fig_id):
+    """Quick lookup: 'this figure is bound to revision X, latest is Y,
+    you're N versions behind'.  None of the fields are required to be
+    present -- a figure with no bound_revision is a no-op."""
+    fig = figures_store.load(fig_id)
+    if fig is None:
+        return jsonify({"error": "figure not found"}), 404
+    bound = fig.get("bound_revision") or {}
+    bound_id = bound.get("id")
+    source_id = fig.get("source_id")
+    latest = revisions_store.latest_version(source_id) if source_id else None
+    behind = (revisions_store.versions_behind(source_id, bound_id)
+              if bound_id and source_id else None)
+    return jsonify({
+        "figure_id": fig_id,
+        "source_id": source_id,
+        "bound_revision": bound or None,
+        "latest_revision": latest,
+        "versions_behind": behind,
     })
 
 
