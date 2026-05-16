@@ -196,6 +196,28 @@ def encode_configuration(values: dict) -> str:
     return ";".join(parts)
 
 
+def list_part_studio_parts(did: str, wv: str, wvid: str,
+                             eid: str) -> list[dict]:
+    """List every part in a part studio (id + name).
+
+    Used by ``start_step_translation`` to enumerate part ids
+    explicitly, because Onshape's STEP translation endpoint for
+    part studios will silently export just one body if ``partIds``
+    is omitted (or set to empty) -- a long-standing API quirk.
+    """
+    c = _client()
+    try:
+        resp = c.get(f"/parts/d/{did}/{wv}/{wvid}/e/{eid}") or []
+    except Exception:
+        return []
+    parts = []
+    for p in resp:
+        pid = p.get("partId")
+        if pid:
+            parts.append({"partId": pid, "name": p.get("name") or pid})
+    return parts
+
+
 def start_step_translation(did: str, wv: str, wvid: str, eid: str,
                             element_type: str = "ASSEMBLY",
                             configuration: str = "") -> dict:
@@ -207,27 +229,43 @@ def start_step_translation(did: str, wv: str, wvid: str, eid: str,
     Args:
       element_type: ``"ASSEMBLY"`` or ``"PARTSTUDIO"`` -- selects which
         REST endpoint family to call.
+
+    Part studios: we enumerate every part id up-front and pass them as
+    a comma-separated ``partIds`` so Onshape exports the whole studio.
+    Without that, the API can return just one part body.
+
+    Assemblies: ``level: "leaf"`` flattens the instance tree so every
+    leaf part comes through (otherwise the response can be just the
+    top-level assembly stub).
     """
     c = _client()
-    body = {
-        "formatName": "STEP",
-        # AS-DESIGNED keeps the geometry exactly as authored.  AP214 is
-        # the most-supported flavour; ANSI units = mm by Onshape default.
-        "storeInDocument": False,
-        "elementId": eid,
-        "step": {
-            "stepVersion": "AP214",
+    if element_type == "PARTSTUDIO":
+        parts = list_part_studio_parts(did, wv, wvid, eid)
+        part_ids_str = ",".join(p["partId"] for p in parts)
+        body = {
+            "formatName": "STEP",
+            "storeInDocument": False,
+            # Empty string = nothing; we need every part.
+            "partIds": part_ids_str,
+            # STEP-specific options live at the TOP of the body for the
+            # part-studio endpoint, not nested under "step".
+            "stepVersionString": "AP214",
             "stepUnit": "millimeter",
-        },
-    }
+        }
+        path = f"/partstudios/d/{did}/{wv}/{wvid}/e/{eid}/translations"
+    else:
+        body = {
+            "formatName": "STEP",
+            "storeInDocument": False,
+            "level": "leaf",
+            "stepVersionString": "AP214",
+            "stepUnit": "millimeter",
+        }
+        path = f"/assemblies/d/{did}/{wv}/{wvid}/e/{eid}/translations"
     if configuration:
         # Onshape accepts the encoded "key1=val1;key2=val2" string under
         # the top-level ``configuration`` field on the translation body.
         body["configuration"] = configuration
-    if element_type == "PARTSTUDIO":
-        path = f"/partstudios/d/{did}/{wv}/{wvid}/e/{eid}/translations"
-    else:
-        path = f"/assemblies/d/{did}/{wv}/{wvid}/e/{eid}/translations"
     resp = c.post(path, json=body) or {}
     return {
         "translation_id": resp.get("id"),

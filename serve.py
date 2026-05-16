@@ -110,6 +110,40 @@ _FOOT_CACHE_MAX = 2000
 _FOOT_RASTER_DONE: dict[tuple, bool] = {}
 
 
+def _load_step_as_compound(step_path: Path):
+    """Read a STEP and return a single OCCT shape that contains every
+    top-level solid.
+
+    cadquery's importStep returns a Workplane whose ``vals()`` lists
+    every top-level item in the file.  When the STEP itself wraps its
+    parts in a top-level COMPOUND (Onshape's assembly export, the
+    hand-curated Presto STEP) ``vals()`` is length 1 and ``val()``
+    already covers everything.  When the STEP lists each part as a
+    sibling top-level entity (Onshape's part-studio export via
+    /partstudios/.../translations), ``vals()`` has one entry per part
+    and ``val()`` quietly drops everything except the first solid --
+    which is why the user only saw 1 rivet.
+
+    To handle both shapes uniformly we always build a compound here.
+    """
+    imp = cq.importers.importStep(str(step_path))
+    vals = imp.vals()
+    if not vals:
+        raise RuntimeError(f"STEP {step_path} contained no shapes")
+    if len(vals) == 1:
+        return vals[0].wrapped
+    # Multi-solid file: assemble all of them under a single compound
+    # so downstream code (split_solids, HLR, GLB) sees everything.
+    from OCP.TopoDS import TopoDS_Compound
+    from OCP.BRep import BRep_Builder
+    comp = TopoDS_Compound()
+    bb = BRep_Builder()
+    bb.MakeCompound(comp)
+    for v in vals:
+        bb.Add(comp, v.wrapped)
+    return comp
+
+
 def _load_source_into_memory(*, file_id: str, step_path: Path,
                                 hlr_kw: dict,
                                 pre_rotate=None) -> bool:
@@ -122,7 +156,7 @@ def _load_source_into_memory(*, file_id: str, step_path: Path,
     print(f"  {file_id:<28s} ", end="", flush=True)
     t0 = time.time()
     try:
-        shape = cq.importers.importStep(str(step_path)).val().wrapped
+        shape = _load_step_as_compound(step_path)
         if pre_rotate is not None:
             axis, angle = pre_rotate
             shape = rotate_shape(shape, axis, angle)
