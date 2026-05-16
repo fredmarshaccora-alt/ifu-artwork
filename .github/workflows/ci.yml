@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backtest-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install cadquery-ocp==7.7.2 numpy pillow opencv-python flask pytest playwright
+      - name: Run unit backtests
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          python -m pytest tests/backtest -m "unit" -v
+
+  backtest-integration:
+    runs-on: ubuntu-latest
+    needs: backtest-unit
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install cadquery numpy pillow opencv-python flask pytest playwright trimesh
+      - name: Run integration backtests
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          # Integration tests SKIP when STEP files aren't present
+          # (which is the case on CI -- they're gitignored).  This
+          # job still runs to verify the test infrastructure works.
+          python -m pytest tests/backtest -m "integration" -v
