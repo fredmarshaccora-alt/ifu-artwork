@@ -2557,11 +2557,12 @@ async function EditorScreen(container, params) {{
     AppState.currentProjectId = projId;
     AppState.currentFigureId = figId;
     // Yield a tick so the legacy editor's catalogue is fully ready,
-    // then drop the figure in.  _loadFigureIntoEditor auto-fires the
-    // confirm dialog if the editor has current work; suppress it here
-    // because the user JUST clicked into this figure intentionally.
+    // then drop the figure in.  Skip the "replace current work?"
+    // confirm: the user JUST clicked into this figure via the
+    // workspace -- their intent isn't ambiguous.
     setTimeout(() => {{
-      try {{ window._loadFigureIntoEditor(fig); }} catch (_e) {{}}
+      try {{ window._loadFigureIntoEditor(fig, {{ skipConfirm: true }}); }}
+      catch (_e) {{}}
     }}, 200);
   }}
 
@@ -2701,10 +2702,25 @@ CATALOGUE.forEach(fe => {{
   opt.value = fe.file_id; opt.textContent = fe.file_label;
   fileSel.appendChild(opt);
 }});
+// Fallback view list for sources that aren't in the baked CATALOGUE
+// (e.g. Onshape imports landed at runtime).  Same iso / front / side
+// presets used by the standard sources, with the same view directions
+// the build pipeline uses.  No baked SVG -- live /api/render fills in.
+const _FALLBACK_VIEWS = [
+  {{ view_id: 'iso',   label: 'Iso 3/4 (front-right-above)',
+     view_dir: [-0.5, -1.0, 0.7] }},
+  {{ view_id: 'front', label: 'Front elevation',
+     view_dir: [ 0.0, -1.0, 0.25] }},
+  {{ view_id: 'side',  label: 'Side elevation',
+     view_dir: [-1.0,  0.0, 0.25] }},
+];
+
 function refreshViews() {{
   viewSel.innerHTML = '';
   const fe = CATALOGUE.find(x => x.file_id === fileSel.value);
-  fe.views.forEach(ve => {{
+  const views = (fe && fe.views && fe.views.length)
+                ? fe.views : _FALLBACK_VIEWS;
+  views.forEach(ve => {{
     const o = document.createElement('option');
     o.value = ve.view_id; o.textContent = ve.label;
     viewSel.appendChild(o);
@@ -3871,18 +3887,43 @@ async function saveCurrentAsFigure() {{
   refreshFiguresList();
 }}
 
-function _loadFigureIntoEditor(fig) {{
+function _loadFigureIntoEditor(fig, opts) {{
+  opts = opts || {{}};
   // Restore: source -> view -> camera -> selection -> styles -> layers
   // Confirm before clobbering current state -- it's destructive and
-  // there's no undo.  Skip the prompt if the editor is in a "fresh"
-  // state (no selection, no applied styles).
-  const curSt = getState(fileSel.value, viewSel.value);
-  const curStyles = loadPartStyles(fileSel.value) || {{}};
-  const hasWork = (curSt.highlights && curSt.highlights.size > 0)
-               || Object.keys(curStyles).length > 0;
-  if (hasWork) {{
-    if (!confirm(`Loading "${{fig.name}}" will replace the current `
-                + `selection and applied styles.  Continue?`)) return;
+  // there's no undo.  Skip the prompt when ``opts.skipConfirm`` (the
+  // user JUST clicked into this figure via the project workspace, no
+  // ambiguity about intent), or if the editor is in a "fresh" state.
+  if (!opts.skipConfirm) {{
+    const curSt = getState(fileSel.value, viewSel.value);
+    const curStyles = loadPartStyles(fileSel.value) || {{}};
+    const hasWork = (curSt.highlights && curSt.highlights.size > 0)
+                 || Object.keys(curStyles).length > 0;
+    if (hasWork) {{
+      if (!confirm(`Loading "${{fig.name}}" will replace the current `
+                  + `selection and applied styles.  Continue?`)) return;
+    }}
+  }}
+
+  // If the figure's source isn't in the dropdown yet (e.g. a dynamic
+  // Onshape import that landed AFTER the page loaded), pull /api/sources
+  // and add an option for it.  Otherwise the value assignment below
+  // silently no-ops and the user keeps staring at the wrong assembly.
+  if (fig.source_id) {{
+    const hasOpt = Array.from(fileSel.options)
+                         .some(o => o.value === fig.source_id);
+    if (!hasOpt) {{
+      const opt = document.createElement('option');
+      opt.value = fig.source_id;
+      opt.textContent = fig.source_id;   // best-effort label until we
+                                          // hear back from /api/sources
+      fileSel.appendChild(opt);
+      // Fire off a label lookup so the option shows the human name
+      fetch(API_BASE + '/api/sources').then(r => r.json()).then(data => {{
+        const s = (data.sources || []).find(x => x.id === fig.source_id);
+        if (s && s.label) opt.textContent = s.label;
+      }}).catch(() => {{}});
+    }}
   }}
 
   if (fig.source_id && fig.source_id !== fileSel.value) {{
@@ -5342,26 +5383,18 @@ function loadSource(file_id) {{
     if (upRot) applyUpAxisOverride(upRot); else frame(active);
     return;
   }}
-  const b64 = GLB_B64[file_id];
-  if (!b64) {{
-    readout.textContent = '(no 3D mesh for this source)';
-    return;
-  }}
-  const url = 'data:model/gltf-binary;base64,' + b64;
-  const loader = new GLTFLoader();
-  loader.load(url, (gltf) => {{
-    const grp = gltf.scene;
+  // Static sources have their GLB baked into the page.  Dynamic
+  // (Onshape-imported) sources don't -- fall back to /api/glb/<id>
+  // which meshes the server-side shape on demand.
+  const bakedB64 = GLB_B64[file_id];
+  const _hookGroup = (grp) => {{
     grp.traverse(obj => {{
       if (obj.isMesh) {{
-        // PBR material gives the surface a subtle sheen + proper
-        // response to the rim/sun/fill lighting, instead of the flat
-        // Lambert "construction paper" look.
         obj.material = new THREE.MeshStandardMaterial({{
           color: 0xe8e8ea, metalness: 0.15, roughness: 0.55,
           transparent: false, side: THREE.DoubleSide,
           polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1,
         }});
-        // crease edges only (>=30deg dihedral) for a Composer-ish look
         const edges = new THREE.EdgesGeometry(obj.geometry, 30);
         const lines = new THREE.LineSegments(
           edges,
@@ -5378,10 +5411,40 @@ function loadSource(file_id) {{
     indexParts(grp);
     const upRot = window.IFU_VIEWER?.getActiveUpAxis?.();
     if (upRot) applyUpAxisOverride(upRot); else frame(grp);
-  }}, undefined, (err) => {{
-    console.error('GLB load failed', err);
-    readout.textContent = '(GLB load failed - see console)';
-  }});
+  }};
+
+  const _loadFromB64 = (b64) => {{
+    const url = 'data:model/gltf-binary;base64,' + b64;
+    const loader = new GLTFLoader();
+    loader.load(url, (gltf) => _hookGroup(gltf.scene), undefined, (err) => {{
+      console.error('GLB load failed', err);
+      readout.textContent = '(GLB load failed - see console)';
+    }});
+  }};
+
+  if (bakedB64) {{ _loadFromB64(bakedB64); return; }}
+
+  // No baked mesh -- ask the server to generate one.  This can take
+  // 5-30 seconds depending on assembly size, so show progress.
+  readout.textContent = 'meshing ' + file_id + ' ...';
+  fetch(API_BASE + '/api/glb/' + encodeURIComponent(file_id))
+    .then(r => {{
+      if (!r.ok) {{
+        return r.json().then(j => {{
+          throw new Error(j.error || ('HTTP ' + r.status));
+        }});
+      }}
+      return r.json();
+    }})
+    .then(data => {{
+      if (!data.b64) throw new Error('no GLB returned');
+      readout.textContent = `${{file_id}} : ${{data.parts}} parts, ${{data.kb}} KB`;
+      _loadFromB64(data.b64);
+    }})
+    .catch(err => {{
+      console.error('GLB fetch failed', err);
+      readout.textContent = '(no 3D mesh: ' + (err.message || err) + ')';
+    }});
 }}
 
 function indexParts(grp) {{

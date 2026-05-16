@@ -412,6 +412,37 @@ def onshape_import_status(job_id):
     return jsonify(job)
 
 
+@app.route("/api/glb/<source_id>", methods=["GET"])
+@_occt_serialised
+def glb_for_source(source_id):
+    """Generate a GLB for a source on demand.
+
+    The baked GLB_B64 catalogue only knows about static sources -- after
+    an Onshape import lands at runtime, the editor needs to be able to
+    pull a fresh mesh.  We mesh against the same in-memory shape used
+    by /api/render with the source's hlr_kwargs mesh_defl, base64-encode
+    it, and return ``{b64, parts, tris, kb}``.
+    """
+    if source_id not in _SHAPES:
+        return jsonify({"error": f"unknown or unloaded source: {source_id!r}",
+                         "known": list(_SHAPES.keys())}), 404
+    shape, hlr_kw = _SHAPES[source_id]
+    mesh_defl = (hlr_kw or {}).get("mesh_defl", 1.5)
+    try:
+        from ifu.glb import export_glb_b64
+        b64, summary = export_glb_b64(shape, mesh_defl)
+    except Exception as exc:
+        return jsonify({"error":
+            f"GLB export failed: {type(exc).__name__}: {exc}"}), 500
+    if not b64:
+        return jsonify({"error": "no meshable solids"}), 422
+    return jsonify({
+        "source_id": source_id,
+        "b64": b64,
+        **(summary or {}),
+    })
+
+
 @app.route("/api/sources/<source_id>/configuration", methods=["GET"])
 def source_configuration(source_id):
     """List the Onshape configuration parameters for a source.  Only
