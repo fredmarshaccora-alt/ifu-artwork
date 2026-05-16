@@ -8,7 +8,8 @@ from __future__ import annotations
 import pytest
 
 from ifu.onshape_fetch import (parse_onshape_url, OnshapeURLError,
-                                encode_configuration)
+                                encode_configuration,
+                                get_element_configuration)
 from ifu import sources_store
 
 
@@ -163,3 +164,78 @@ class TestEncodeConfiguration:
         assert "d=4" in parts
         assert "b=" not in parts
         assert "c=" not in parts
+
+
+# ----- Configuration response parser -------------------------------
+
+class TestParseConfigurationResponse:
+    """Verify get_element_configuration normalises the real Onshape
+    BTConfigurationResponse-2019 shape, not the imagined nested-message
+    one we originally coded against."""
+
+    def _norm(self, raw):
+        # Monkeypatch _client().get to return raw; saves a network call
+        from ifu import onshape_fetch as of
+        class _Stub:
+            def get(self, path): return raw
+        orig = of._client
+        of._client = lambda: _Stub()
+        try:
+            return of.get_element_configuration("d", "w", "wv", "e")
+        finally:
+            of._client = orig
+
+    def test_enum_parameter(self):
+        raw = {"configurationParameters": [{
+            "btType": "BTMConfigurationParameterEnum-105",
+            "parameterId": "List_X", "parameterName": "Rise",
+            "defaultValue": "Default",
+            "options": [
+                {"option": "Default", "optionName": "Default"},
+                {"option": "Up",      "optionName": "Up"},
+                {"option": "Down",    "optionName": "Down"},
+            ],
+        }]}
+        out = self._norm(raw)
+        assert out["has_config"] is True
+        p = out["parameters"][0]
+        assert p["id"] == "List_X"
+        assert p["name"] == "Rise"
+        assert p["type"] == "enum"
+        assert p["default"] == "Default"
+        assert [o["value"] for o in p["options"]] == ["Default", "Up", "Down"]
+        assert [o["label"] for o in p["options"]] == ["Default", "Up", "Down"]
+
+    def test_boolean_parameter(self):
+        raw = {"configurationParameters": [{
+            "btType": "BTMConfigurationParameterBoolean-2550",
+            "parameterId": "BoolX", "parameterName": "Has armrest",
+            "defaultValue": True,
+        }]}
+        p = self._norm(raw)["parameters"][0]
+        assert p["type"] == "boolean"
+        assert p["default"] is True
+        assert p["name"] == "Has armrest"
+
+    def test_quantity_parameter_pulls_unit_and_range(self):
+        raw = {"configurationParameters": [{
+            "btType": "BTMConfigurationParameterQuantity-1826",
+            "parameterId": "WidthQ", "parameterName": "Seat width",
+            "quantityType": "LENGTH",
+            "rangeAndDefault": {
+                "defaultValue": 450, "minValue": 300, "maxValue": 600,
+                "units": "millimeter",
+            },
+        }]}
+        p = self._norm(raw)["parameters"][0]
+        assert p["type"] == "quantity"
+        assert p["name"] == "Seat width"
+        assert p["default"] == 450
+        assert p["unit"] == "millimeter"
+        assert p["range"]["min"] == 300
+        assert p["range"]["max"] == 600
+
+    def test_empty_response(self):
+        out = self._norm({"configurationParameters": []})
+        assert out["has_config"] is False
+        assert out["parameters"] == []

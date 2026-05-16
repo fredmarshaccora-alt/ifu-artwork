@@ -2025,14 +2025,19 @@ function _openNewFigureModal(projId, sources, proj) {{
         + (cfg.parameters.length === 1 ? '' : 's')
         + ' available -- pick variant to render';
       for (const p of cfg.parameters) {{
-        const row = h('div.field-row', {{
+        const labelEl = h('label', {{
+          style: {{ marginBottom: 0,
+                      fontSize: 'var(--t-body)',
+                      color: 'var(--c-text)',
+                      fontWeight: 500 }} }},
+          p.name || p.id || '(unnamed parameter)');
+        const row = h('div', {{
           style: {{ display: 'grid',
-                      gridTemplateColumns: '1fr 2fr',
-                      gap: '8px',
+                      gridTemplateColumns: '160px 1fr',
+                      gap: '12px',
                       alignItems: 'center',
-                      marginTop: '6px' }} }}, [
-          h('label', {{ style: {{ marginBottom: 0 }} }}, p.name),
-        ]);
+                      marginTop: '6px' }} }}, [labelEl]);
+
         if (p.type === 'enum' && p.options?.length) {{
           const sel = h('select.select', {{ style: {{ width: '100%' }} }});
           for (const o of p.options) {{
@@ -2044,12 +2049,55 @@ function _openNewFigureModal(projId, sources, proj) {{
           }}
           row.appendChild(sel);
           configInputs[p.id] = sel;
-        }} else {{
+        }} else if (p.type === 'boolean') {{
+          const wrap = h('label', {{
+            style: {{ display: 'flex', alignItems: 'center',
+                        gap: '8px', cursor: 'pointer',
+                        fontSize: 'var(--t-meta)',
+                        color: 'var(--c-text-muted)' }} }});
+          const cb = h('input', {{ type: 'checkbox' }});
+          if (p.default === true || p.default === 'true') cb.checked = true;
+          wrap.appendChild(cb);
+          wrap.appendChild(h('span', cb.checked ? 'enabled' : 'disabled'));
+          cb.addEventListener('change', () => {{
+            wrap.lastChild.textContent = cb.checked ? 'enabled' : 'disabled';
+          }});
+          // Read .value as a string so the create-handler can write it
+          // to the configuration map uniformly.
+          Object.defineProperty(cb, 'value', {{
+            get() {{ return cb.checked ? 'true' : 'false'; }},
+          }});
+          row.appendChild(wrap);
+          configInputs[p.id] = cb;
+        }} else if (p.type === 'quantity') {{
+          const inner = h('div', {{
+            style: {{ display: 'flex', alignItems: 'center',
+                        gap: '6px' }} }});
           const inp = h('input.input', {{
-            placeholder: '(default: ' + (p.default || '') + ')',
+            type: 'text',
+            placeholder: p.default != null
+              ? `default: ${{p.default}}` : '',
+            style: {{ flex: '1', minWidth: 0 }},
+          }});
+          if (p.default != null) inp.value = String(p.default);
+          inner.appendChild(inp);
+          if (p.unit) {{
+            inner.appendChild(h('span', {{
+              style: {{ color: 'var(--c-text-muted)',
+                          fontSize: 'var(--t-meta)' }} }},
+              p.unit));
+          }}
+          row.appendChild(inner);
+          configInputs[p.id] = inp;
+        }} else {{
+          // string / unknown: plain text input
+          const inp = h('input.input', {{
+            type: 'text',
+            placeholder: p.default != null
+              ? `default: ${{p.default}}` : '',
             style: {{ width: '100%' }},
           }});
-          if (p.default) inp.value = String(p.default);
+          if (p.default != null) inp.value = String(p.default);
           row.appendChild(inp);
           configInputs[p.id] = inp;
         }}

@@ -136,15 +136,25 @@ def get_element_configuration(did: str, wv: str, wvid: str,
                                 eid: str) -> dict:
     """Fetch the configuration parameter definitions for an element.
 
-    Onshape's /elements/d/{did}/{wv}/{wvid}/e/{eid}/configuration returns
-    one ``configurationParameters`` list -- each entry describes a knob
-    (enum, bool, length, etc.) with its options and current default.
+    Onshape's /elements/d/{did}/{wv}/{wvid}/e/{eid}/configuration
+    returns ``{configurationParameters: [{btType, parameterId,
+    parameterName, defaultValue, options, ...}]}``.  Field shape
+    varies by parameter type:
+
+      Enum:     btType "BTMConfigurationParameterEnum-105"
+                options: [{optionName, option, nodeId}, ...]
+                defaultValue: option string
+      Boolean:  btType "BTMConfigurationParameterBoolean-2550"
+                defaultValue: bool
+      Quantity: btType "BTMConfigurationParameterQuantity-1826"
+                rangeAndDefault.defaultValue / minValue / maxValue
+                quantityType: e.g. "LENGTH", "ANGLE"
+      String:   btType "BTMConfigurationParameterString-872"
+                defaultValue: string
 
     Returns a UI-friendly normalised shape:
       ``{has_config: bool, parameters: [{id, name, type, default,
-                                         options}]}``
-    where ``options`` is a list of ``{value, label}`` for enum parameters,
-    and empty for other types.
+                                         options, unit, range}]}``
     """
     c = _client()
     try:
@@ -155,26 +165,50 @@ def get_element_configuration(did: str, wv: str, wvid: str,
     params = resp.get("configurationParameters") or []
     out_params = []
     for p in params:
-        msg = p.get("message") or {}
-        ptype = (p.get("typeName") or "").upper()
-        param_id = msg.get("parameterId")
-        name = msg.get("parameterName") or param_id
-        default = msg.get("defaultValue")
+        bt_type = (p.get("btType") or "").lower()
+        # Derive a short kind from the btType prefix
+        if "enum" in bt_type:
+            kind = "enum"
+        elif "boolean" in bt_type:
+            kind = "boolean"
+        elif "quantity" in bt_type:
+            kind = "quantity"
+        elif "string" in bt_type:
+            kind = "string"
+        else:
+            kind = "unknown"
+
+        param_id = p.get("parameterId")
+        name = p.get("parameterName") or param_id
+        default = p.get("defaultValue")
         opts = []
-        if ptype == "BTMCONFIGURATIONPARAMETERENUM":
-            for o in msg.get("options") or []:
-                om = o.get("message") or {}
+        unit = None
+        rng = None
+
+        if kind == "enum":
+            for o in p.get("options") or []:
                 opts.append({
-                    "value": om.get("option"),
-                    "label": om.get("optionName") or om.get("option"),
+                    "value": o.get("option"),
+                    "label": o.get("optionName") or o.get("option"),
                 })
+        elif kind == "quantity":
+            rad = p.get("rangeAndDefault") or {}
+            default = rad.get("defaultValue", default)
+            rng = {
+                "min": rad.get("minValue"),
+                "max": rad.get("maxValue"),
+                "units": rad.get("units"),
+            }
+            unit = rad.get("units") or p.get("quantityType")
+
         out_params.append({
             "id": param_id,
             "name": name,
-            "type": ptype.replace("BTMCONFIGURATIONPARAMETER", "")
-                          .lower() or "unknown",
+            "type": kind,
             "default": default,
             "options": opts,
+            "unit": unit,
+            "range": rng,
         })
     return {
         "has_config": bool(out_params),
