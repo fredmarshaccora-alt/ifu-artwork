@@ -56,3 +56,55 @@ def test_sources_endpoint_lists_static_origin(server_url):
         assert "origin" in s
         assert "loaded" in s
         assert s["origin"] in ("static", "dynamic")
+
+
+# ----- /api/onshape/probe (G.4) -------------------------------------
+
+def test_probe_rejects_empty_url(server_url):
+    import requests
+    r = requests.post(f"{server_url}/api/onshape/probe", json={},
+                       timeout=10)
+    assert r.status_code == 400
+    assert "url required" in r.json().get("error", "").lower()
+
+
+def test_probe_rejects_non_onshape_url(server_url):
+    import requests
+    r = requests.post(f"{server_url}/api/onshape/probe",
+                       json={"url": "https://google.com"}, timeout=10)
+    assert r.status_code == 400
+
+
+def test_probe_rejects_url_without_element_segment(server_url):
+    """A URL that parses but has no /e/<eid> should 400 with a
+    specific message."""
+    import requests
+    url = ("https://cad.onshape.com/documents/abc1234567890123/"
+           "w/def4567890123456")
+    r = requests.post(f"{server_url}/api/onshape/probe",
+                       json={"url": url}, timeout=10)
+    assert r.status_code == 400
+    assert "element" in r.json().get("error", "").lower()
+
+
+# ----- /api/sources/<id>/configuration (G.3) ------------------------
+
+def test_configuration_404_for_unknown_source(server_url):
+    import requests
+    r = requests.get(
+        f"{server_url}/api/sources/nope_does_not_exist/configuration",
+        timeout=10)
+    assert r.status_code == 404
+
+
+def test_configuration_empty_for_local_source(server_url):
+    """A static source without onshape_ids (e.g. siderail) returns
+    has_config: false / empty parameters -- no Onshape call made."""
+    import requests
+    r = requests.get(
+        f"{server_url}/api/sources/siderail/configuration",
+        timeout=10)
+    assert r.status_code == 200
+    body = r.json()
+    assert body.get("has_config") is False
+    assert body.get("parameters") == []

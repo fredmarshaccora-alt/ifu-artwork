@@ -315,6 +315,52 @@ def sources_list():
 
 # ----- Onshape import (Phase G.2) ------------------------------------
 
+@app.route("/api/onshape/probe", methods=["POST"])
+def onshape_probe():
+    """Lightweight URL inspection -- no translation, no STEP download.
+
+    Used by the new-project wizard to pre-populate the project name
+    from the Onshape document title as soon as the user pastes the URL.
+
+    Body: ``{url: "<doc URL>"}``.  Returns ``{document_name,
+    element_name, element_type, onshape_ids}`` on success, or
+    ``{error: "..."}`` with an appropriate HTTP code on failure.
+    """
+    body = request.get_json(silent=True) or {}
+    url = (body.get("url") or "").strip()
+    if not url:
+        return jsonify({"error": "url required"}), 400
+    try:
+        ids = onshape_fetch.parse_onshape_url(url)
+    except onshape_fetch.OnshapeURLError as exc:
+        return jsonify({"error": str(exc)}), 400
+    did, wv, wvid, eid = ids["did"], ids["wv"], ids["wvid"], ids["eid"]
+    if not eid:
+        return jsonify({
+            "error": "URL must include /e/<eid> element segment"
+        }), 400
+    try:
+        doc = onshape_fetch.get_document_info(did)
+        elem = onshape_fetch.get_element_info(did, wv, wvid, eid)
+    except RuntimeError as exc:
+        # Client missing creds, etc.
+        return jsonify({"error": str(exc)}), 503
+    except Exception as exc:
+        return jsonify({
+            "error": f"probe failed: {type(exc).__name__}: {exc}"
+        }), 502
+    return jsonify({
+        "document_name": doc.get("name"),
+        "element_name": elem.get("name"),
+        "element_type": elem.get("type"),
+        "onshape_ids": {"did": did,
+                         "wid": wvid if wv == "w" else None,
+                         "vid": wvid if wv == "v" else None,
+                         "mid": wvid if wv == "m" else None,
+                         "eid": eid, "wv": wv},
+    })
+
+
 @app.route("/api/onshape/import", methods=["POST"])
 def onshape_import_start():
     """Kick off an Onshape STEP import.  Body: ``{url: "<doc URL>"}``.

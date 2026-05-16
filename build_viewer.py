@@ -850,6 +850,39 @@ const _DESIGN_CSS = `
   background: var(--c-surface); border-style: solid;
   color: var(--c-accora);
 }}
+.card {{ position: relative; }}
+.card .card-menu-btn {{
+  position: absolute; top: 6px; right: 6px;
+  width: 28px; height: 28px;
+  display: flex; align-items: center; justify-content: center;
+  border: none; background: transparent; cursor: pointer;
+  color: var(--c-text-muted); border-radius: var(--radius-1);
+  opacity: 0; transition: opacity 0.12s, background 0.12s, color 0.12s;
+  font-size: 18px; line-height: 1;
+}}
+.card:hover .card-menu-btn,
+.card .card-menu-btn.open {{ opacity: 1; }}
+.card .card-menu-btn:hover {{
+  background: var(--c-bg); color: var(--c-text);
+}}
+.card-menu {{
+  position: absolute; min-width: 160px;
+  background: var(--c-surface); border: 1px solid var(--c-line);
+  border-radius: var(--radius-2); box-shadow: var(--shadow-2);
+  padding: 4px; z-index: 100;
+  font-size: var(--t-body);
+}}
+.card-menu .item {{
+  padding: 6px 10px; border-radius: var(--radius-1);
+  cursor: pointer; color: var(--c-text);
+  display: flex; align-items: center; gap: var(--space-2);
+}}
+.card-menu .item:hover {{ background: var(--c-bg); }}
+.card-menu .item.danger {{ color: var(--c-danger); }}
+.card-menu .item.danger:hover {{ background: #fdf0f0; }}
+.card-menu .sep {{
+  height: 1px; background: var(--c-line); margin: 4px 2px;
+}}
 
 /* Buttons */
 .btn {{
@@ -1075,8 +1108,100 @@ function toast(message, kind /* 'success' | 'error' | undefined */) {{
   }}, 3500);
 }}
 
+// Attach a "..." action menu to a .card.  items is a list of:
+//   {{ label, onClick: (closeMenu) => void, danger?: true, separator?: true }}
+//
+// The menu pops below the button, closes on outside click / Escape, and
+// stops click-propagation so the menu and its actions don't trigger the
+// card's own onClick (which would otherwise navigate away while you
+// pick "Delete").
+function _attachCardMenu(card, items) {{
+  const btn = h('button.card-menu-btn',
+                  {{ type: 'button', title: 'More actions',
+                     'aria-label': 'More actions' }},
+                  '⋯');
+  card.appendChild(btn);
+
+  let menu = null;
+  function closeMenu() {{
+    if (menu) {{ menu.remove(); menu = null; }}
+    btn.classList.remove('open');
+    document.removeEventListener('click', _docCloser, true);
+    document.removeEventListener('keydown', _escCloser);
+  }}
+  function _docCloser(ev) {{
+    if (menu && !menu.contains(ev.target) && ev.target !== btn) closeMenu();
+  }}
+  function _escCloser(ev) {{
+    if (ev.key === 'Escape') closeMenu();
+  }}
+  btn.addEventListener('click', (ev) => {{
+    ev.stopPropagation();
+    if (menu) {{ closeMenu(); return; }}
+    menu = h('div.card-menu');
+    for (const it of items) {{
+      if (it.separator) {{
+        menu.appendChild(h('div.sep'));
+        continue;
+      }}
+      const item = h('div', {{
+        class: 'item' + (it.danger ? ' danger' : ''),
+      }}, it.label);
+      item.addEventListener('click', (e) => {{
+        e.stopPropagation();
+        closeMenu();
+        try {{ it.onClick(closeMenu); }} catch (err) {{ console.error(err); }}
+      }});
+      menu.appendChild(item);
+    }}
+    // Position: anchor below the button.  Since .card has position:relative,
+    // we can use right/top in the card's own coordinate space.
+    menu.style.top = '32px';
+    menu.style.right = '4px';
+    card.appendChild(menu);
+    btn.classList.add('open');
+    // Defer the document listener so the click that opened the menu
+    // doesn't immediately close it.
+    setTimeout(() => {{
+      document.addEventListener('click', _docCloser, true);
+      document.addEventListener('keydown', _escCloser);
+    }}, 0);
+  }});
+}}
+
+// Simple confirm modal -- returns a Promise<bool>.  Cancel resolves to false.
+// Clicking X or the backdrop / pressing Escape also resolves to false.
+function confirmModal({{ title, body, confirmLabel, danger }}) {{
+  return new Promise((resolve) => {{
+    let resolved = false;
+    const finish = (v) => {{ if (!resolved) {{ resolved = true; resolve(v); }} }};
+    openModal({{
+      title: title || 'Confirm',
+      body: typeof body === 'string' ? h('div', body) : body,
+      footer: [
+        {{ label: 'Cancel', onClick: (close) => {{ close(); finish(false); }} }},
+        {{ label: confirmLabel || 'Confirm',
+           primary: !danger, danger: !!danger,
+           onClick: (close) => {{ close(); finish(true); }} }},
+      ],
+    }});
+    // Backstop: if the modal is closed any other way, the modal-backdrop
+    // is removed from the DOM.  MutationObserver detects that and treats
+    // it as a cancel.
+    const obs = new MutationObserver(() => {{
+      if (!document.querySelector('.modal-backdrop')) {{
+        obs.disconnect();
+        finish(false);
+      }}
+    }});
+    obs.observe(document.body, {{ childList: true }});
+  }});
+}}
+
 // Expose so screens can use them
-window.IFU_UI = {{ openModal, toast, topBar: _topBar }};
+window.IFU_UI = {{ openModal, toast, topBar: _topBar,
+                    attachCardMenu: _attachCardMenu,
+                    confirmModal }};
 // ===== end G.0 design system =====
 
 
@@ -1186,6 +1311,14 @@ async function HomeScreen(container) {{
     card.addEventListener('click', () => {{
       location.hash = '#/project/' + encodeURIComponent(p.id);
     }});
+    _attachCardMenu(card, [
+      {{ label: 'Rename...', onClick: () => _renameProject(p) }},
+      {{ label: 'Edit description...',
+         onClick: () => _editProjectDescription(p) }},
+      {{ separator: true }},
+      {{ label: 'Delete project...', danger: true,
+         onClick: () => _deleteProject(p) }},
+    ]);
     grid.appendChild(card);
   }}
   main.appendChild(grid);
@@ -1226,7 +1359,13 @@ registerRoute(/^#\/$/, HomeScreen);
 function _openNewProjectModal() {{
   let nameInput, descInput, urlInput, errorBox;
   let progressWrap, progressBar, progressLabel, progressDetail;
+  let probeHint;
   let cancelBtn, createBtn;
+  // True after the user has typed in the name field at all, so we
+  // don't clobber their text with the auto-probed document name.
+  let nameTouched = false;
+  let probeTimer = null;
+  let lastProbedUrl = null;
 
   const body = h('div', [
     h('div.field-row', [
@@ -1252,6 +1391,10 @@ function _openNewProjectModal() {{
         autocomplete: 'off',
         spellcheck: false,
       }})),
+      (probeHint = h('div', {{ style: {{ fontSize: '11px',
+                                              color: 'var(--c-text-muted)',
+                                              marginTop: '4px',
+                                              minHeight: '14px' }} }}, '')),
     ]),
     (errorBox = h('div', {{ style: {{ display: 'none',
                                           padding: '8px 12px',
@@ -1323,6 +1466,60 @@ function _openNewProjectModal() {{
       }}
     }}
   }}
+
+  // Mark the name as user-touched once they type anything.  Stops the
+  // debounced probe from clobbering their text.
+  nameInput.addEventListener('input', () => {{
+    if (nameInput.value.trim()) nameTouched = true;
+  }});
+
+  async function probeUrl(url) {{
+    if (url === lastProbedUrl) return;
+    lastProbedUrl = url;
+    probeHint.textContent = 'checking Onshape...';
+    probeHint.style.color = 'var(--c-text-muted)';
+    try {{
+      const r = await fetch(API_BASE + '/api/onshape/probe', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ url }}),
+      }});
+      const data = await r.json();
+      if (!r.ok) {{
+        probeHint.textContent = data.error || 'could not read URL';
+        probeHint.style.color = 'var(--c-danger)';
+        return;
+      }}
+      const docName = data.document_name || '';
+      const elName = data.element_name || '';
+      probeHint.textContent = `${{docName}} · ${{elName}}`;
+      probeHint.style.color = 'var(--c-accora)';
+      if (!nameTouched && docName) {{
+        nameInput.value = docName;
+      }}
+    }} catch (e) {{
+      probeHint.textContent = 'probe failed: ' + (e.message || e);
+      probeHint.style.color = 'var(--c-danger)';
+    }}
+  }}
+
+  urlInput.addEventListener('input', () => {{
+    const url = (urlInput.value || '').trim();
+    if (probeTimer) clearTimeout(probeTimer);
+    if (!url) {{
+      probeHint.textContent = '';
+      lastProbedUrl = null;
+      return;
+    }}
+    // Don't fire the probe until the URL looks structurally valid --
+    // saves a request per keystroke while typing.
+    if (!/\/documents\/[0-9a-f]{{16,}}\/[wvm]\//i.test(url)) {{
+      probeHint.textContent = '';
+      lastProbedUrl = null;
+      return;
+    }}
+    probeTimer = setTimeout(() => probeUrl(url), 600);
+  }});
 
   const modal = openModal({{
     title: 'New project',
@@ -1527,6 +1724,12 @@ async function ProjectScreen(container, params) {{
       location.hash = '#/project/' + encodeURIComponent(projId)
                     + '/figure/' + encodeURIComponent(fig.id);
     }});
+    _attachCardMenu(card, [
+      {{ label: 'Rename...', onClick: () => _renameFigure(fig, projId) }},
+      {{ separator: true }},
+      {{ label: 'Delete figure...', danger: true,
+         onClick: () => _deleteFigure(fig, projId) }},
+    ]);
     grid.appendChild(card);
   }}
   main.appendChild(grid);
@@ -1733,6 +1936,202 @@ function _openNewFigureModal(projId, sources) {{
 }}
 
 registerRoute(/^#\/project\/([^/]+)$/, ProjectScreen);
+
+
+// --- Card actions: rename / delete projects + figures ---------------
+
+function _renameProject(p) {{
+  let nameInput;
+  const body = h('div', [
+    h('div.field-row', [
+      h('label', 'Project name'),
+      (nameInput = h('input.input', {{ value: p.name || '',
+                                          style: {{ width: '100%' }} }})),
+    ]),
+  ]);
+  openModal({{
+    title: 'Rename project',
+    body,
+    footer: [
+      {{ label: 'Cancel', onClick: (close) => close() }},
+      {{ label: 'Save', primary: true, onClick: async (close) => {{
+        const name = (nameInput.value || '').trim();
+        if (!name) {{ nameInput.focus(); return; }}
+        try {{
+          await _saveProjectPatch(p.id, {{ ...p, name }});
+          close();
+          toast('Project renamed', 'success');
+          if (typeof window.IFU_APP?.renderRoute === 'function') {{
+            window.IFU_APP.renderRoute();
+          }}
+        }} catch (e) {{
+          toast('Rename failed: ' + (e.message || 'unknown'), 'error');
+        }}
+      }} }},
+    ],
+  }});
+  setTimeout(() => {{ nameInput.focus(); nameInput.select(); }}, 50);
+}}
+
+function _editProjectDescription(p) {{
+  let descInput;
+  const body = h('div', [
+    h('div.field-row', [
+      h('label', 'Description'),
+      (descInput = h('textarea.input', {{
+        rows: 4, style: {{ width: '100%', resize: 'vertical' }},
+      }}, p.description || '')),
+    ]),
+  ]);
+  openModal({{
+    title: 'Edit description',
+    body,
+    footer: [
+      {{ label: 'Cancel', onClick: (close) => close() }},
+      {{ label: 'Save', primary: true, onClick: async (close) => {{
+        const description = (descInput.value || '').trim();
+        try {{
+          await _saveProjectPatch(p.id, {{ ...p, description }});
+          close();
+          toast('Description updated', 'success');
+          if (typeof window.IFU_APP?.renderRoute === 'function') {{
+            window.IFU_APP.renderRoute();
+          }}
+        }} catch (e) {{
+          toast('Update failed: ' + (e.message || 'unknown'), 'error');
+        }}
+      }} }},
+    ],
+  }});
+  setTimeout(() => descInput.focus(), 50);
+}}
+
+async function _saveProjectPatch(projId, patch) {{
+  const r = await fetch(API_BASE + '/api/projects/' + encodeURIComponent(projId),
+                          {{ method: 'PUT',
+                             headers: {{ 'Content-Type': 'application/json' }},
+                             body: JSON.stringify(patch) }});
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return await r.json();
+}}
+
+async function _deleteProject(p) {{
+  const figcount = (p.figure_ids || []).length;
+  const body = h('div', [
+    h('p', {{ style: {{ marginTop: 0 }} }},
+      'This will delete the project ',
+      h('strong', p.name || '(untitled)'),
+      figcount
+        ? `, which contains ${{figcount}} figure${{figcount === 1 ? '' : 's'}}.`
+        : '.'),
+    figcount
+      ? h('label', {{ style: {{ display: 'flex',
+                                    alignItems: 'center',
+                                    gap: '8px',
+                                    marginTop: '12px' }} }}, [
+          h('input', {{ type: 'checkbox', id: '_del_cascade',
+                          checked: false }}),
+          h('span', `Also delete the ${{figcount}} figure${{figcount === 1 ? '' : 's'}}`),
+        ])
+      : null,
+    h('p', {{ style: {{ color: 'var(--c-text-muted)',
+                          fontSize: '12px', marginBottom: 0 }} }},
+      'This action cannot be undone.'),
+  ]);
+  const ok = await new Promise((resolve) => {{
+    openModal({{
+      title: 'Delete project?',
+      body,
+      footer: [
+        {{ label: 'Cancel', onClick: (close) => {{ close(); resolve(null); }} }},
+        {{ label: 'Delete', danger: true, onClick: (close) => {{
+          const cb = document.getElementById('_del_cascade');
+          close();
+          resolve({{ cascade: cb ? cb.checked : false }});
+        }} }},
+      ],
+    }});
+  }});
+  if (!ok) return;
+  try {{
+    const q = ok.cascade ? '?cascade=1' : '';
+    const r = await fetch(API_BASE + '/api/projects/' + encodeURIComponent(p.id) + q,
+                            {{ method: 'DELETE' }});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    toast('Project deleted', 'success');
+    if (typeof window.IFU_APP?.renderRoute === 'function') {{
+      window.IFU_APP.renderRoute();
+    }}
+  }} catch (e) {{
+    toast('Delete failed: ' + (e.message || 'unknown'), 'error');
+  }}
+}}
+
+function _renameFigure(fig, projId) {{
+  let nameInput;
+  const body = h('div', [
+    h('div.field-row', [
+      h('label', 'Figure name'),
+      (nameInput = h('input.input', {{ value: fig.name || '',
+                                          style: {{ width: '100%' }} }})),
+    ]),
+  ]);
+  openModal({{
+    title: 'Rename figure',
+    body,
+    footer: [
+      {{ label: 'Cancel', onClick: (close) => close() }},
+      {{ label: 'Save', primary: true, onClick: async (close) => {{
+        const name = (nameInput.value || '').trim();
+        if (!name) {{ nameInput.focus(); return; }}
+        try {{
+          const r = await fetch(API_BASE + '/api/figures/'
+                                  + encodeURIComponent(fig.id),
+                                  {{ method: 'PUT',
+                                     headers: {{ 'Content-Type': 'application/json' }},
+                                     body: JSON.stringify({{ ...fig, name }}) }});
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          close();
+          toast('Figure renamed', 'success');
+          if (typeof window.IFU_APP?.renderRoute === 'function') {{
+            window.IFU_APP.renderRoute();
+          }}
+        }} catch (e) {{
+          toast('Rename failed: ' + (e.message || 'unknown'), 'error');
+        }}
+      }} }},
+    ],
+  }});
+  setTimeout(() => {{ nameInput.focus(); nameInput.select(); }}, 50);
+}}
+
+async function _deleteFigure(fig, projId) {{
+  const ok = await confirmModal({{
+    title: 'Delete figure?',
+    body: h('div', [
+      h('p', {{ style: {{ marginTop: 0 }} }},
+        'Delete ', h('strong', fig.name || '(untitled)'), '?'),
+      h('p', {{ style: {{ color: 'var(--c-text-muted)',
+                            fontSize: '12px', marginBottom: 0 }} }},
+        'This action cannot be undone.'),
+    ]),
+    confirmLabel: 'Delete',
+    danger: true,
+  }});
+  if (!ok) return;
+  try {{
+    const r = await fetch(API_BASE + '/api/figures/'
+                            + encodeURIComponent(fig.id),
+                            {{ method: 'DELETE' }});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    toast('Figure deleted', 'success');
+    if (typeof window.IFU_APP?.renderRoute === 'function') {{
+      window.IFU_APP.renderRoute();
+    }}
+  }} catch (e) {{
+    toast('Delete failed: ' + (e.message || 'unknown'), 'error');
+  }}
+}}
 // ===== end F.4 Project screen =====
 
 
