@@ -716,6 +716,371 @@ window.IFU_APP = {{ AppState, h, registerRoute, renderRoute }};
 
 
 // =====================================================================
+// G.0 -- Design system: tokens, primitives, modal + toast
+// =====================================================================
+//
+// Onshape-style product shell.  Light gray bg, white surface cards,
+// brand-teal primary actions, subtle shadows, consistent spacing.
+// All the new-shell screens (Home / Project / Settings / wizards)
+// use these tokens; the legacy editor is unchanged.
+
+const _DESIGN_CSS = `
+:root {{
+  --space-1: 4px;  --space-2: 8px;  --space-3: 12px;
+  --space-4: 16px; --space-5: 24px; --space-6: 32px;
+  --space-7: 48px;
+  --t-meta: 11px;   /* labels, badges */
+  --t-body: 13px;   /* inputs, table cells */
+  --t-strong: 14px; /* body emphasis */
+  --t-card-title: 15px;
+  --t-section: 12px;  /* uppercase section heads */
+  --t-page-title: 22px;
+  --c-accora: #00836a;
+  --c-accora-dark: #006953;
+  --c-accora-pale: #e8f3f0;
+  --c-bg: #f5f5f7;
+  --c-surface: #ffffff;
+  --c-line: #e5e5e7;
+  --c-text: #1d1d1f;
+  --c-text-muted: #6e6e73;
+  --c-danger: #c44;
+  --shadow-1: 0 1px 2px rgba(0,0,0,0.04);
+  --shadow-2: 0 2px 8px rgba(0,0,0,0.08);
+  --radius-1: 4px;
+  --radius-2: 6px;
+  --radius-3: 10px;
+}}
+.app-shell {{
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  color: var(--c-text);
+  background: var(--c-bg);
+  min-height: 100vh;
+  margin: 0; padding: 0;
+}}
+.app-topbar {{
+  background: #ffffff;
+  border-bottom: 1px solid var(--c-line);
+  height: 48px; padding: 0 var(--space-5);
+  display: flex; align-items: center; gap: var(--space-4);
+  box-shadow: var(--shadow-1);
+  position: sticky; top: 0; z-index: 10;
+}}
+.app-topbar .logo {{
+  font-weight: 600; font-size: 15px; color: var(--c-accora);
+  text-decoration: none; letter-spacing: -0.01em;
+  display: flex; align-items: center; gap: 8px;
+}}
+.app-topbar .logo::before {{
+  content: ""; width: 18px; height: 18px;
+  background: var(--c-accora);
+  border-radius: 50%;
+  /* concentric arc motif from the Accora brand */
+  box-shadow:
+    inset 0 0 0 2px #fff,
+    inset 0 0 0 4px var(--c-accora);
+}}
+.app-topbar .crumbs {{
+  display: flex; align-items: center; gap: var(--space-2);
+  font-size: var(--t-strong); color: var(--c-text-muted);
+}}
+.app-topbar .crumbs a {{
+  color: var(--c-text-muted); text-decoration: none;
+}}
+.app-topbar .crumbs a:hover {{ color: var(--c-accora); }}
+.app-topbar .crumbs .sep {{ color: var(--c-line); }}
+.app-topbar .crumbs .current {{ color: var(--c-text); font-weight: 500; }}
+.app-topbar .spacer {{ flex: 1; }}
+.app-topbar .nav-link {{
+  color: var(--c-text-muted); text-decoration: none;
+  font-size: var(--t-strong); padding: 4px 8px;
+  border-radius: var(--radius-1);
+}}
+.app-topbar .nav-link:hover {{ background: var(--c-bg); color: var(--c-text); }}
+
+.app-main {{ max-width: 1200px; margin: 0 auto;
+  padding: var(--space-6) var(--space-5); }}
+
+.section-title {{
+  font-size: var(--t-section); color: var(--c-text-muted);
+  text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600;
+  margin: var(--space-6) 0 var(--space-3) 0;
+}}
+.section-title:first-child {{ margin-top: 0; }}
+
+/* Card primitives */
+.card-grid {{
+  display: grid; gap: var(--space-4);
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+}}
+.card {{
+  background: var(--c-surface); border: 1px solid var(--c-line);
+  border-radius: var(--radius-2); padding: var(--space-4);
+  cursor: pointer; transition: border-color 0.12s, box-shadow 0.12s, transform 0.12s;
+  display: flex; flex-direction: column; gap: var(--space-2);
+  min-height: 96px;
+}}
+.card:hover {{
+  border-color: var(--c-accora);
+  box-shadow: var(--shadow-2);
+  transform: translateY(-1px);
+}}
+.card .card-title {{
+  font-size: var(--t-card-title); font-weight: 600;
+  color: var(--c-text); line-height: 1.25;
+}}
+.card .card-meta {{
+  font-size: var(--t-meta); color: var(--c-text-muted);
+  display: flex; gap: var(--space-2); flex-wrap: wrap;
+}}
+.card .badge {{
+  display: inline-block; font-size: var(--t-meta);
+  padding: 1px 6px; border-radius: 10px;
+  background: var(--c-bg); color: var(--c-text-muted);
+}}
+.card .badge.ok {{ background: var(--c-accora-pale); color: var(--c-accora); }}
+.card .badge.warn {{ background: #fff3e0; color: #c70; }}
+.card.placeholder {{
+  background: transparent; border-style: dashed;
+  align-items: center; justify-content: center;
+  color: var(--c-text-muted); cursor: pointer;
+  font-size: var(--t-strong);
+}}
+.card.placeholder:hover {{
+  background: var(--c-surface); border-style: solid;
+  color: var(--c-accora);
+}}
+
+/* Buttons */
+.btn {{
+  display: inline-flex; align-items: center; gap: var(--space-2);
+  border-radius: var(--radius-1); border: 1px solid var(--c-line);
+  background: var(--c-surface); color: var(--c-text);
+  font-size: var(--t-strong); font-family: inherit;
+  padding: 6px 12px; cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+}}
+.btn:hover {{ background: var(--c-bg); border-color: var(--c-text-muted); }}
+.btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+.btn.primary {{
+  background: var(--c-accora); color: #fff; border-color: var(--c-accora);
+}}
+.btn.primary:hover {{
+  background: var(--c-accora-dark); border-color: var(--c-accora-dark);
+}}
+.btn.danger {{
+  color: var(--c-danger); border-color: #e5b5b5;
+}}
+.btn.danger:hover {{ background: #fdf0f0; }}
+.btn.ghost {{ border: none; background: transparent; }}
+.btn.ghost:hover {{ background: var(--c-bg); }}
+
+/* Inputs */
+.input, .select {{
+  font-family: inherit; font-size: var(--t-body);
+  padding: 6px 10px; border-radius: var(--radius-1);
+  border: 1px solid var(--c-line); background: #fff;
+  color: var(--c-text);
+}}
+.input:focus, .select:focus {{
+  outline: none; border-color: var(--c-accora);
+  box-shadow: 0 0 0 3px var(--c-accora-pale);
+}}
+.field-row {{
+  display: grid; grid-template-columns: 200px 1fr;
+  gap: var(--space-4); align-items: center;
+  margin-bottom: var(--space-3);
+}}
+.field-row label {{
+  font-size: var(--t-strong); color: var(--c-text-muted);
+}}
+
+/* Empty state */
+.empty {{
+  color: var(--c-text-muted); font-style: italic;
+  padding: var(--space-4); text-align: center;
+}}
+
+/* Modal */
+.modal-backdrop {{
+  position: fixed; inset: 0;
+  background: rgba(20, 22, 28, 0.45);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 1000;
+  animation: fade-in 0.15s ease-out;
+}}
+@keyframes fade-in {{ from {{ opacity: 0; }} to {{ opacity: 1; }} }}
+.modal {{
+  background: #fff; border-radius: var(--radius-3);
+  box-shadow: 0 12px 48px rgba(0,0,0,0.25);
+  width: 520px; max-width: 90vw; max-height: 86vh;
+  display: flex; flex-direction: column;
+  animation: pop-in 0.18s ease-out;
+}}
+@keyframes pop-in {{
+  from {{ opacity: 0; transform: scale(0.96); }}
+  to {{ opacity: 1; transform: scale(1); }}
+}}
+.modal-header {{
+  padding: var(--space-4) var(--space-5);
+  border-bottom: 1px solid var(--c-line);
+  display: flex; align-items: center;
+}}
+.modal-header h2 {{
+  font-size: 17px; margin: 0; font-weight: 600;
+  color: var(--c-text); flex: 1;
+}}
+.modal-close {{
+  border: none; background: transparent; font-size: 20px;
+  color: var(--c-text-muted); cursor: pointer; padding: 0;
+  width: 28px; height: 28px; border-radius: 50%;
+}}
+.modal-close:hover {{ background: var(--c-bg); color: var(--c-text); }}
+.modal-body {{
+  padding: var(--space-5);
+  overflow-y: auto; flex: 1;
+  font-size: var(--t-body); color: var(--c-text);
+  line-height: 1.5;
+}}
+.modal-footer {{
+  padding: var(--space-4) var(--space-5);
+  border-top: 1px solid var(--c-line);
+  display: flex; gap: var(--space-2); justify-content: flex-end;
+}}
+
+/* Toast */
+.toast-host {{
+  position: fixed; bottom: var(--space-5); right: var(--space-5);
+  display: flex; flex-direction: column; gap: var(--space-2);
+  z-index: 2000; pointer-events: none;
+}}
+.toast {{
+  background: #232325; color: #fff; padding: 10px 14px;
+  border-radius: var(--radius-2); font-size: var(--t-body);
+  box-shadow: 0 6px 20px rgba(0,0,0,0.18);
+  pointer-events: auto; max-width: 360px;
+  animation: slide-in 0.18s ease-out;
+}}
+.toast.success {{ background: var(--c-accora-dark); }}
+.toast.error {{ background: #b54040; }}
+@keyframes slide-in {{
+  from {{ opacity: 0; transform: translateY(8px); }}
+  to {{ opacity: 1; transform: translateY(0); }}
+}}
+
+/* Spinner */
+.spinner {{
+  display: inline-block;
+  width: 16px; height: 16px; vertical-align: middle;
+  border: 2px solid var(--c-line); border-top-color: var(--c-accora);
+  border-radius: 50%;
+  animation: spin 0.9s linear infinite;
+}}
+@keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+`;
+
+function _ensureDesignStyles() {{
+  if (document.getElementById('ifu-design-tokens')) return;
+  const s = document.createElement('style');
+  s.id = 'ifu-design-tokens';
+  s.textContent = _DESIGN_CSS;
+  document.head.appendChild(s);
+}}
+
+// Top bar: logo + breadcrumb + (optional) right-side nav items.
+function _topBar({{ crumbs, rightLinks }}) {{
+  const bar = h('div.app-topbar');
+  bar.appendChild(h('a.logo', {{ href: '#/' }}, 'Accora IFU'));
+  if (crumbs && crumbs.length) {{
+    const crumbBox = h('div.crumbs');
+    crumbs.forEach((c, i) => {{
+      if (i > 0) crumbBox.appendChild(h('span.sep', '/'));
+      if (c.href) crumbBox.appendChild(h('a', {{ href: c.href }}, c.label));
+      else crumbBox.appendChild(h('span.current', c.label));
+    }});
+    bar.appendChild(crumbBox);
+  }}
+  bar.appendChild(h('div.spacer'));
+  for (const link of (rightLinks || [])) {{
+    bar.appendChild(h('a.nav-link', {{ href: link.href }}, link.label));
+  }}
+  return bar;
+}}
+
+// Modal component: open(title, body, footerButtons) -> close()
+// body can be a string or a DOM node.  footerButtons is an array of
+// {{label, primary, danger, onClick}} -- onClick gets the close fn.
+function openModal({{ title, body, footer, width }}) {{
+  _ensureDesignStyles();
+  const backdrop = h('div.modal-backdrop');
+  const modal = h('div.modal');
+  if (width) modal.style.width = (typeof width === 'number' ? width + 'px' : width);
+
+  const closeBtn = h('button.modal-close', {{ title: 'Close' }}, '×');
+  const header = h('div.modal-header', [
+    h('h2', title || ''),
+    closeBtn,
+  ]);
+
+  const bodyEl = h('div.modal-body');
+  if (typeof body === 'string') bodyEl.appendChild(document.createTextNode(body));
+  else if (body instanceof Node) bodyEl.appendChild(body);
+  else if (typeof body === 'function') body(bodyEl, _close);   // builder fn
+
+  const footerEl = h('div.modal-footer');
+  if (footer && footer.length) {{
+    for (const b of footer) {{
+      const cls = 'btn ' + (b.primary ? 'primary' : (b.danger ? 'danger' : ''));
+      const btn = h('button', {{
+        class: cls.trim(),
+        onClick: () => b.onClick && b.onClick(_close),
+      }}, b.label);
+      footerEl.appendChild(btn);
+    }}
+  }} else {{
+    footerEl.appendChild(h('button.btn', {{ onClick: () => _close() }}, 'Close'));
+  }}
+
+  function _close() {{ backdrop.remove(); document.removeEventListener('keydown', _esc); }}
+  function _esc(e) {{ if (e.key === 'Escape') _close(); }}
+  closeBtn.addEventListener('click', _close);
+  backdrop.addEventListener('click', (e) => {{
+    if (e.target === backdrop) _close();
+  }});
+  document.addEventListener('keydown', _esc);
+
+  modal.appendChild(header);
+  modal.appendChild(bodyEl);
+  modal.appendChild(footerEl);
+  backdrop.appendChild(modal);
+  document.body.appendChild(backdrop);
+  return {{ close: _close, body: bodyEl }};
+}}
+
+// Toast: short status message in the bottom-right.
+function toast(message, kind /* 'success' | 'error' | undefined */) {{
+  _ensureDesignStyles();
+  let host = document.querySelector('.toast-host');
+  if (!host) {{
+    host = h('div.toast-host');
+    document.body.appendChild(host);
+  }}
+  const cls = 'toast' + (kind ? ' ' + kind : '');
+  const t = h('div', {{ class: cls }}, message);
+  host.appendChild(t);
+  setTimeout(() => {{
+    t.style.transition = 'opacity 0.25s';
+    t.style.opacity = '0';
+    setTimeout(() => t.remove(), 280);
+  }}, 3500);
+}}
+
+// Expose so screens can use them
+window.IFU_UI = {{ openModal, toast, topBar: _topBar }};
+// ===== end G.0 design system =====
+
+
+// =====================================================================
 // F.3 -- Home screen
 // =====================================================================
 //
@@ -776,10 +1141,21 @@ function _ensureHomeStyles() {{
 }}
 
 async function HomeScreen(container) {{
-  _ensureHomeStyles();
-  container.className = 'home-screen';
+  _ensureDesignStyles();
+  container.className = 'app-shell';
 
-  // Fetch in parallel
+  // Top bar
+  container.appendChild(_topBar({{
+    crumbs: [{{ label: 'Home' }}],
+    rightLinks: [
+      {{ label: 'Legacy editor', href: '' }},
+      {{ label: 'Settings', href: '#/settings' }},
+    ],
+  }}));
+
+  const main = h('div.app-main');
+  container.appendChild(main);
+
   let projects = [], figures = [];
   try {{
     const [pr, fr] = await Promise.all([
@@ -790,77 +1166,112 @@ async function HomeScreen(container) {{
     if (fr.ok) figures = (await fr.json()).figures || [];
   }} catch (_e) {{}}
 
-  const recents = figures.slice(0, 5);
-
-  // Top bar
-  container.appendChild(h('div.topbar', [
-    h('h1', 'IFU Artwork'),
-    h('a', {{ href: '', title: 'Legacy single-page editor' }}, 'Open legacy editor'),
-    h('a', {{ href: '#/settings' }}, '⚙ Settings'),
-  ]));
-
-  // Projects section
-  container.appendChild(h('h2', `Projects (${{projects.length}})`));
-  const grid = h('div.grid');
-  // New-project card first
+  // Projects
+  main.appendChild(h('div.section-title', `Projects (${{projects.length}})`));
+  const grid = h('div.card-grid');
   const newCard = h('div.card.placeholder', '+ new project');
-  newCard.addEventListener('click', async () => {{
-    const name = prompt('Project name:');
-    if (!name) return;
-    const r = await fetch(API_BASE + '/api/projects', {{
-      method: 'POST',
-      headers: {{ 'Content-Type': 'application/json' }},
-      body: JSON.stringify({{ name }}),
-    }});
-    if (!r.ok) {{ alert('Create failed: ' + r.status); return; }}
-    const p = await r.json();
-    location.hash = '#/project/' + encodeURIComponent(p.id);
-  }});
+  newCard.addEventListener('click', () => _openNewProjectModal());
   grid.appendChild(newCard);
 
   for (const p of projects) {{
-    const card = h('div.card', [
-      h('div.name', p.name),
-      h('div.meta', `${{(p.figure_ids || []).length}} figure(s) - `
-                   + `updated ${{(p.updated_at || '').slice(0, 10)}}`),
+    const card = h('div.card');
+    card.appendChild(h('div.card-title', p.name));
+    const figcount = (p.figure_ids || []).length;
+    const meta = h('div.card-meta', [
+      h('span', `${{figcount}} figure${{figcount === 1 ? '' : 's'}}`),
+      h('span', '·'),
+      h('span', (p.updated_at || '').slice(0, 10)),
     ]);
+    card.appendChild(meta);
     card.addEventListener('click', () => {{
       location.hash = '#/project/' + encodeURIComponent(p.id);
     }});
     grid.appendChild(card);
   }}
-  container.appendChild(grid);
+  main.appendChild(grid);
 
   // Recents
-  container.appendChild(h('h2', 'Recent figures'));
-  if (!recents.length) {{
-    container.appendChild(h('div.empty', 'No figures yet.'));
-  }} else {{
-    const ul = h('ul.recents');
-    for (const f of recents) {{
-      const li = h('li', [
-        h('span.figname', f.name || '(untitled)'),
-        h('span.figmeta',
-          `${{f.source_id || '?'}} - ${{(f.updated_at || '').slice(0, 10)}}`),
-      ]);
-      li.addEventListener('click', () => {{
-        // Until F.4/F.5 the editor route doesn't exist yet -- fall
-        // through to the legacy editor at the source.  Set the file
-        // dropdown for the next page load.
+  if (figures.length) {{
+    main.appendChild(h('div.section-title', 'Recent figures'));
+    const recentGrid = h('div.card-grid');
+    for (const f of figures.slice(0, 6)) {{
+      const card = h('div.card', {{ style: {{ minHeight: '72px' }} }});
+      card.appendChild(h('div.card-title', f.name || '(untitled)'));
+      card.appendChild(h('div.card-meta', [
+        h('span', f.source_id || '?'),
+        h('span', '·'),
+        h('span', (f.updated_at || '').slice(0, 10)),
+      ]));
+      card.addEventListener('click', () => {{
         if (f.project_id) {{
-          location.hash = '#/project/' + encodeURIComponent(f.project_id);
+          location.hash = '#/project/' + encodeURIComponent(f.project_id)
+                        + '/figure/' + encodeURIComponent(f.id);
         }} else {{
-          // Orphan figure: drop back into legacy editor
           location.hash = '';
         }}
       }});
-      ul.appendChild(li);
+      recentGrid.appendChild(card);
     }}
-    container.appendChild(ul);
+    main.appendChild(recentGrid);
   }}
 }}
 
 registerRoute(/^#\/$/, HomeScreen);
+
+// New-project wizard.  G.2 upgrades this with Onshape URL ingestion;
+// for now it collects a name + optional description and creates an
+// empty project.
+function _openNewProjectModal() {{
+  let nameInput, descInput;
+  const body = h('div', [
+    h('div.field-row', [
+      h('label', 'Project name'),
+      (nameInput = h('input.input', {{
+        placeholder: 'e.g. Presto IFU R03',
+        style: {{ width: '100%' }},
+      }})),
+    ]),
+    h('div.field-row', [
+      h('label', 'Description (optional)'),
+      (descInput = h('input.input', {{
+        placeholder: 'short description shown on the home card',
+        style: {{ width: '100%' }},
+      }})),
+    ]),
+    h('div', {{ style: {{ marginTop: '16px', fontSize: '12px',
+                            color: 'var(--c-text-muted)' }} }},
+      'After creation you can attach figures from any configured source. ' +
+      'Onshape document import is coming in the next iteration.'),
+  ]);
+  const modal = openModal({{
+    title: 'New project',
+    body,
+    footer: [
+      {{ label: 'Cancel', onClick: (close) => close() }},
+      {{ label: 'Create', primary: true, onClick: async (close) => {{
+        const name = (nameInput.value || '').trim();
+        if (!name) {{ nameInput.focus(); return; }}
+        const description = (descInput.value || '').trim();
+        try {{
+          const r = await fetch(API_BASE + '/api/projects', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ name, description }}),
+          }});
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          const p = await r.json();
+          close();
+          toast('Project created', 'success');
+          location.hash = '#/project/' + encodeURIComponent(p.id);
+        }} catch (e) {{
+          toast('Create failed: ' + (e.message || 'unknown'), 'error');
+        }}
+      }} }},
+    ],
+  }});
+  setTimeout(() => nameInput.focus(), 50);
+  return modal;
+}}
 // ===== end F.3 Home screen =====
 
 
@@ -874,11 +1285,10 @@ registerRoute(/^#\/$/, HomeScreen);
 // endpoint).
 
 async function ProjectScreen(container, params) {{
-  _ensureHomeStyles();    // reuse the same CSS
-  container.className = 'home-screen';
+  _ensureDesignStyles();
+  container.className = 'app-shell';
   const projId = params[0];
 
-  // Fetch project + figures + sources in parallel
   let proj = null, figs = [], sources = [];
   try {{
     const [pr, fr, sr] = await Promise.all([
@@ -892,105 +1302,159 @@ async function ProjectScreen(container, params) {{
   }} catch (_e) {{}}
 
   if (!proj) {{
-    container.appendChild(h('div', [
-      h('h1', 'Project not found'),
-      h('p', [h('a', {{ href: '#/' }}, '← back to home')]),
-    ]));
+    container.appendChild(_topBar({{
+      crumbs: [{{ label: 'Home', href: '#/' }}, {{ label: 'Project not found' }}],
+    }}));
+    const main = h('div.app-main');
+    main.appendChild(h('p', {{ style: {{ color: 'var(--c-text-muted)' }} }},
+                        'This project could not be loaded.'));
+    main.appendChild(h('a.btn', {{ href: '#/' }}, '← Back to home'));
+    container.appendChild(main);
     return;
   }}
 
   AppState.currentProjectId = projId;
 
-  // Breadcrumb + actions
-  container.appendChild(h('div.topbar', [
-    h('h1', [
-      h('a', {{ href: '#/', style: {{ color: '#71717a', textDecoration: 'none' }} }},
-        'Home'),
-      ' / ',
-      proj.name,
-    ]),
-    h('a', {{ href: '#/settings' }}, '⚙ Settings'),
-  ]));
+  container.appendChild(_topBar({{
+    crumbs: [
+      {{ label: 'Home', href: '#/' }},
+      {{ label: proj.name }},
+    ],
+    rightLinks: [
+      {{ label: 'Settings', href: '#/settings' }},
+    ],
+  }}));
+  const main = h('div.app-main');
+  container.appendChild(main);
+
   if (proj.description) {{
-    container.appendChild(h('p', {{ style: {{ color: '#71717a', margin: '0 0 16px 0' }} }},
-                             proj.description));
+    main.appendChild(h('p', {{ style: {{ color: 'var(--c-text-muted)',
+                                            margin: '0 0 24px 0' }} }},
+                        proj.description));
   }}
 
-  // Source binding bar: which sources do figures in this project use?
-  // (Distinct source_ids across the project's figures.)
+  // Source status bar
   const usedSourceIds = [...new Set(figs.map(f => f.source_id).filter(Boolean))];
   if (usedSourceIds.length) {{
-    const bar = h('div', {{ style: {{ marginBottom: '24px',
-                                        padding: '12px', background: '#f4f4f5',
-                                        borderRadius: '6px', fontSize: '13px' }} }});
-    bar.appendChild(h('strong', 'Sources in this project: '));
-    bar.appendChild(document.createTextNode(usedSourceIds.join(', ')));
-    bar.appendChild(h('button', {{
-      style: {{ marginLeft: '12px', padding: '4px 10px',
-                 fontSize: '12px', cursor: 'pointer' }},
-      onClick: async () => {{
-        let ok = 0, fail = 0;
-        for (const sid of usedSourceIds) {{
-          try {{
-            const r = await fetch(API_BASE + '/api/sources/'
-                                     + encodeURIComponent(sid)
-                                     + '/versions/refresh', {{ method: 'POST' }});
-            if (r.ok) ok++; else fail++;
-          }} catch (_e) {{ fail++; }}
-        }}
-        alert(`Refreshed ${{ok}} source(s); ${{fail}} failed.`);
-      }},
-    }}, '↻ refresh Onshape Versions'));
-    container.appendChild(bar);
+    const bar = h('div', {{ style: {{
+        background: 'var(--c-surface)', border: '1px solid var(--c-line)',
+        borderRadius: 'var(--radius-2)', padding: '12px 16px',
+        marginBottom: '24px',
+        display: 'flex', alignItems: 'center', gap: '12px',
+        fontSize: 'var(--t-body)',
+      }} }});
+    bar.appendChild(h('span', {{ style: {{ color: 'var(--c-text-muted)' }} }}, 'Sources:'));
+    for (const sid of usedSourceIds) {{
+      const src = sources.find(s => s.id === sid);
+      bar.appendChild(h('span', {{ style: {{ fontWeight: '500' }} }},
+                        src?.label || sid));
+      bar.appendChild(h('span.badge.ok', sid));
+    }}
+    bar.appendChild(h('div', {{ style: {{ flex: '1' }} }}));
+    const refreshBtn = h('button.btn', '↻ Refresh Onshape Versions');
+    refreshBtn.addEventListener('click', async () => {{
+      refreshBtn.disabled = true;
+      refreshBtn.textContent = 'Refreshing...';
+      let ok = 0, fail = 0;
+      for (const sid of usedSourceIds) {{
+        try {{
+          const r = await fetch(API_BASE + '/api/sources/'
+                                   + encodeURIComponent(sid)
+                                   + '/versions/refresh', {{ method: 'POST' }});
+          if (r.ok) ok++; else fail++;
+        }} catch (_e) {{ fail++; }}
+      }}
+      toast(`Refreshed ${{ok}} source(s)` + (fail ? `, ${{fail}} failed` : ''),
+            fail ? 'error' : 'success');
+      refreshBtn.disabled = false;
+      refreshBtn.textContent = '↻ Refresh Onshape Versions';
+    }});
+    bar.appendChild(refreshBtn);
+    main.appendChild(bar);
   }}
 
-  // Figure grid + new
-  container.appendChild(h('h2', `Figures (${{figs.length}})`));
-  const grid = h('div.grid');
+  main.appendChild(h('div.section-title', `Figures (${{figs.length}})`));
+  const grid = h('div.card-grid');
   const newCard = h('div.card.placeholder', '+ new figure');
-  newCard.addEventListener('click', async () => {{
-    const name = prompt('Figure name:');
-    if (!name) return;
-    // Default source: first one in SOURCES (legacy CATALOGUE-based)
-    let sourceId = sources[0]?.id;
-    if (sources.length > 1) {{
-      const sourceOptions = sources.map((s, i) => `${{i + 1}}. ${{s.id}} (${{s.label}})`).join('\\n');
-      const pick = prompt(
-        'Source?\\n\\n' + sourceOptions + '\\n\\nEnter number:');
-      if (!pick) return;
-      const idx = parseInt(pick) - 1;
-      sourceId = sources[idx]?.id;
-      if (!sourceId) return;
-    }}
-    const r = await fetch(API_BASE + '/api/figures', {{
-      method: 'POST',
-      headers: {{ 'Content-Type': 'application/json' }},
-      body: JSON.stringify({{
-        name, source_id: sourceId, project_id: projId,
-      }}),
-    }});
-    if (!r.ok) {{ alert('Create failed: ' + r.status); return; }}
-    // Re-render this screen (refreshes the figure grid)
-    renderRoute();
-  }});
+  newCard.addEventListener('click', () => _openNewFigureModal(projId, sources));
   grid.appendChild(newCard);
 
   for (const fig of figs) {{
     const card = h('div.card');
-    card.appendChild(h('div.name', fig.name || '(untitled)'));
-    const metaBits = [];
-    metaBits.push(fig.source_id || '?');
-    if (fig.bound_revision) metaBits.push(fig.bound_revision.name || '?rev');
-    metaBits.push((fig.updated_at || '').slice(0, 10));
-    card.appendChild(h('div.meta', metaBits.join(' - ')));
+    card.appendChild(h('div.card-title', fig.name || '(untitled)'));
+    const meta = h('div.card-meta', [
+      h('span', fig.source_id || '?'),
+      h('span', '·'),
+      h('span', (fig.updated_at || '').slice(0, 10)),
+    ]);
+    if (fig.bound_revision) {{
+      meta.appendChild(h('span.badge.ok',
+                          fig.bound_revision.name || '?rev'));
+    }}
+    card.appendChild(meta);
     card.addEventListener('click', () => {{
-      // F.5: will route into #/project/X/figure/Y editor.
-      // For now, drop into legacy editor.
-      location.hash = '';
+      location.hash = '#/project/' + encodeURIComponent(projId)
+                    + '/figure/' + encodeURIComponent(fig.id);
     }});
     grid.appendChild(card);
   }}
-  container.appendChild(grid);
+  main.appendChild(grid);
+}}
+
+function _openNewFigureModal(projId, sources) {{
+  let nameInput, sourceSelect;
+  const body = h('div', [
+    h('div.field-row', [
+      h('label', 'Figure name'),
+      (nameInput = h('input.input', {{ placeholder: 'e.g. Side rail close-up',
+                                         style: {{ width: '100%' }} }})),
+    ]),
+    h('div.field-row', [
+      h('label', 'Source'),
+      (sourceSelect = h('select.select', {{ style: {{ width: '100%' }} }})),
+    ]),
+    h('div', {{ style: {{ marginTop: '12px', fontSize: '12px',
+                            color: 'var(--c-text-muted)' }} }},
+      "The figure will open in the editor; pose your camera and apply " +
+      "styling there.  You can always re-bind to a different source " +
+      "revision later."),
+  ]);
+  // Populate source dropdown
+  for (const s of (sources || [])) {{
+    const opt = document.createElement('option');
+    opt.value = s.id; opt.textContent = `${{s.label}}  (${{s.id}})`;
+    sourceSelect.appendChild(opt);
+  }}
+  openModal({{
+    title: 'New figure',
+    body,
+    footer: [
+      {{ label: 'Cancel', onClick: (close) => close() }},
+      {{ label: 'Create + open editor', primary: true, onClick: async (close) => {{
+        const name = (nameInput.value || '').trim();
+        if (!name) {{ nameInput.focus(); return; }}
+        const sourceId = sourceSelect.value;
+        if (!sourceId) return;
+        try {{
+          const r = await fetch(API_BASE + '/api/figures', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ name, source_id: sourceId,
+                                      project_id: projId }}),
+          }});
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          const f = await r.json();
+          close();
+          toast('Figure created', 'success');
+          location.hash = '#/project/' + encodeURIComponent(projId)
+                        + '/figure/' + encodeURIComponent(f.id);
+        }} catch (e) {{
+          toast('Create failed: ' + (e.message || 'unknown'), 'error');
+        }}
+      }} }},
+    ],
+  }});
+  setTimeout(() => nameInput.focus(), 50);
 }}
 
 registerRoute(/^#\/project\/([^/]+)$/, ProjectScreen);
@@ -1006,17 +1470,17 @@ registerRoute(/^#\/project\/([^/]+)$/, ProjectScreen);
 // every change via PATCH.  Single-user, so no debounce needed.
 
 async function SettingsScreen(container) {{
-  _ensureHomeStyles();
-  container.className = 'home-screen';
+  _ensureDesignStyles();
+  container.className = 'app-shell';
 
-  // Header
-  container.appendChild(h('div.topbar', [
-    h('h1', [
-      h('a', {{ href: '#/', style: {{ color: '#71717a', textDecoration: 'none' }} }},
-        'Home'),
-      ' / Settings',
-    ]),
-  ]));
+  container.appendChild(_topBar({{
+    crumbs: [{{ label: 'Home', href: '#/' }}, {{ label: 'Settings' }}],
+  }}));
+  const mainEl = h('div.app-main');
+  container.appendChild(mainEl);
+  const container_orig = container;
+  // Redirect subsequent appendChild calls in this function to mainEl
+  container = mainEl;
 
   // Load current settings + source list
   let settings = {{}};
@@ -1057,7 +1521,7 @@ async function SettingsScreen(container) {{
   }}
 
   // ---- General ----
-  container.appendChild(h('h2', 'General'));
+  container.appendChild(h('div.section-title', 'General'));
 
   const detailSelect = h('select');
   for (const opt of ['coarse', 'normal', 'fine']) {{
@@ -1099,7 +1563,7 @@ async function SettingsScreen(container) {{
   container.appendChild(fieldRow('Default fill alpha (0–1)', fillAlpha));
 
   // ---- Sources (read-only for now; editing in F.5+) ----
-  container.appendChild(h('h2', 'Sources'));
+  container.appendChild(h('div.section-title', 'Sources'));
   const srcList = h('div', {{ style: {{ marginBottom: '24px' }} }});
   if (!sources.length) {{
     srcList.appendChild(h('div.empty', 'No sources configured.'));
@@ -1119,7 +1583,7 @@ async function SettingsScreen(container) {{
   container.appendChild(srcList);
 
   // ---- Storage ----
-  container.appendChild(h('h2', 'Storage'));
+  container.appendChild(h('div.section-title', 'Storage'));
   container.appendChild(h('div', {{ style: {{ fontSize: '13px',
                                                 marginBottom: '24px' }} }},
     [
@@ -1128,7 +1592,7 @@ async function SettingsScreen(container) {{
     ]));
 
   // ---- Reset ----
-  container.appendChild(h('h2', 'Danger zone'));
+  container.appendChild(h('div.section-title', 'Danger zone'));
   const resetBtn = h('button',
     {{ style: {{ padding: '8px 12px', fontSize: '13px',
                   border: '1px solid #c44', color: '#c44',

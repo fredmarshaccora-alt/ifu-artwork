@@ -20,12 +20,12 @@ def test_project_screen_loads_and_shows_breadcrumb(page):
         page.evaluate(f"location.hash = '#/project/{pid}'")
         page.wait_for_timeout(500)
         info = page.evaluate("""() => {
-            const h1 = document.querySelector('.home-screen h1');
+            const h1 = document.querySelector('.app-topbar .crumbs');
             return {
                 text: h1 ? h1.textContent : null,
-                has_home_link: !!document.querySelector('.home-screen h1 a[href="#/"]'),
+                has_home_link: !!document.querySelector('.app-topbar .crumbs a[href="#/"]'),
                 has_new_figure: !!Array.from(
-                    document.querySelectorAll('.home-screen .card.placeholder'))
+                    document.querySelectorAll('.card.placeholder'))
                   .find(c => c.textContent.includes('new figure')),
             };
         }""")
@@ -74,7 +74,7 @@ def test_project_screen_lists_attached_figures(page):
         page.evaluate(f"location.hash = '#/project/{pid}'")
         page.wait_for_timeout(500)
         names = page.evaluate("""() => Array.from(
-            document.querySelectorAll('.home-screen .card .name'))
+            document.querySelectorAll('.card .card-title'))
             .map(n => n.textContent)""")
         assert "F4-figs-content" in names, \
             f"figure not shown in project: {names}"

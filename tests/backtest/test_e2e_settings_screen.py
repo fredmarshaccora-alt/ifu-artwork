@@ -6,9 +6,9 @@ def test_settings_screen_loads(page):
     page.evaluate("location.hash = '#/settings'")
     page.wait_for_timeout(400)
     info = page.evaluate("""() => ({
-        h1: document.querySelector('.home-screen h1')?.textContent,
-        has_detail: !!document.querySelector('.home-screen select'),
-        h2_count: document.querySelectorAll('.home-screen h2').length,
+        h1: document.querySelector('.app-topbar .crumbs .current')?.textContent,
+        has_detail: !!document.querySelector('.app-main select'),
+        h2_count: document.querySelectorAll('.section-title').length,
     })""")
     assert info["h1"] and "Settings" in info["h1"]
     assert info["has_detail"], "no detail-level select"
@@ -26,7 +26,7 @@ def test_changing_default_detail_persists(page):
     page.evaluate("window.IFU_APP.renderRoute()")
     page.wait_for_timeout(400)
     page.evaluate("""() => {
-        const sel = document.querySelector('.home-screen select');
+        const sel = document.querySelector('.app-main select');
         sel.value = 'fine';
         sel.dispatchEvent(new Event('change'));
     }""")

@@ -12,11 +12,11 @@ def test_navigating_to_root_mounts_home(page):
     page.evaluate("location.hash = '#/'")
     page.wait_for_timeout(500)
     info = page.evaluate("""() => ({
-        h1: document.querySelector('.home-screen h1')?.textContent,
-        has_grid: !!document.querySelector('.home-screen .grid'),
-        has_new_card: !!document.querySelector('.home-screen .card.placeholder'),
+        h1: document.querySelector('.app-topbar .crumbs .current')?.textContent,
+        has_grid: !!document.querySelector('.card-grid'),
+        has_new_card: !!document.querySelector('.card.placeholder'),
     })""")
-    assert info["h1"] == "IFU Artwork", f"home H1 wrong: {info['h1']!r}"
+    assert info["h1"] == "Home", f"home crumb wrong: {info['h1']!r}"
     assert info["has_grid"], "no project grid"
     assert info["has_new_card"], "no new-project placeholder card"
 
@@ -44,7 +44,7 @@ def test_home_lists_projects_from_api(page):
     page.evaluate("window.IFU_APP.renderRoute()")
     page.wait_for_timeout(500)
     names = page.evaluate("""() => Array.from(
-        document.querySelectorAll('.home-screen .card .name'))
+        document.querySelectorAll('.card .card-title'))
         .map(n => n.textContent)""")
     assert "F3-test-proj" in names, \
         f"new project not shown on home: {names}"
