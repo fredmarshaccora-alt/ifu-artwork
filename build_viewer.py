@@ -2989,6 +2989,7 @@ setLayout('2d');
 import * as THREE from 'three';
 import {{ OrbitControls }} from 'three/addons/controls/OrbitControls.js';
 import {{ GLTFLoader }} from 'three/addons/loaders/GLTFLoader.js';
+import {{ ViewHelper }} from 'three/addons/helpers/ViewHelper.js';
 
 const canvas = document.getElementById('webgl-canvas');
 const wrap3d = document.getElementById('webgl-wrap');
@@ -3002,7 +3003,10 @@ const is3DVisible = () => {{
   return cl.contains('layout-split') || cl.contains('layout-3d');
 }};
 
-let scene, camera, renderer, controls;
+let scene, camera, renderer, controls, viewHelper;
+// ViewHelper rendering also needs the main renderer's auto-clear off,
+// then we manually clear before main + after main draw the gizmo.
+let _viewHelperClock = null;
 let loaded = new Map();      // file_id -> THREE.Group
 let active = null;           // currently visible group
 let partByName = new Map();  // "part_NNN" -> THREE.Object3D
@@ -3063,6 +3067,25 @@ function init() {{
   controls.enableDamping = true;
   controls.dampingFactor = 0.08;
   controls.update();
+
+  // ViewHelper (orientation gizmo): the floating axis-cube in the corner.
+  // Click a face -> camera animates to that direction.  Renders as its
+  // own overlay viewport in the bottom-right of the canvas.
+  viewHelper = new ViewHelper(camera, renderer.domElement);
+  viewHelper.controls = controls;
+  viewHelper.controls.center = controls.target;
+  _viewHelperClock = new THREE.Clock();
+  // Click handling: forward canvas clicks to the helper when they land
+  // in its viewport region.
+  canvas.addEventListener('pointerdown', (e) => {{
+    if (!viewHelper) return;
+    const rect = canvas.getBoundingClientRect();
+    if (viewHelper.handleClick(e)) {{
+      // The helper consumed this click for navigation; cancel further
+      // processing (so we don't accidentally raycast for selection).
+      e.stopPropagation();
+    }}
+  }}, true);
 
   window.addEventListener('resize', resize);
 
@@ -3161,14 +3184,25 @@ function resize() {{
 function animate() {{
   requestAnimationFrame(animate);
   if (!controls || !is3DVisible()) return;
+  // Pump the ViewHelper's animation (face-snap interpolation) every
+  // frame even if the user hasn't touched OrbitControls.
+  if (viewHelper && viewHelper.animating) {{
+    const dt = _viewHelperClock ? _viewHelperClock.getDelta() : 0.016;
+    viewHelper.update(dt);
+  }}
   controls.update();
-  // Pane width can change when entering Split; keep the renderer in sync.
   const r = canvas.getBoundingClientRect();
   if (renderer.domElement.width !== Math.round(r.width * (window.devicePixelRatio || 1)) ||
       renderer.domElement.height !== Math.round(r.height * (window.devicePixelRatio || 1))) {{
     resize();
   }}
+  // Main scene, then overlay the orientation gizmo on top.
+  renderer.autoClear = true;
   renderer.render(scene, camera);
+  if (viewHelper) {{
+    renderer.autoClear = false;
+    viewHelper.render(renderer);
+  }}
   updateReadout();
 }}
 
