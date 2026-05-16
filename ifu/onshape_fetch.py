@@ -326,6 +326,56 @@ def poll_translation(translation_id: str) -> dict:
     }
 
 
+def translate_and_download(did: str, wv: str, wvid: str, eid: str,
+                             element_type: str,
+                             configuration: str,
+                             dest: Path,
+                             timeout_sec: int = 15 * 60) -> dict:
+    """Submit a STEP translation, poll until DONE, download to ``dest``.
+
+    Synchronous variant of the async _run_import worker; suitable for
+    short re-translation cycles (configuration changes on already-
+    imported sources, where the user is waiting in the UI for the new
+    geometry).
+
+    Returns ``{translation_id, external_data_id, step_path}``.  Raises
+    on failure or timeout so the caller can surface the cause.
+    """
+    tr = start_step_translation(did, wv, wvid, eid,
+                                  element_type=element_type,
+                                  configuration=configuration)
+    tid = tr["translation_id"]
+    if not tid:
+        raise RuntimeError(
+            f"Onshape did not return a translation id: {tr.get('raw')!r}")
+    deadline = time.time() + timeout_sec
+    last_state = "ACTIVE"
+    st = None
+    while time.time() < deadline:
+        time.sleep(2.0)
+        st = poll_translation(tid)
+        last_state = st["state"]
+        if last_state == "DONE":
+            break
+        if last_state == "FAILED":
+            raise RuntimeError(
+                f"Onshape translation failed: "
+                f"{st.get('failure_reason') or '(no reason)'}")
+    else:
+        raise TimeoutError(
+            f"Translation did not finish within {timeout_sec}s")
+    ext_ids = (st or {}).get("external_data_ids") or []
+    if not ext_ids:
+        raise RuntimeError(
+            "Onshape reported DONE but no resultExternalDataIds")
+    download_external_data(st.get("did") or did, ext_ids[0], dest)
+    return {
+        "translation_id": tid,
+        "external_data_id": ext_ids[0],
+        "step_path": str(dest),
+    }
+
+
 def download_external_data(did: str, external_data_id: str,
                             dest: Path) -> Path:
     """Stream Onshape's translation result to ``dest``.

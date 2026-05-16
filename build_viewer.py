@@ -350,6 +350,7 @@ HTML_TEMPLATE = r"""<!doctype html>
   <button id="btn-detail-clear" title="Remove the hi-detail overlay" style="display:none">clear detail</button>
   <button id="btn-export">export SVG</button>
   <button id="btn-screenshot" title="Save the current pane(s) as PNG">📸 PNG</button>
+  <button id="btn-server-log" title="Toggle server log overlay -- see what the backend is doing in real time">📡 log</button>
 </header>
 <main>
   <aside class="left">
@@ -417,6 +418,28 @@ HTML_TEMPLATE = r"""<!doctype html>
   </div>
   <div class="webgl-wrap" id="webgl-wrap">
     <canvas id="webgl-canvas"></canvas>
+    <!-- Configuration panel: shown when the active source has Onshape
+         ids and the document defines configurable parameters.  Changing
+         a value re-translates the source and reloads the 3D mesh. -->
+    <div id="cfg-panel"
+         style="position:absolute;top:50px;right:8px;z-index:10;
+                width:240px;background:rgba(255,255,255,.96);
+                border:1px solid #d4d4d8;border-radius:6px;
+                box-shadow:0 4px 14px rgba(0,0,0,.08);
+                padding:10px;font-size:12px;display:none;">
+      <div id="cfg-header"
+           style="display:flex;align-items:center;justify-content:space-between;
+                  font-weight:600;color:#18181b;margin-bottom:8px;">
+        <span>Onshape configuration</span>
+        <button id="cfg-collapse"
+                title="Collapse"
+                style="background:transparent;border:none;color:#71717a;
+                       font-size:14px;cursor:pointer;padding:0 4px;line-height:1;">−</button>
+      </div>
+      <div id="cfg-body"></div>
+      <div id="cfg-status"
+           style="font-size:11px;color:#71717a;margin-top:8px;min-height:14px;"></div>
+    </div>
     <div class="three-toolbar">
       <button id="btn-generate" class="primary"
               title="Render an HLR SVG of the current camera angle and show it on the left. Requires the local server (python serve.py).">
@@ -2876,6 +2899,142 @@ function _dbgTime(label, fn, extra) {{
   try {{ return fn(); }}
   finally {{ _dbgLine(label, performance.now() - t0, extra); }}
 }}
+
+// ---- Server log overlay -------------------------------------------------
+// Pinned to the bottom-right.  Auto-polls /api/debug/log and renders the
+// rolling buffer the server keeps so the user can see exactly which
+// requests landed, how long they took, and (critically) what went wrong
+// or returned zero polylines.
+let _serverLogEl = null;
+let _serverLogBody = null;
+let _serverLogSince = 0;
+let _serverLogTimer = null;
+let _serverLogOpen = false;
+
+function _ensureServerLogEl() {{
+  if (_serverLogEl) return;
+  _serverLogEl = document.createElement('div');
+  _serverLogEl.id = '_server_log';
+  _serverLogEl.style.cssText =
+      'position:fixed;bottom:8px;right:8px;z-index:99998;'
+    + 'width:480px;max-height:280px;'
+    + 'background:rgba(15,15,17,.94);color:#d4d4d8;'
+    + 'border:1px solid #3f3f46;border-radius:6px;'
+    + 'font:11px/1.4 ui-monospace,Consolas,monospace;'
+    + 'box-shadow:0 4px 16px rgba(0,0,0,.4);'
+    + 'display:none;flex-direction:column;';
+  const head = document.createElement('div');
+  head.style.cssText =
+      'padding:5px 9px;border-bottom:1px solid #3f3f46;'
+    + 'display:flex;align-items:center;justify-content:space-between;'
+    + 'background:#27272a;font-weight:600;color:#fafafa;';
+  const title = document.createElement('span');
+  title.textContent = 'Server log';
+  const right = document.createElement('span');
+  right.style.cssText = 'display:flex;gap:6px;';
+  const clearBtn = document.createElement('button');
+  clearBtn.textContent = 'clear';
+  clearBtn.style.cssText =
+      'background:transparent;border:1px solid #52525b;color:#d4d4d8;'
+    + 'border-radius:3px;padding:1px 6px;font-size:10px;cursor:pointer;';
+  clearBtn.addEventListener('click', () => {{
+    _serverLogBody.innerHTML = '';
+  }});
+  const closeBtn = document.createElement('button');
+  closeBtn.textContent = '×';
+  closeBtn.style.cssText =
+      'background:transparent;border:none;color:#a1a1aa;'
+    + 'font-size:16px;cursor:pointer;line-height:1;padding:0 4px;';
+  closeBtn.addEventListener('click', () => _toggleServerLog(false));
+  right.appendChild(clearBtn);
+  right.appendChild(closeBtn);
+  head.appendChild(title);
+  head.appendChild(right);
+  _serverLogBody = document.createElement('div');
+  _serverLogBody.style.cssText =
+      'padding:4px 6px;overflow-y:auto;flex:1;white-space:pre-wrap;';
+  _serverLogEl.appendChild(head);
+  _serverLogEl.appendChild(_serverLogBody);
+  document.body.appendChild(_serverLogEl);
+}}
+
+function _serverLogRender(events) {{
+  if (!events || !events.length) return;
+  const wasAtBottom =
+      _serverLogBody.scrollTop + _serverLogBody.clientHeight
+      >= _serverLogBody.scrollHeight - 4;
+  for (const e of events) {{
+    const line = document.createElement('div');
+    let color = '#d4d4d8';
+    if (e.level === 'err')   color = '#fda4af';
+    else if (e.level === 'warn')  color = '#fde047';
+    else if (e.level === 'ok')    color = '#86efac';
+    else if (e.level === 'req')   color = '#93c5fd';
+    line.style.color = color;
+    const parts = [`[${{e.t}}]`, (e.level || '').padEnd(4)];
+    for (const [k, v] of Object.entries(e)) {{
+      if (k === 't' || k === 'level' || k === 'seq') continue;
+      if (v === null || v === undefined || v === '') continue;
+      parts.push(`${{k}}=${{v}}`);
+    }}
+    line.textContent = parts.join(' ');
+    _serverLogBody.appendChild(line);
+  }}
+  // Cap to last 200 lines so the DOM doesn't blow up
+  while (_serverLogBody.children.length > 200) {{
+    _serverLogBody.removeChild(_serverLogBody.firstChild);
+  }}
+  if (wasAtBottom) _serverLogBody.scrollTop = _serverLogBody.scrollHeight;
+}}
+
+async function _serverLogPoll() {{
+  if (!_serverLogOpen) return;
+  try {{
+    const r = await fetch(API_BASE + '/api/debug/log'
+                            + (_serverLogSince ? `?since=${{_serverLogSince}}` : ''));
+    if (r.ok) {{
+      const data = await r.json();
+      _serverLogSince = data.latest_seq || _serverLogSince;
+      _serverLogRender(data.events || []);
+    }}
+  }} catch (_e) {{}}
+  _serverLogTimer = setTimeout(_serverLogPoll, 1500);
+}}
+
+function _toggleServerLog(forceOpen) {{
+  _ensureServerLogEl();
+  if (forceOpen === undefined) forceOpen = !_serverLogOpen;
+  _serverLogOpen = forceOpen;
+  _serverLogEl.style.display = _serverLogOpen ? 'flex' : 'none';
+  localStorage.setItem('ifu:server_log_open', _serverLogOpen ? '1' : '0');
+  if (_serverLogOpen) {{
+    // On (re-)open: ask for the whole buffer once so we have context
+    _serverLogSince = 0;
+    if (_serverLogTimer) clearTimeout(_serverLogTimer);
+    _serverLogPoll();
+  }} else if (_serverLogTimer) {{
+    clearTimeout(_serverLogTimer);
+    _serverLogTimer = null;
+  }}
+}}
+
+// Wire up the header button (will no-op if the element isn't on this
+// page, e.g. on a non-editor route)
+const _logBtn = document.getElementById('btn-server-log');
+if (_logBtn) {{
+  _logBtn.addEventListener('click', () => _toggleServerLog());
+}}
+// Restore previous open/closed state.  Default OFF so it doesn't get
+// in the way unless the user asked for it.
+if (localStorage.getItem('ifu:server_log_open') === '1') {{
+  _toggleServerLog(true);
+}}
+// Also open it automatically on ?dbg=1 so the perf HUD + server log
+// pair up usefully.
+if (_DBG_ON && localStorage.getItem('ifu:server_log_open') !== '0') {{
+  _toggleServerLog(true);
+}}
+window._toggleServerLog = _toggleServerLog;
 
 function applyHighlights() {{
   const _t0 = _DBG_ON ? performance.now() : 0;
@@ -5495,6 +5654,189 @@ function loadSource(file_id) {{
     }});
 }}
 
+// ---- Configuration panel (3D overlay) ---------------------------------
+// Shows the active source's Onshape configuration parameters as a small
+// floating panel anchored to the 3D viewport.  Changing any value
+// fires /api/sources/<id>/reconfigure, which re-translates the STEP
+// and replaces the in-memory shape; we then evict the local GLB cache
+// and reload, so the 3D pane updates in place.
+
+const _cfgPanel  = document.getElementById('cfg-panel');
+const _cfgBody   = document.getElementById('cfg-body');
+const _cfgStatus = document.getElementById('cfg-status');
+const _cfgHdr    = document.getElementById('cfg-header');
+const _cfgColl   = document.getElementById('cfg-collapse');
+let   _cfgInputs = {{}};          // parameter_id -> <input|select>
+let   _cfgCurrentSourceId = null;  // last source we loaded into the panel
+let   _cfgReloadTimer = null;
+let   _cfgCollapsed = localStorage.getItem('ifu:cfg_collapsed') === '1';
+
+function _cfgSetCollapsed(yes) {{
+  _cfgCollapsed = !!yes;
+  _cfgBody.style.display   = _cfgCollapsed ? 'none' : 'block';
+  _cfgStatus.style.display = _cfgCollapsed ? 'none' : 'block';
+  _cfgColl.textContent     = _cfgCollapsed ? '+' : '−';
+  localStorage.setItem('ifu:cfg_collapsed', _cfgCollapsed ? '1' : '0');
+}}
+if (_cfgColl) _cfgColl.addEventListener('click', () =>
+  _cfgSetCollapsed(!_cfgCollapsed));
+if (_cfgHdr) _cfgHdr.addEventListener('dblclick', () =>
+  _cfgSetCollapsed(!_cfgCollapsed));
+_cfgSetCollapsed(_cfgCollapsed);
+
+async function _cfgLoadForSource(sourceId) {{
+  if (!sourceId || !_cfgPanel) {{ if (_cfgPanel) _cfgPanel.style.display = 'none'; return; }}
+  _cfgCurrentSourceId = sourceId;
+  _cfgInputs = {{}};
+  _cfgBody.innerHTML = '';
+  _cfgStatus.textContent = 'loading parameters...';
+  _cfgPanel.style.display = 'block';
+  let cfg;
+  try {{
+    const r = await fetch(API_BASE + '/api/sources/'
+                            + encodeURIComponent(sourceId) + '/configuration');
+    if (!r.ok) {{
+      // Unknown / non-Onshape source -- hide the panel quietly
+      _cfgPanel.style.display = 'none';
+      return;
+    }}
+    cfg = await r.json();
+  }} catch (_e) {{
+    _cfgPanel.style.display = 'none';
+    return;
+  }}
+  if (!cfg.has_config || !(cfg.parameters || []).length) {{
+    _cfgPanel.style.display = 'none';
+    return;
+  }}
+  _cfgStatus.textContent =
+      cfg.parameters.length + ' parameter'
+    + (cfg.parameters.length === 1 ? '' : 's')
+    + ' -- changes update the 3D in place';
+  for (const p of cfg.parameters) {{
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;flex-direction:column;gap:3px;margin-bottom:8px;';
+    const lab = document.createElement('label');
+    lab.textContent = p.name || p.id || '(unnamed)';
+    lab.style.cssText = 'font-weight:500;color:#3f3f46;';
+    row.appendChild(lab);
+    let input;
+    if (p.type === 'enum' && (p.options || []).length) {{
+      input = document.createElement('select');
+      input.style.cssText = 'width:100%;padding:4px 6px;border:1px solid #d4d4d8;'
+                          + 'border-radius:3px;background:#fff;font-size:12px;';
+      for (const o of p.options) {{
+        const opt = document.createElement('option');
+        opt.value = o.value; opt.textContent = o.label;
+        if (o.value === p.default) opt.selected = true;
+        input.appendChild(opt);
+      }}
+    }} else if (p.type === 'boolean') {{
+      const wrap = document.createElement('label');
+      wrap.style.cssText = 'display:flex;align-items:center;gap:6px;cursor:pointer;'
+                         + 'font-size:12px;color:#52525b;';
+      input = document.createElement('input');
+      input.type = 'checkbox';
+      if (p.default === true || p.default === 'true') input.checked = true;
+      wrap.appendChild(input);
+      const sp = document.createElement('span');
+      sp.textContent = input.checked ? 'enabled' : 'disabled';
+      wrap.appendChild(sp);
+      input.addEventListener('change', () => {{
+        sp.textContent = input.checked ? 'enabled' : 'disabled';
+      }});
+      // Normalise value semantics
+      Object.defineProperty(input, 'value', {{
+        get() {{ return input.checked ? 'true' : 'false'; }},
+      }});
+      row.appendChild(wrap);
+    }} else {{
+      input = document.createElement('input');
+      input.type = 'text';
+      input.style.cssText = 'width:100%;padding:4px 6px;border:1px solid #d4d4d8;'
+                          + 'border-radius:3px;background:#fff;font-size:12px;'
+                          + 'box-sizing:border-box;';
+      if (p.default != null) input.value = String(p.default);
+      if (p.unit) input.placeholder = p.unit;
+    }}
+    if (p.type !== 'boolean') row.appendChild(input);
+    _cfgInputs[p.id] = input;
+    input.addEventListener('change', () =>
+      _cfgScheduleReconfigure(sourceId));
+    _cfgBody.appendChild(row);
+  }}
+  if (_cfgCollapsed) _cfgSetCollapsed(true);
+}}
+
+function _cfgScheduleReconfigure(sourceId) {{
+  if (_cfgReloadTimer) clearTimeout(_cfgReloadTimer);
+  // Small debounce in case the user is tabbing through several
+  // controls -- collapse a burst into one re-translation.
+  _cfgReloadTimer = setTimeout(() => _cfgApply(sourceId), 250);
+}}
+
+async function _cfgApply(sourceId) {{
+  if (sourceId !== _cfgCurrentSourceId) return;
+  const values = {{}};
+  for (const [pid, el] of Object.entries(_cfgInputs)) {{
+    const v = el.value;
+    if (v !== undefined && v !== null && v !== '') values[pid] = v;
+  }}
+  _cfgStatus.textContent = 'reconfiguring (Onshape -> STEP -> 3D)...';
+  // Disable inputs while re-translating
+  for (const el of Object.values(_cfgInputs)) el.disabled = true;
+  try {{
+    const r = await fetch(
+      API_BASE + '/api/sources/' + encodeURIComponent(sourceId)
+        + '/reconfigure',
+      {{ method: 'POST',
+         headers: {{ 'Content-Type': 'application/json' }},
+         body: JSON.stringify({{ configuration: values }}) }});
+    if (!r.ok) {{
+      const j = await r.json().catch(() => ({{}}));
+      throw new Error(j.error || ('HTTP ' + r.status));
+    }}
+    await r.json();
+    // Bust the local GLB cache for this source so the next loadSource()
+    // pulls the freshly meshed geometry.
+    if (loaded && loaded.has && loaded.has(sourceId)) {{
+      const grp = loaded.get(sourceId);
+      if (grp && grp.parent) grp.parent.remove(grp);
+      loaded.delete(sourceId);
+    }}
+    if (window.GLB_B64) delete window.GLB_B64[sourceId];
+    // Reload the 3D mesh in place
+    if (typeof loadSource === 'function') loadSource(sourceId);
+    _cfgStatus.textContent = '3D updated';
+    setTimeout(() => {{
+      if (_cfgCurrentSourceId === sourceId) {{
+        _cfgStatus.textContent =
+            'changes update the 3D in place';
+      }}
+    }}, 2000);
+  }} catch (e) {{
+    _cfgStatus.textContent = 'reconfigure failed: ' + (e.message || e);
+    (window.IFU_UI?.toast || function(){{}})(
+      'Reconfigure failed: ' + (e.message || e), 'error');
+    (window._toggleServerLog || function(){{}})(true);
+  }} finally {{
+    for (const el of Object.values(_cfgInputs)) el.disabled = false;
+  }}
+}}
+
+// Wire up: when the legacy editor's file selector changes, refresh
+// the configuration panel against the new source.  Initial load
+// after page boot is handled by a one-shot timer because the file
+// selector is populated AFTER this script runs.
+if (typeof fileSel !== 'undefined' && fileSel) {{
+  fileSel.addEventListener('change', () =>
+    _cfgLoadForSource(fileSel.value));
+  setTimeout(() => _cfgLoadForSource(fileSel.value), 250);
+}}
+
+window.IFU_VIEWER.reloadConfig = (sid) =>
+  _cfgLoadForSource(sid || _cfgCurrentSourceId);
+
 function indexParts(grp) {{
   partByName = new Map();
   grp.traverse(obj => {{
@@ -5864,17 +6206,41 @@ async function generateLiveSVG() {{
     window.IFU_VIEWER.injectLiveSVG(fid, view_dir, svgText);
     // Auto-switch to Split so the new SVG appears on the left next to the 3D
     window.IFU_VIEWER.setLayout?.('split');
-    btnGen.innerHTML = `&#10003; ${{elapsed}}s`;
+    const polysHeader = r.headers.get('X-Render-Polylines');
+    const polys = polysHeader ? parseInt(polysHeader, 10) : null;
+    if (polys === 0) {{
+      // The SVG was generated but contains no visible lines.  This is
+      // the exact "nothing appeared" failure mode.  Surface it loudly
+      // so the user knows it's not a UI bug.
+      btnGen.innerHTML = '&#9888; 0 lines';
+      btnGen.title =
+          'HLR produced 0 polylines for this source/view.\n'
+        + 'Common causes:\n'
+        + '  - source loaded but has no solid bodies (only sketches/surfaces)\n'
+        + '  - camera is inside the model or at a degenerate angle\n'
+        + '  - mesh_defl is too coarse for very small geometry\n'
+        + 'Open the Server log (header: log) to see what the backend did.';
+      (window.IFU_UI?.toast || function(){{}})(
+        'Render returned 0 lines -- check the server log', 'error');
+      (window._toggleServerLog || function(){{}})(true);
+    }} else {{
+      btnGen.innerHTML =
+        `&#10003; ${{elapsed}}s${{polys != null ? ` (${{polys}} lines)` : ''}}`;
+    }}
     if (breakdown) {{
       readout.title = `last render: ${{elapsed}}s -- ${{breakdown}}`;
-      console.log(`[generate] ${{elapsed}}s -- ${{breakdown}}`);
+      console.log(`[generate] ${{elapsed}}s -- ${{breakdown}}`
+                    + (polys != null ? ` -- ${{polys}} polylines` : ''));
     }}
   }} catch (e) {{
     console.error('generate failed:', e);
     btnGen.innerHTML = '&#10007; ' + (e.message || 'render failed');
+    (window.IFU_UI?.toast || function(){{}})(
+      'Render failed: ' + (e.message || e), 'error');
+    (window._toggleServerLog || function(){{}})(true);
   }} finally {{
     controls.enabled = true;
-    setTimeout(() => {{ btnGen.disabled = false; btnGen.innerHTML = orig; }}, 2500);
+    setTimeout(() => {{ btnGen.disabled = false; btnGen.innerHTML = orig; }}, 4000);
   }}
 }}
 

@@ -44,6 +44,7 @@ from ifu import (figures_store, projects_store, revisions_store,
 from ifu.config import SOURCES
 import threading
 import functools
+from collections import deque
 
 # Serialises OCCT-touching endpoints (/api/render, /api/part_silhouettes,
 # /api/part_footprints, /api/render_region).  Cheap endpoints
@@ -60,8 +61,64 @@ def _occt_serialised(fn):
             return fn(*args, **kwargs)
     return _wrapper
 
+
+# ---- Rolling request log ----------------------------------------------
+# Captures every API call (path, method, status, duration, source_id if
+# extractable, error message) into an in-memory ring buffer.  /api/debug/log
+# returns it as JSON; the editor's "Server log" overlay polls and prints
+# it so the user can see at a glance which endpoint ran and how it ended.
+_LOG_BUFFER: "deque[dict]" = deque(maxlen=500)
+_LOG_LOCK = threading.Lock()
+_LOG_SEQ = [0]
+
+
+def _log_event(**fields) -> None:
+    """Push one structured event onto the rolling buffer + stdout."""
+    with _LOG_LOCK:
+        _LOG_SEQ[0] += 1
+        evt = {"seq": _LOG_SEQ[0],
+               "t": time.strftime("%H:%M:%S", time.gmtime()),
+               **fields}
+        _LOG_BUFFER.append(evt)
+    # Mirror to stdout so a running terminal shows it too
+    parts = [f"{k}={v}" for k, v in fields.items()
+             if k not in ("level",)]
+    print(f"[{evt['t']}] {fields.get('level','info'):<5} {' '.join(parts)}",
+          flush=True)
+
 HERE = Path(__file__).parent
 app = Flask(__name__)
+
+
+@app.before_request
+def _log_start():
+    """Stamp the start time + log a request-start event.  Stored on
+    request.environ so the corresponding after_request can compute
+    duration."""
+    request.environ["_t_start"] = time.time()
+    # Don't log the boring stuff
+    p = request.path
+    if (p == "/" or p == "/api/healthz"
+            or p == "/api/debug/log"
+            or p.startswith("/static")):
+        return
+    # Try to extract a source_id from common patterns -- body for
+    # /api/render etc, path for /api/sources/<sid>/...
+    sid = None
+    try:
+        if request.method in ("POST", "PUT") and request.is_json:
+            body = request.get_json(silent=True) or {}
+            sid = body.get("file_id") or body.get("source_id")
+        if not sid:
+            parts = p.strip("/").split("/")
+            # /api/sources/<sid>/... -> parts[2]
+            if len(parts) >= 3 and parts[0] == "api" and parts[1] == "sources":
+                sid = parts[2]
+            elif len(parts) >= 3 and parts[0] == "api" and parts[1] == "glb":
+                sid = parts[2]
+    except Exception:
+        pass
+    _log_event(level="req", method=request.method, path=p, source_id=sid)
 
 
 @app.after_request
@@ -75,7 +132,38 @@ def _cors_and_no_cache(resp):
     # running is picked up on the next reload.
     if request.path in ("/", "/viewer.html"):
         resp.headers["Cache-Control"] = "no-store"
+
+    # Log the response (skip the noisy ones)
+    p = request.path
+    if not (p == "/" or p == "/api/healthz"
+            or p == "/api/debug/log"
+            or p.startswith("/static")):
+        t0 = request.environ.get("_t_start") or time.time()
+        ms = int((time.time() - t0) * 1000)
+        level = "err" if resp.status_code >= 400 else "ok"
+        _log_event(level=level, method=request.method, path=p,
+                    status=resp.status_code, ms=ms)
     return resp
+
+
+@app.route("/api/debug/log", methods=["GET"])
+def debug_log():
+    """Return the recent server log buffer.  Query ``?since=<seq>`` to
+    only fetch entries newer than the given sequence number (cheap
+    polling for the editor's debug overlay)."""
+    since = 0
+    try:
+        since = int(request.args.get("since") or 0)
+    except (TypeError, ValueError):
+        pass
+    with _LOG_LOCK:
+        if since:
+            out = [e for e in _LOG_BUFFER if e["seq"] > since]
+        else:
+            # Default: tail the last ~80 entries
+            out = list(_LOG_BUFFER)[-80:]
+        latest_seq = _LOG_SEQ[0]
+    return jsonify({"events": out, "latest_seq": latest_seq})
 
 
 @app.route("/api/<path:_p>", methods=["OPTIONS"])
@@ -210,6 +298,9 @@ def render():
     up_axis = body.get("up_axis")    # {"axis": [x,y,z], "angle": deg} or None
 
     if file_id not in _SHAPES:
+        _log_event(level="err", op="render", source_id=file_id,
+                    reason="source not loaded",
+                    known=",".join(_SHAPES.keys()))
         return jsonify({"error": f"unknown source: {file_id!r}",
                         "known": list(_SHAPES.keys())}), 400
 
@@ -221,6 +312,8 @@ def render():
         vd = (eye[0] - focal[0], eye[1] - focal[1], eye[2] - focal[2])
         mag = (vd[0] ** 2 + vd[1] ** 2 + vd[2] ** 2) ** 0.5
         if mag < 1e-9:
+            _log_event(level="err", op="render", source_id=file_id,
+                        reason="eye==target")
             return jsonify({"error": "eye and target coincide"}), 400
         view_dir = (vd[0] / mag, vd[1] / mag, vd[2] / mag)
     elif isinstance(view_dir, list) and len(view_dir) == 3:
@@ -230,6 +323,9 @@ def render():
         else:
             focal = (0.0, 0.0, 0.0)
     else:
+        _log_event(level="err", op="render", source_id=file_id,
+                    reason="no camera in body",
+                    body_keys=",".join((body or {}).keys()))
         return jsonify({"error":
             "supply either {eye, target} or {view_dir, focal}"}), 400
 
@@ -258,16 +354,46 @@ def render():
     if cached is not None:
         print(f"  /api/render {file_id:<10s} dir={vd_key}{extra_rot_str}  "
               f"CACHE HIT  {len(cached)//1024}KB")
+        _log_event(level="ok", op="render.cache_hit",
+                    source_id=file_id, kb=len(cached)//1024)
         return Response(cached, mimetype="image/svg+xml", headers={
             "X-Render-Seconds": "0.0",
             "X-Render-Breakdown": "cache-hit",
         })
+    _log_event(level="info", op="render.start", source_id=file_id,
+                vd=f"({vd_key[0]},{vd_key[1]},{vd_key[2]})",
+                focal=f"({focal_key[0]},{focal_key[1]},{focal_key[2]})",
+                mesh_defl=hlr_kw.get("mesh_defl"))
     t_hlr0 = time.time()
     try:
         parts = run_hlr_per_solid(shape, view_dir, focal=focal, **hlr_kw)
     except Exception as exc:
+        _log_event(level="err", op="render.hlr",
+                    source_id=file_id,
+                    error=f"{type(exc).__name__}: {exc}")
         return jsonify({"error": f"HLR failed: {type(exc).__name__}: {exc}"}), 500
     t_hlr = time.time() - t_hlr0
+    # Count what came out -- if everything's zero the user sees a blank
+    # SVG, which is the "I clicked Generate and nothing happened" symptom.
+    n_polys = 0
+    n_parts_with_geom = 0
+    for pe in parts or []:
+        cats = pe.get("categories") or {}
+        any_seg = False
+        for cat_name, polylines in cats.items():
+            for poly in polylines or []:
+                # poly is a list of (x, y) tuples
+                if poly and len(poly) >= 2:
+                    n_polys += 1
+                    any_seg = True
+        if any_seg:
+            n_parts_with_geom += 1
+    _log_event(level="info" if n_polys else "warn",
+                op="render.hlr_done",
+                source_id=file_id, hlr_sec=round(t_hlr, 2),
+                parts=len(parts or []),
+                parts_with_geom=n_parts_with_geom,
+                polylines=n_polys)
 
     # X-mirror is gone now.  build_projector was rewritten to build the
     # Ax2 with Z = +view_dir and X = up × view_dir, so OCCT's camera and
@@ -286,6 +412,10 @@ def render():
     print(f"  /api/render {file_id:<10s} dir={tuple(round(x,3) for x in view_dir)}"
           f"{extra_rot_str}  total={elapsed:.1f}s ({breakdown})  "
           f"{len(svg)//1024}KB")
+    _log_event(level="ok", op="render.done",
+                source_id=file_id, total_sec=round(elapsed, 2),
+                hlr_sec=round(t_hlr, 2), svg_sec=round(t_svg, 2),
+                svg_kb=len(svg)//1024, polylines=n_polys)
     # Insert into render cache (evict oldest if over cap)
     svg_bytes = svg.encode("utf-8")
     if len(_RENDER_CACHE) >= _RENDER_CACHE_MAX:
@@ -295,6 +425,7 @@ def render():
     return Response(svg_bytes, mimetype="image/svg+xml", headers={
         "X-Render-Seconds": f"{elapsed:.2f}",
         "X-Render-Breakdown": breakdown,
+        "X-Render-Polylines": str(n_polys),
     })
 
 
@@ -474,6 +605,110 @@ def glb_for_source(source_id):
         "source_id": source_id,
         "b64": b64,
         **(summary or {}),
+    })
+
+
+@app.route("/api/sources/<source_id>/reconfigure", methods=["POST"])
+@_occt_serialised
+def source_reconfigure(source_id):
+    """Re-translate a dynamic source with a new configuration and swap
+    the in-memory shape.
+
+    Body: ``{configuration: {parameter_id: value, ...}}``.
+
+    On success returns ``{ok: true, source_id, configuration,
+    step_path}`` and evicts every cache keyed by source_id so the next
+    /api/render / /api/glb call recomputes.
+    """
+    src = sources_store.find(source_id)
+    if src is None:
+        return jsonify({"error": "unknown source"}), 404
+    ids = src.get("onshape_ids") or {}
+    did, eid = ids.get("did"), ids.get("eid")
+    wv = ids.get("wv") or "w"
+    wvid = ids.get("wid") or ids.get("vid") or ids.get("mid")
+    if not (did and wvid and eid):
+        return jsonify({
+            "error": "source has no onshape_ids -- can't reconfigure"
+        }), 400
+
+    body = request.get_json(silent=True) or {}
+    cfg_values = body.get("configuration") or {}
+    cfg_str = onshape_fetch.encode_configuration(cfg_values)
+    _log_event(level="info", op="reconfigure.start",
+                source_id=source_id, cfg=cfg_str or "(default)")
+
+    # Need element type for the translation endpoint family.  Probe it.
+    try:
+        elem = onshape_fetch.get_element_info(did, wv, wvid, eid)
+    except Exception as exc:
+        _log_event(level="err", op="reconfigure.elem",
+                    source_id=source_id,
+                    error=f"{type(exc).__name__}: {exc}")
+        return jsonify({
+            "error": f"element probe failed: {exc}"
+        }), 502
+    element_type = elem.get("type") or "ASSEMBLY"
+
+    dest = Path(src["step_path"])
+    try:
+        result = onshape_fetch.translate_and_download(
+            did=did, wv=wv, wvid=wvid, eid=eid,
+            element_type=element_type,
+            configuration=cfg_str,
+            dest=dest)
+    except Exception as exc:
+        _log_event(level="err", op="reconfigure.translate",
+                    source_id=source_id,
+                    error=f"{type(exc).__name__}: {exc}")
+        return jsonify({
+            "error": f"translation failed: {exc}"
+        }), 502
+
+    # Swap the in-memory shape.  Errors here are recoverable (we still
+    # have the new STEP on disk), but we need to surface them.
+    try:
+        ok = _load_source_into_memory(
+            file_id=source_id, step_path=dest,
+            hlr_kw=src.get("hlr_kwargs") or {},
+            pre_rotate=None)
+        if not ok:
+            raise RuntimeError("failed to reload STEP into shape cache")
+    except Exception as exc:
+        _log_event(level="err", op="reconfigure.reload",
+                    source_id=source_id,
+                    error=f"{type(exc).__name__}: {exc}")
+        return jsonify({
+            "error": f"reload failed: {exc}",
+            "step_path": str(dest),
+        }), 500
+
+    # Evict caches keyed by this source so the next render recomputes
+    for cache in (_RENDER_CACHE, _SIL_CACHE, _FOOT_CACHE,
+                   _FOOT_RASTER_DONE):
+        for key in list(cache.keys()):
+            if isinstance(key, tuple) and key and key[0] == source_id:
+                del cache[key]
+
+    # Update the dynamic-source record so the configuration persists
+    # across a server restart.
+    sources_store.register(
+        source_id=source_id,
+        label=src.get("label") or source_id,
+        step_path=str(dest),
+        onshape_ids=src.get("onshape_ids"),
+        hlr_kwargs=src.get("hlr_kwargs"),
+        imported_from=src.get("imported_from"))
+
+    _log_event(level="ok", op="reconfigure.done",
+                source_id=source_id, cfg=cfg_str or "(default)",
+                step_kb=dest.stat().st_size // 1024)
+    return jsonify({
+        "ok": True,
+        "source_id": source_id,
+        "configuration": cfg_values,
+        "step_path": str(dest),
+        **(result or {}),
     })
 
 
