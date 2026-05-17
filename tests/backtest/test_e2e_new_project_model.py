@@ -106,46 +106,65 @@ def test_new_figure_modal_uses_bound_model(page):
     }""")
     pid = proj["id"]
     try:
-        # Phase 3: the new-figure flow now lives inside a View, not at
-        # the project root.  Seed a view, navigate to its ViewScreen,
-        # click the "+ New figure" placeholder.
-        view = page.evaluate(f"""async () => {{
-            const r = await fetch(API_BASE + '/api/views', {{
+        # Phase 3-revised: figures live as variant cards in the editor
+        # sidebar, not via a modal.  The contract we still want to
+        # preserve: the figure-creation path doesn't expose a Source
+        # picker because the project/view owns the source.  Verify by
+        # navigating into the editor under a view and confirming there
+        # is no visible Source <select> in either the sidebar or any
+        # modal.
+        seeded = page.evaluate(f"""async () => {{
+            const vr = await fetch(API_BASE + '/api/views', {{
                 method: 'POST',
                 headers: {{'Content-Type': 'application/json'}},
                 body: JSON.stringify({{project_id: '{pid}',
                                         source_id: 'siderail',
-                                        name: 'V-test'}}),
+                                        name: 'V-test',
+                                        camera: {{eye:[1000,1000,800],
+                                                    target:[0,0,0]}}}}),
             }});
-            return await r.json();
+            const v = await vr.json();
+            const fr = await fetch(API_BASE + '/api/figures', {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{name: 'fig-bound-source',
+                                        source_id: 'siderail',
+                                        project_id: '{pid}',
+                                        view_id: v.id,
+                                        camera: v.camera}}),
+            }});
+            const f = await fr.json();
+            await fetch(API_BASE + '/api/views/' + v.id
+                          + '/figures/' + f.id, {{method: 'POST'}});
+            return {{v, f}};
         }}""")
+        vid = seeded["v"]["id"]
+        fid = seeded["f"]["id"]
         page.evaluate(
-            f"location.hash = '#/project/{pid}/view/{view['id']}'")
-        page.wait_for_timeout(800)
-        page.evaluate("""() => {
-            const card = document.querySelector('.card.placeholder');
-            if (card) card.click();
-        }""")
-        page.wait_for_timeout(400)
+            f"location.hash = "
+            f"'#/project/{pid}/view/{vid}/figure/{fid}'")
+        page.wait_for_timeout(2000)
         info = page.evaluate("""() => {
-            const modal = document.querySelector('.modal');
-            if (!modal) return null;
+            // Source <select> would only exist on the legacy figure
+            // input -- which is hidden in project mode.  Any visible
+            // <select> with previousSibling text == 'Source' is a fail.
             const sourceSelects = Array.from(
-                modal.querySelectorAll('select')).filter(s =>
-                    s.previousElementSibling
-                    && s.previousElementSibling.textContent === 'Source');
-            const hasNameInput = !!modal.querySelector('input.input');
+                document.querySelectorAll('select')).filter(s => {
+                    if (getComputedStyle(s).display === 'none') return false;
+                    const sib = s.previousElementSibling;
+                    return sib && sib.textContent.trim() === 'Source';
+                });
+            const stripVisible = !!document.querySelector(
+                '#variants-strip .variant-card');
             return {
                 source_selects: sourceSelects.length,
-                has_name_input: hasNameInput,
+                strip_visible: stripVisible,
             };
         }""")
-        assert info, "new-figure modal didn't open"
-        # Phase 3: figure inherits view's camera + source; no source
-        # picker.
         assert info["source_selects"] == 0, \
-            f"expected no Source <select> when figure inherits view source; got {info['source_selects']}"
-        assert info["has_name_input"], "missing figure-name input"
+            f"expected no visible Source <select> in figure-under-view editor; got {info['source_selects']}"
+        assert info["strip_visible"], \
+            "variant strip should be visible in subview editor"
     finally:
         page.evaluate(f"""async () => {{
             await fetch(API_BASE + '/api/projects/{pid}?cascade=1',

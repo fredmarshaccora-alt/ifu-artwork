@@ -72,10 +72,15 @@ def test_project_workspace_shows_views(page):
         _cleanup(page, pid)
 
 
-def test_view_card_click_opens_view_screen(page):
+def test_view_card_click_opens_editor_on_first_variant(page):
+    """Phase-3-rev: ViewScreen is now a redirector.  Clicking a view
+    card lands directly on the editor for the first figure under
+    that view (and the variant strip in the editor sidebar lists the
+    siblings)."""
     seed = _seed(page, 'V-click')
     pid = seed['proj']['id']
     vid = seed['view']['id']
+    fid = seed['fig']['id']
     try:
         page.evaluate(f"location.hash = '#/project/{pid}'")
         page.wait_for_timeout(800)
@@ -88,19 +93,16 @@ def test_view_card_click_opens_view_screen(page):
                 if (t.includes('Front-right iso')) { c.click(); return; }
             }
         }""")
-        page.wait_for_timeout(800)
+        page.wait_for_timeout(1200)
         hash_ = page.evaluate("location.hash")
-        assert hash_ == f"#/project/{pid}/view/{vid}", \
-            f"view click didn't navigate to ViewScreen: {hash_}"
-        # ViewScreen should list the figure
-        figure_visible = page.evaluate("""() => {
-            const cards = document.querySelectorAll('.card-grid .card');
-            return Array.from(cards).some(c => {
-                const t = c.querySelector('.card-title')?.textContent || '';
-                return t.includes('V-click-fig');
-            });
-        }""")
-        assert figure_visible, "figure not rendered on ViewScreen"
+        assert hash_ == f"#/project/{pid}/view/{vid}/figure/{fid}", \
+            f"expected editor redirect to first variant; got {hash_}"
+        # Variant strip should be populated
+        n_cards = page.evaluate(
+            "() => document.querySelectorAll('#variants-strip .variant-card').length")
+        # 1 figure + 1 add card
+        assert n_cards >= 2, \
+            f"variant strip should have at least the figure + add card; got {n_cards}"
     finally:
         _cleanup(page, pid)
 

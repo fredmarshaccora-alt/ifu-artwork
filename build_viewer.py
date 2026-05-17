@@ -175,8 +175,68 @@ HTML_TEMPLATE = r"""<!doctype html>
   body.project-scoped-editor [data-ed-control="group-mode"],
   body.project-scoped-editor [data-ed-control="dev-buttons"],
   body.project-scoped-editor [data-ed-control="dev-prose"],
-  body.project-scoped-editor [data-ed-control="advanced-styling"] {{
+  body.project-scoped-editor [data-ed-control="advanced-styling"],
+  body.project-scoped-editor [data-ed-control="legacy-figures"] {{
     display: none !important;
+  }}
+  /* Show the variant strip in project mode */
+  body.project-scoped-editor #variants-header,
+  body.project-scoped-editor #variants-help {{
+    display: block !important;
+  }}
+  body.project-scoped-editor #variants-strip {{
+    display: flex !important;
+  }}
+  /* Variant card: thumbnail + name + selection size */
+  .variant-card {{
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 8px;
+    border: 1px solid var(--c-line);
+    border-radius: var(--radius-1);
+    background: var(--c-surface);
+    cursor: pointer;
+    transition: background 0.12s, border-color 0.12s;
+  }}
+  .variant-card:hover {{
+    background: var(--c-accora-pale);
+    border-color: var(--c-accora);
+  }}
+  .variant-card.is-active {{
+    background: var(--c-accora-pale);
+    border-color: var(--c-accora);
+    box-shadow: inset 0 0 0 1px var(--c-accora);
+  }}
+  .variant-card .variant-thumb {{
+    flex: 0 0 56px;
+    width: 56px; height: 42px;
+    background: var(--c-surface-1);
+    border: 1px solid var(--c-line);
+    border-radius: 3px;
+    object-fit: contain;
+  }}
+  .variant-card .variant-thumb.placeholder {{
+    border-style: dashed;
+  }}
+  .variant-card .variant-meta {{ flex: 1; min-width: 0; }}
+  .variant-card .variant-name {{
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--c-text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }}
+  .variant-card .variant-sub {{
+    font-size: 10px; color: var(--c-text-muted);
+  }}
+  .variant-card.add {{
+    justify-content: center;
+    border-style: dashed;
+    color: var(--c-text-muted);
+    font-weight: 500;
+  }}
+  .variant-card.add:hover {{
+    color: var(--c-accora-dark);
   }}
   /* Show the preset row + actions in project mode (flex), keep them
      hidden in the file:// / legacy path so power users see the old
@@ -577,10 +637,12 @@ HTML_TEMPLATE = r"""<!doctype html>
     </section>
 
     <section class="ed-section" data-ed-section="figures">
-      <h2>Figures</h2>
-      <p style="font-size:11px; color: var(--muted); margin: 0 0 6px 0;">
+      <h2 data-ed-control="legacy-figures">Figures</h2>
+      <p data-ed-control="legacy-figures"
+         style="font-size:11px; color: var(--muted); margin: 0 0 6px 0;">
         A figure = camera + selection + per-part styles.</p>
-      <div style="display:flex; gap:4px; margin-bottom:4px;">
+      <div data-ed-control="legacy-figures"
+           style="display:flex; gap:4px; margin-bottom:4px;">
         <input type="text" id="fig-name" placeholder="figure name..."
                style="flex:1; padding:4px 6px; font-size:12px;
                       border:1px solid var(--line); border-radius:3px;">
@@ -592,7 +654,22 @@ HTML_TEMPLATE = r"""<!doctype html>
       <div id="fig-save-status"
            style="font-size:11px; color:var(--muted); margin: 0 0 6px 0;
                   min-height: 14px; display: none;"></div>
-      <ul id="figures-list" class="saved-views-list"></ul>
+      <ul id="figures-list" class="saved-views-list"
+          data-ed-control="legacy-figures"></ul>
+      <!-- Variant sidebar (project-scoped editor / subview mode).
+           Replaces the project-wide figures list with a vertical
+           strip of thumbnail cards, all of which are highlight
+           variants of the active View.  Auto-save means switching
+           cards is safe. -->
+      <h2 id="variants-header"
+          style="display:none; margin: 0 0 6px 0; font-size: 13px;">
+        Variants</h2>
+      <p id="variants-help" style="display:none;
+            font-size: 11px; color: var(--c-text-muted); margin: 0 0 8px 0;">
+        Different highlights of this view.  Click + for a new variant;
+        edits auto-save.</p>
+      <div id="variants-strip"
+           style="display:none; flex-direction: column; gap: 6px;"></div>
     </section>
 
     <section class="ed-section" data-ed-section="saved-views">
@@ -2736,8 +2813,6 @@ async function ViewScreen(container, params) {{
   // Special "new view" route: redirect to the editor with the project's
   // primary source so the user can pose the camera and Save view.
   if (viewId === '__new__') {{
-    // Lazy: hop into the editor.  The save flow there will create a
-    // View when the user generates 2D and clicks save.
     location.hash = '#/project/' + encodeURIComponent(projId)
                   + '/figure/__new_view__';
     return;
@@ -2754,6 +2829,44 @@ async function ViewScreen(container, params) {{
     if (vr.ok) view = await vr.json();
     if (fr.ok) figs = (await fr.json()).figures || [];
   }} catch (_e) {{}}
+
+  // PIVOT: skip this intermediate workspace and drop straight into the
+  // editor for the view's first figure -- the variant strip in the
+  // editor sidebar already shows all the highlight variants.  If the
+  // view has no figures yet, create a "Default" one so the editor has
+  // something to load.  Auto-save means switching variants is safe.
+  if (proj && view) {{
+    let target = figs[0];
+    if (!target) {{
+      try {{
+        const r = await fetch(API_BASE + '/api/figures', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{
+            name: 'Default variant',
+            source_id: view.source_id,
+            project_id: projId,
+            view_id: viewId,
+            camera: view.camera,
+            configuration: view.configuration,
+          }}),
+        }});
+        if (r.ok) {{
+          target = await r.json();
+          await fetch(API_BASE + '/api/views/'
+                        + encodeURIComponent(viewId)
+                        + '/figures/' + encodeURIComponent(target.id),
+                        {{ method: 'POST' }});
+        }}
+      }} catch (_e) {{}}
+    }}
+    if (target) {{
+      location.hash = '#/project/' + encodeURIComponent(projId)
+                    + '/view/' + encodeURIComponent(viewId)
+                    + '/figure/' + encodeURIComponent(target.id);
+      return;
+    }}
+  }}
 
   if (!proj || !view) {{
     container.appendChild(_topBar({{
@@ -3332,6 +3445,8 @@ async function EditorScreen(container, params) {{
 
   const projId = params[0];
   const figId = params[1];
+  const opts = params[2] || {{}};
+  const viewIdFromRoute = opts.viewId || null;
 
   // Fetch both in parallel so we know the project name for the crumb
   let proj = null, fig = null;
@@ -3343,6 +3458,12 @@ async function EditorScreen(container, params) {{
     if (pr.ok) proj = await pr.json();
     if (fr.ok) fig = await fr.json();
   }} catch (_e) {{}}
+
+  // If no view id came in the route but the figure has one, use that
+  // -- the variant strip needs the view id to know which figures are
+  // siblings.
+  const viewId = viewIdFromRoute || fig?.view_id || null;
+  AppState.currentViewId = viewId;
 
   _installCrumb([
     {{ label: 'Home', href: '#/' }},
@@ -3407,6 +3528,10 @@ async function EditorScreen(container, params) {{
         if (window._markLoadedFigureBaseline) {{
           window._markLoadedFigureBaseline();
         }}
+        // Render the variant strip if this figure is under a view
+        if (viewId && typeof _renderVariantStrip === 'function') {{
+          _renderVariantStrip(projId, viewId, figId);
+        }}
         // Inject a "back to project" pill in the legacy header so
         // there's an obvious exit.  Sits right after the logo.
         const hdr = document.querySelector('header');
@@ -3448,7 +3573,11 @@ async function EditorScreen(container, params) {{
     if (sa) sa.style.display = 'none';
     if (typeof AppState !== 'undefined') {{
       AppState.currentFigureId = null;
+      AppState.currentViewId = null;
     }}
+    // Clear the variant strip
+    const stripEl = document.getElementById('variants-strip');
+    if (stripEl) stripEl.innerHTML = '';
     // Pull the back-to-project pill so non-project routes don't
     // inherit a stale exit
     document.querySelectorAll('header .back-to-project')
@@ -5115,6 +5244,111 @@ function _loadFigureIntoEditor(fig, opts) {{
 
 // Expose for tests + ad-hoc debugging
 window._loadFigureIntoEditor = _loadFigureIntoEditor;
+
+// ---- Variant strip (subview mode) ----------------------------------
+// Render a vertical strip of small cards, one per figure attached to
+// the active View, with thumbnails.  The currently-open figure is
+// marked is-active.  A leading "+" card creates a fresh figure under
+// the same view (inherits view's camera + source).  Switching cards
+// is a route navigation -- auto-save handles persisting the previous
+// figure's edits before the swap.
+async function _renderVariantStrip(projId, viewId, activeFigId) {{
+  const strip = document.getElementById('variants-strip');
+  if (!strip) return;
+  strip.innerHTML = '';
+
+  // The "+" add-card always sits at the top
+  const addCard = document.createElement('div');
+  addCard.className = 'variant-card add';
+  addCard.textContent = '+ new highlight variant';
+  addCard.addEventListener('click', async () => {{
+    // Build a fresh figure name from the variant count
+    let view, figs;
+    try {{
+      view = await (await fetch(API_BASE + '/api/views/'
+                                  + encodeURIComponent(viewId))).json();
+      figs = await (await fetch(API_BASE + '/api/views/'
+                                  + encodeURIComponent(viewId)
+                                  + '/figures')).json();
+    }} catch (_e) {{
+      toast('Failed to load view', 'error');
+      return;
+    }}
+    const nextN = ((figs.figures || []).length) + 1;
+    const defaultName = 'Variant ' + nextN;
+    try {{
+      const r = await fetch(API_BASE + '/api/figures', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{
+          name: defaultName,
+          source_id: view.source_id,
+          project_id: projId,
+          view_id: viewId,
+          camera: view.camera,
+          configuration: view.configuration,
+        }}),
+      }});
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const f = await r.json();
+      await fetch(API_BASE + '/api/views/' + encodeURIComponent(viewId)
+                    + '/figures/' + encodeURIComponent(f.id),
+                    {{ method: 'POST' }});
+      // Hop to the new variant -- editor will auto-render the view
+      location.hash = '#/project/' + encodeURIComponent(projId)
+                    + '/view/' + encodeURIComponent(viewId)
+                    + '/figure/' + encodeURIComponent(f.id);
+    }} catch (e) {{
+      toast('Create failed: ' + (e.message || e), 'error');
+    }}
+  }});
+  strip.appendChild(addCard);
+
+  // Fetch the figures under this view
+  let figs = [];
+  try {{
+    const r = await fetch(API_BASE + '/api/views/'
+                            + encodeURIComponent(viewId) + '/figures');
+    if (r.ok) figs = (await r.json()).figures || [];
+  }} catch (_e) {{}}
+
+  for (const f of figs) {{
+    const card = document.createElement('div');
+    card.className = 'variant-card'
+                   + (f.id === activeFigId ? ' is-active' : '');
+    const img = document.createElement('img');
+    img.className = 'variant-thumb';
+    img.src = API_BASE + '/api/figures/' + encodeURIComponent(f.id)
+              + '/thumbnail?v=' + encodeURIComponent(f.updated_at || '');
+    img.alt = '';
+    img.onerror = () => {{
+      const ph = document.createElement('div');
+      ph.className = 'variant-thumb placeholder';
+      img.replaceWith(ph);
+    }};
+    card.appendChild(img);
+    const meta = document.createElement('div');
+    meta.className = 'variant-meta';
+    const nm = document.createElement('div');
+    nm.className = 'variant-name';
+    nm.textContent = f.name || '(untitled)';
+    meta.appendChild(nm);
+    const sub = document.createElement('div');
+    sub.className = 'variant-sub';
+    const sel = (f.selection || []).length;
+    sub.textContent = sel + (sel === 1 ? ' part' : ' parts');
+    meta.appendChild(sub);
+    card.appendChild(meta);
+    card.addEventListener('click', () => {{
+      if (f.id === activeFigId) return;   // already on this variant
+      location.hash = '#/project/' + encodeURIComponent(projId)
+                    + '/view/' + encodeURIComponent(viewId)
+                    + '/figure/' + encodeURIComponent(f.id);
+    }});
+    strip.appendChild(card);
+  }}
+}}
+window._renderVariantStrip = _renderVariantStrip;
 
 async function refreshFiguresList() {{
   if (!figuresList) return;
