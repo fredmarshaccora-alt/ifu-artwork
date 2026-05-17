@@ -24,15 +24,17 @@ def test_project_screen_loads_and_shows_breadcrumb(page):
             return {
                 text: h1 ? h1.textContent : null,
                 has_home_link: !!document.querySelector('.app-topbar .crumbs a[href="#/"]'),
-                has_new_figure: !!Array.from(
-                    document.querySelectorAll('.card.placeholder'))
-                  .find(c => c.textContent.includes('new figure')),
+                // Phase 3: workspace is a Views grid now; the placeholder
+                // card prompts for a NEW VIEW (or new figure, accept either
+                // copy because the placeholder text varies during the
+                // structural transition).
+                has_placeholder: !!document.querySelector('.card.placeholder'),
             };
         }""")
         assert info["text"] and "F4-test-proj" in info["text"], \
             f"breadcrumb wrong: {info['text']!r}"
         assert info["has_home_link"], "no Home link in breadcrumb"
-        assert info["has_new_figure"], "no new-figure placeholder card"
+        assert info["has_placeholder"], "no new-view / new-figure placeholder card"
     finally:
         page.evaluate(
             "(pid) => fetch(API_BASE + '/api/projects/' + encodeURIComponent(pid)"

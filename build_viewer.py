@@ -2141,20 +2141,29 @@ async function ProjectScreen(container, params) {{
     main.appendChild(bar);
   }}
 
-  main.appendChild(h('div.section-title', `Figures (${{figs.length}})`));
+  // Views grid: each view = camera angle, owns 1..N figures (highlight
+  // variants).  "New view" sends the user into the editor in a special
+  // "create-view" mode that captures whatever camera angle they choose.
+  let views = [];
+  try {{
+    const vr = await fetch(API_BASE + '/api/projects/'
+                            + encodeURIComponent(projId) + '/views');
+    if (vr.ok) views = (await vr.json()).views || [];
+  }} catch (_e) {{}}
+
+  main.appendChild(h('div.section-title', `Views (${{views.length}})`));
   const grid = h('div.card-grid');
-  const newCard = h('div.card.placeholder', '+ new figure');
-  newCard.addEventListener('click', () => _openNewFigureModal(projId, sources, proj));
+  const newCard = h('div.card.placeholder',
+    [h('div', {{ style: {{ fontSize: '24px' }} }}, '+'),
+     h('div', 'New view')]);
+  newCard.addEventListener('click', () => _openNewViewModal(projId, proj));
   grid.appendChild(newCard);
 
-  for (const fig of figs) {{
+  for (const view of views) {{
     const card = h('div.card.figure-card');
-    // Thumbnail: <img> with onerror hiding itself if the figure
-    // was saved before the thumbnail feature landed (404 ok).
-    // Cache-bust with updated_at so a fresh save reloads it.
     const thumb = h('img', {{
-      src: API_BASE + '/api/figures/' + encodeURIComponent(fig.id)
-           + '/thumbnail?v=' + encodeURIComponent(fig.updated_at || ''),
+      src: API_BASE + '/api/views/' + encodeURIComponent(view.id)
+           + '/thumbnail?v=' + encodeURIComponent(view.updated_at || ''),
       alt: '',
       style: {{ width: '100%', height: '120px',
                   objectFit: 'contain',
@@ -2164,11 +2173,6 @@ async function ProjectScreen(container, params) {{
                   border: '1px solid var(--c-line)' }},
     }});
     thumb.onerror = () => {{
-      // No thumbnail yet -- show a tasteful placeholder
-      thumb.removeAttribute('src');
-      thumb.style.display = 'flex';
-      thumb.style.alignItems = 'center';
-      thumb.style.justifyContent = 'center';
       thumb.replaceWith(h('div', {{
         style: {{ width: '100%', height: '120px',
                     background: 'var(--c-surface-1)',
@@ -2182,30 +2186,171 @@ async function ProjectScreen(container, params) {{
         'no preview yet'));
     }};
     card.appendChild(thumb);
-    card.appendChild(h('div.card-title', fig.name || '(untitled)'));
-    const meta = h('div.card-meta', [
-      h('span', fig.source_id || '?'),
+    card.appendChild(h('div.card-title', view.name || '(untitled view)'));
+    const n = view.figure_count || (view.figure_ids || []).length;
+    card.appendChild(h('div.card-meta', [
+      h('span', n + (n === 1 ? ' figure' : ' figures')),
       h('span', '·'),
-      h('span', (fig.updated_at || '').slice(0, 10)),
-    ]);
-    if (fig.bound_revision) {{
-      meta.appendChild(h('span.badge.ok',
-                          fig.bound_revision.name || '?rev'));
-    }}
-    card.appendChild(meta);
+      h('span', (view.updated_at || '').slice(0, 10)),
+    ]));
     card.addEventListener('click', () => {{
       location.hash = '#/project/' + encodeURIComponent(projId)
-                    + '/figure/' + encodeURIComponent(fig.id);
+                    + '/view/' + encodeURIComponent(view.id);
     }});
     _attachCardMenu(card, [
-      {{ label: 'Rename...', onClick: () => _renameFigure(fig, projId) }},
+      {{ label: 'Rename...', onClick: () => _renameView(view, projId) }},
       {{ separator: true }},
-      {{ label: 'Delete figure...', danger: true,
-         onClick: () => _deleteFigure(fig, projId) }},
+      {{ label: 'Delete view...', danger: true,
+         onClick: () => _deleteView(view, projId) }},
     ]);
     grid.appendChild(card);
   }}
   main.appendChild(grid);
+
+  // Legacy figures section: figures that aren't attached to any view
+  // (= pre-Phase-3 data the migration couldn't link, OR figures whose
+  // view got deleted).  Surfaced so the user can recover them.
+  const orphanFigs = figs.filter(f => !f.view_id
+                                       || !views.some(v => v.id === f.view_id));
+  if (orphanFigs.length) {{
+    main.appendChild(h('div.section-title',
+      {{ style: {{ marginTop: '32px', color: 'var(--c-text-muted)' }} }},
+      `Unfiled figures (${{orphanFigs.length}})`));
+    main.appendChild(h('p', {{ style: {{ fontSize: '12px',
+                                              color: 'var(--c-text-muted)',
+                                              margin: '0 0 12px 0' }} }},
+      'These figures predate the View layer.  Open them to assign a View, '
+      + 'or delete them.'));
+    const orphanGrid = h('div.card-grid');
+    for (const fig of orphanFigs) {{
+      const card = h('div.card.figure-card');
+      const thumb = h('img', {{
+        src: API_BASE + '/api/figures/' + encodeURIComponent(fig.id)
+             + '/thumbnail?v=' + encodeURIComponent(fig.updated_at || ''),
+        alt: '',
+        style: {{ width: '100%', height: '120px',
+                    objectFit: 'contain',
+                    background: 'var(--c-surface-1)',
+                    borderRadius: 'var(--radius-1)',
+                    marginBottom: '6px',
+                    border: '1px solid var(--c-line)' }},
+      }});
+      thumb.onerror = () => {{
+        thumb.replaceWith(h('div', {{
+          style: {{ width: '100%', height: '120px',
+                      background: 'var(--c-surface-1)',
+                      borderRadius: 'var(--radius-1)',
+                      border: '1px dashed var(--c-line)',
+                      marginBottom: '6px',
+                      display: 'flex', alignItems: 'center',
+                      justifyContent: 'center',
+                      color: 'var(--c-text-muted)',
+                      fontSize: '11px', fontStyle: 'italic' }} }},
+          'no preview yet'));
+      }};
+      card.appendChild(thumb);
+      card.appendChild(h('div.card-title', fig.name || '(untitled)'));
+      card.appendChild(h('div.card-meta', [
+        h('span', fig.source_id || '?'),
+        h('span', '·'),
+        h('span', (fig.updated_at || '').slice(0, 10)),
+      ]));
+      card.addEventListener('click', () => {{
+        location.hash = '#/project/' + encodeURIComponent(projId)
+                      + '/figure/' + encodeURIComponent(fig.id);
+      }});
+      _attachCardMenu(card, [
+        {{ label: 'Rename...', onClick: () => _renameFigure(fig, projId) }},
+        {{ separator: true }},
+        {{ label: 'Delete figure...', danger: true,
+           onClick: () => _deleteFigure(fig, projId) }},
+      ]);
+      orphanGrid.appendChild(card);
+    }}
+    main.appendChild(orphanGrid);
+  }}
+}}
+
+// Open the editor with the project's primary source so the user can
+// pose the camera and "Save view".  No view created up-front -- we
+// stamp the View on first save so deleted-without-save doesn't leave
+// empty Views littering the project.
+function _openNewViewModal(projId, proj) {{
+  // Simplest first cut: go straight into the editor with the project
+  // pre-bound but no figure loaded.  Save flow there creates the View.
+  location.hash = '#/project/' + encodeURIComponent(projId)
+                + '/view/__new__';
+}}
+
+async function _renameView(view, projId) {{
+  let nameInput;
+  const body = h('div', [
+    h('div.field-row', [
+      h('label', 'View name'),
+      (nameInput = h('input.input', {{ value: view.name || '',
+                                          style: {{ width: '100%' }} }})),
+    ]),
+  ]);
+  openModal({{
+    title: 'Rename view',
+    body,
+    footer: [
+      {{ label: 'Cancel', onClick: (close) => close() }},
+      {{ label: 'Save', primary: true, onClick: async (close) => {{
+        const name = (nameInput.value || '').trim();
+        if (!name) {{ nameInput.focus(); return; }}
+        try {{
+          const r = await fetch(API_BASE + '/api/views/'
+                                  + encodeURIComponent(view.id),
+                                  {{ method: 'PUT',
+                                     headers: {{ 'Content-Type': 'application/json' }},
+                                     body: JSON.stringify({{ ...view, name }}) }});
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          close();
+          toast('View renamed', 'success');
+          if (window.IFU_APP?.renderRoute) window.IFU_APP.renderRoute();
+        }} catch (e) {{
+          toast('Rename failed: ' + (e.message || e), 'error');
+        }}
+      }} }},
+    ],
+  }});
+  setTimeout(() => {{ nameInput.focus(); nameInput.select(); }}, 50);
+}}
+
+async function _deleteView(view, projId) {{
+  const n = view.figure_count || (view.figure_ids || []).length;
+  const body = h('div', [
+    h('p', {{ style: {{ marginTop: 0 }} }},
+      'Delete the view ', h('strong', view.name || '(untitled)'),
+      n ? ` and its ${{n}} figure${{n === 1 ? '' : 's'}}?` : '?'),
+    h('p', {{ style: {{ color: 'var(--c-text-muted)',
+                          fontSize: '12px', marginBottom: 0 }} }},
+      'This action cannot be undone.'),
+  ]);
+  const ok = await new Promise((resolve) => {{
+    openModal({{
+      title: 'Delete view?',
+      body,
+      footer: [
+        {{ label: 'Cancel', onClick: (close) => {{ close(); resolve(false); }} }},
+        {{ label: 'Delete', danger: true, onClick: (close) => {{
+          close(); resolve(true);
+        }} }},
+      ],
+    }});
+  }});
+  if (!ok) return;
+  try {{
+    const r = await fetch(API_BASE + '/api/views/'
+                            + encodeURIComponent(view.id) + '?cascade=1',
+                            {{ method: 'DELETE' }});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    toast('View deleted', 'success');
+    if (window.IFU_APP?.renderRoute) window.IFU_APP.renderRoute();
+  }} catch (e) {{
+    toast('Delete failed: ' + (e.message || e), 'error');
+  }}
 }}
 
 function _openNewFigureModal(projId, sources, proj) {{
@@ -2494,6 +2639,198 @@ function _openNewFigureModal(projId, sources, proj) {{
 }}
 
 registerRoute(/^#\/project\/([^/]+)$/, ProjectScreen);
+
+
+// =====================================================================
+// Phase 3 -- View workspace (figures within a view)
+// =====================================================================
+
+async function ViewScreen(container, params) {{
+  _ensureDesignStyles();
+  container.className = 'app-shell';
+  const projId = params[0];
+  const viewId = params[1];
+
+  // Special "new view" route: redirect to the editor with the project's
+  // primary source so the user can pose the camera and Save view.
+  if (viewId === '__new__') {{
+    // Lazy: hop into the editor.  The save flow there will create a
+    // View when the user generates 2D and clicks save.
+    location.hash = '#/project/' + encodeURIComponent(projId)
+                  + '/figure/__new_view__';
+    return;
+  }}
+
+  let proj = null, view = null, figs = [];
+  try {{
+    const [pr, vr, fr] = await Promise.all([
+      fetch(API_BASE + '/api/projects/' + encodeURIComponent(projId)),
+      fetch(API_BASE + '/api/views/' + encodeURIComponent(viewId)),
+      fetch(API_BASE + '/api/views/' + encodeURIComponent(viewId) + '/figures'),
+    ]);
+    if (pr.ok) proj = await pr.json();
+    if (vr.ok) view = await vr.json();
+    if (fr.ok) figs = (await fr.json()).figures || [];
+  }} catch (_e) {{}}
+
+  if (!proj || !view) {{
+    container.appendChild(_topBar({{
+      crumbs: [{{ label: 'Home', href: '#/' }},
+                {{ label: 'Not found' }}],
+    }}));
+    container.appendChild(h('div.app-main',
+      h('p', 'Project or view not found.')));
+    return;
+  }}
+
+  AppState.currentProjectId = projId;
+  container.appendChild(_topBar({{
+    crumbs: [
+      {{ label: 'Home', href: '#/' }},
+      {{ label: proj.name, href: '#/project/' + encodeURIComponent(projId) }},
+      {{ label: view.name || 'View' }},
+    ],
+    rightLinks: [
+      {{ label: 'Settings', href: '#/settings' }},
+    ],
+  }}));
+  const main = h('div.app-main');
+  container.appendChild(main);
+
+  // Big view preview at the top so the user sees the camera angle
+  // they're working under.
+  main.appendChild(h('div', {{ style: {{ marginBottom: '24px' }} }}, [
+    h('img', {{
+      src: API_BASE + '/api/views/' + encodeURIComponent(viewId)
+           + '/thumbnail?v=' + encodeURIComponent(view.updated_at || ''),
+      style: {{ maxWidth: '480px', maxHeight: '280px',
+                  objectFit: 'contain',
+                  background: 'var(--c-surface-1)',
+                  border: '1px solid var(--c-line)',
+                  borderRadius: 'var(--radius-2)',
+                  padding: '12px' }},
+      onerror: 'this.style.display=\"none\"'
+    }}),
+  ]));
+
+  main.appendChild(h('div.section-title', `Figures in this view (${{figs.length}})`));
+  const grid = h('div.card-grid');
+
+  const newCard = h('div.card.placeholder',
+    [h('div', {{ style: {{ fontSize: '24px' }} }}, '+'),
+     h('div', 'New figure')]);
+  newCard.addEventListener('click', () =>
+    _createFigureInView(projId, viewId, view));
+  grid.appendChild(newCard);
+
+  for (const fig of figs) {{
+    const card = h('div.card.figure-card');
+    const thumb = h('img', {{
+      src: API_BASE + '/api/figures/' + encodeURIComponent(fig.id)
+           + '/thumbnail?v=' + encodeURIComponent(fig.updated_at || ''),
+      style: {{ width: '100%', height: '120px',
+                  objectFit: 'contain',
+                  background: 'var(--c-surface-1)',
+                  borderRadius: 'var(--radius-1)',
+                  marginBottom: '6px',
+                  border: '1px solid var(--c-line)' }},
+    }});
+    thumb.onerror = () => {{
+      thumb.replaceWith(h('div', {{
+        style: {{ width: '100%', height: '120px',
+                    background: 'var(--c-surface-1)',
+                    borderRadius: 'var(--radius-1)',
+                    border: '1px dashed var(--c-line)',
+                    marginBottom: '6px',
+                    display: 'flex', alignItems: 'center',
+                    justifyContent: 'center',
+                    color: 'var(--c-text-muted)',
+                    fontSize: '11px', fontStyle: 'italic' }} }},
+        'no preview yet'));
+    }};
+    card.appendChild(thumb);
+    card.appendChild(h('div.card-title', fig.name || '(untitled)'));
+    const n = (fig.selection || []).length;
+    card.appendChild(h('div.card-meta', [
+      h('span', n + (n === 1 ? ' part' : ' parts') + ' highlighted'),
+    ]));
+    card.addEventListener('click', () => {{
+      location.hash = '#/project/' + encodeURIComponent(projId)
+                    + '/view/' + encodeURIComponent(viewId)
+                    + '/figure/' + encodeURIComponent(fig.id);
+    }});
+    _attachCardMenu(card, [
+      {{ label: 'Rename...', onClick: () => _renameFigure(fig, projId) }},
+      {{ separator: true }},
+      {{ label: 'Delete figure...', danger: true,
+         onClick: () => _deleteFigure(fig, projId) }},
+    ]);
+    grid.appendChild(card);
+  }}
+  main.appendChild(grid);
+}}
+
+async function _createFigureInView(projId, viewId, view) {{
+  // Inherit camera + source from the view; user names the highlight
+  // variant and lands in the editor immediately.
+  let nameInput;
+  const body = h('div', [
+    h('div.field-row', [
+      h('label', 'Figure name'),
+      (nameInput = h('input.input', {{
+        placeholder: 'e.g. "Step 1 — locate caster"',
+        style: {{ width: '100%' }},
+      }})),
+    ]),
+    h('p', {{ style: {{ fontSize: '12px', color: 'var(--c-text-muted)',
+                          margin: '4px 0 0 0' }} }},
+      "The figure inherits the view's camera.  Highlight parts and "
+      + "pick a style in the editor."),
+  ]);
+  openModal({{
+    title: 'New figure',
+    body,
+    footer: [
+      {{ label: 'Cancel', onClick: (close) => close() }},
+      {{ label: 'Create + open editor', primary: true,
+         onClick: async (close) => {{
+        const name = (nameInput.value || '').trim();
+        if (!name) {{ nameInput.focus(); return; }}
+        try {{
+          const r = await fetch(API_BASE + '/api/figures', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{
+              name,
+              source_id: view.source_id,
+              project_id: projId,
+              view_id: viewId,
+              camera: view.camera,
+              configuration: view.configuration,
+            }}),
+          }});
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          const f = await r.json();
+          // Attach to view
+          await fetch(API_BASE + '/api/views/'
+                        + encodeURIComponent(viewId)
+                        + '/figures/' + encodeURIComponent(f.id),
+                        {{ method: 'POST' }});
+          close();
+          toast('Figure created', 'success');
+          location.hash = '#/project/' + encodeURIComponent(projId)
+                        + '/view/' + encodeURIComponent(viewId)
+                        + '/figure/' + encodeURIComponent(f.id);
+        }} catch (e) {{
+          toast('Create failed: ' + (e.message || e), 'error');
+        }}
+      }} }},
+    ],
+  }});
+  setTimeout(() => nameInput.focus(), 50);
+}}
+
+registerRoute(/^#\/project\/([^/]+)\/view\/([^/]+)$/, ViewScreen);
 
 
 // --- Card actions: rename / delete projects + figures ---------------
@@ -3032,6 +3369,13 @@ async function EditorScreen(container, params) {{
 }}
 
 registerRoute(/^#\/project\/([^/]+)\/figure\/([^/]+)$/, EditorScreen);
+// View-aware editor route -- accept the same EditorScreen.  The route
+// handler reads the view id from params[1] when present so the editor
+// can later use the view's camera + configuration.  For now params are
+// (projId, viewId, figId) when this matches.
+registerRoute(/^#\/project\/([^/]+)\/view\/([^/]+)\/figure\/([^/]+)$/,
+              (container, params) => EditorScreen(container,
+                [params[0], params[2], {{ viewId: params[1] }}]));
 
 // Update the Project screen's figure-card click to route into the
 // editor instead of falling back to legacy.  We do this by replacing
@@ -3061,10 +3405,15 @@ ProjectScreen = async function(container, params) {{
     }});
   }});
 }};
-// re-register so the wrapped version wins
+// re-register so the wrapped version wins.  IMPORTANT: keep the
+// Phase-3 view routes here too -- the original list was clobbered.
 _routes.length = 0;
 registerRoute(/^#\/$/, HomeScreen);
 registerRoute(/^#\/project\/([^/]+)$/, ProjectScreen);
+registerRoute(/^#\/project\/([^/]+)\/view\/([^/]+)$/, ViewScreen);
+registerRoute(/^#\/project\/([^/]+)\/view\/([^/]+)\/figure\/([^/]+)$/,
+              (container, params) => EditorScreen(container,
+                [params[0], params[2], {{ viewId: params[1] }}]));
 registerRoute(/^#\/project\/([^/]+)\/figure\/([^/]+)$/, EditorScreen);
 registerRoute(/^#\/settings$/, SettingsScreen);
 

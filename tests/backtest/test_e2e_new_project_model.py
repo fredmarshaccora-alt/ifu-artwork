@@ -106,34 +106,46 @@ def test_new_figure_modal_uses_bound_model(page):
     }""")
     pid = proj["id"]
     try:
-        page.evaluate(f"location.hash = '#/project/{pid}'")
-        page.wait_for_timeout(600)
-        # Click "+ new figure"
+        # Phase 3: the new-figure flow now lives inside a View, not at
+        # the project root.  Seed a view, navigate to its ViewScreen,
+        # click the "+ New figure" placeholder.
+        view = page.evaluate(f"""async () => {{
+            const r = await fetch(API_BASE + '/api/views', {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{project_id: '{pid}',
+                                        source_id: 'siderail',
+                                        name: 'V-test'}}),
+            }});
+            return await r.json();
+        }}""")
+        page.evaluate(
+            f"location.hash = '#/project/{pid}/view/{view['id']}'")
+        page.wait_for_timeout(800)
         page.evaluate("""() => {
             const card = document.querySelector('.card.placeholder');
             if (card) card.click();
         }""")
-        page.wait_for_timeout(300)
+        page.wait_for_timeout(400)
         info = page.evaluate("""() => {
             const modal = document.querySelector('.modal');
             if (!modal) return null;
-            // The bound-model banner contains the source label
-            const banner = modal.querySelector('strong');
             const sourceSelects = Array.from(
                 modal.querySelectorAll('select')).filter(s =>
                     s.previousElementSibling
                     && s.previousElementSibling.textContent === 'Source');
+            const hasNameInput = !!modal.querySelector('input.input');
             return {
-                banner_text: banner ? banner.textContent : null,
                 source_selects: sourceSelects.length,
+                has_name_input: hasNameInput,
             };
         }""")
         assert info, "new-figure modal didn't open"
+        # Phase 3: figure inherits view's camera + source; no source
+        # picker.
         assert info["source_selects"] == 0, \
-            f"expected no Source <select> when project has a bound model; got {info['source_selects']}"
-        # Banner should mention the source's label or id
-        assert info["banner_text"], \
-            f"no model banner: {info}"
+            f"expected no Source <select> when figure inherits view source; got {info['source_selects']}"
+        assert info["has_name_input"], "missing figure-name input"
     finally:
         page.evaluate(f"""async () => {{
             await fetch(API_BASE + '/api/projects/{pid}?cascade=1',
