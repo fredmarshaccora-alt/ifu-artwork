@@ -3357,9 +3357,15 @@ async function EditorScreen(container, params) {{
     // Yield a tick so the legacy editor's catalogue is fully ready,
     // then drop the figure in.  Skip the "replace current work?"
     // confirm: the user JUST clicked into this figure via the
-    // workspace -- their intent isn't ambiguous.
+    // workspace -- their intent isn't ambiguous.  autoGenerate fires
+    // /api/render with the figure's camera so the 2D base view
+    // appears without the user having to click "generate 2D" -- the
+    // intended UX for a "subview with different highlighting".
     setTimeout(() => {{
-      try {{ window._loadFigureIntoEditor(fig, {{ skipConfirm: true }}); }}
+      try {{ window._loadFigureIntoEditor(fig, {{
+        skipConfirm: true,
+        autoGenerate: !!(fig.camera && fig.camera.eye && fig.camera.target),
+      }}); }}
       catch (_e) {{}}
       // Bind the legacy sidebar's project filter to THIS project so
       // the figures list only shows figures in this project, not
@@ -5090,6 +5096,21 @@ function _loadFigureIntoEditor(fig, opts) {{
   // Refresh everything that responds to those changes
   applyStyleSheet();
   applyHighlights();
+
+  // Auto-render the 2D base view for figures that came from a View
+  // (i.e. they carry a camera).  Without this the user lands in the
+  // editor, sees the 3D pane, and has to click "generate 2D" before
+  // they can start highlighting -- not what you want for a new figure
+  // that's supposed to inherit a parent View's drawing.
+  if (opts.autoGenerate && fig.camera && fig.camera.eye && fig.camera.target
+      && typeof generateLiveSVGForCamera === 'function') {{
+    // Let three.js apply the snapped camera + the up_axis change
+    // before the render fires, so the projector axes match what the
+    // 3D pane is actually showing.
+    setTimeout(() => {{
+      try {{ generateLiveSVGForCamera(fig.camera); }} catch (_e) {{}}
+    }}, 350);
+  }}
 }}
 
 // Expose for tests + ad-hoc debugging
@@ -7579,6 +7600,57 @@ async function generateLiveSVG() {{
 }}
 
 btnGen.addEventListener('click', generateLiveSVG);
+
+// Programmatic render entry point: same pipeline as the user-driven
+// "generate 2D" button, but you supply eye/target/up_axis explicitly
+// instead of reading them from the live three.js camera.  Used by
+// EditorScreen's auto-render-on-open path so a new figure inside a
+// View shows the View's drawing right away -- no manual click.
+async function generateLiveSVGForCamera(camInfo) {{
+  if (!camInfo || !camInfo.eye || !camInfo.target) return;
+  const fid = window.IFU_VIEWER.getActiveFileId();
+  if (!fid) return;
+  const eye    = [camInfo.eye[0], camInfo.eye[1], camInfo.eye[2]];
+  const target = [camInfo.target[0], camInfo.target[1], camInfo.target[2]];
+  const upRot = window.IFU_VIEWER.getActiveUpAxis?.();
+  const body = {{ file_id: fid, eye, target }};
+  if (upRot && upRot.angle && upRot.angle !== 0) {{
+    body.up_axis = {{ axis: upRot.axis, angle: upRot.angle }};
+  }}
+  // Visual feedback on the (button) so the user sees the render in
+  // flight even though they didn't click it.
+  const orig = btnGen ? btnGen.innerHTML : '';
+  if (btnGen) {{ btnGen.disabled = true; btnGen.innerHTML = '&#8987; rendering...'; }}
+  try {{
+    const r = await fetch(API_BASE + '/api/render', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify(body),
+    }});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const svgText = await r.text();
+    const _vdx = eye[0] - target[0], _vdy = eye[1] - target[1], _vdz = eye[2] - target[2];
+    const _vdL = Math.hypot(_vdx, _vdy, _vdz) || 1;
+    const view_dir = [_vdx / _vdL, _vdy / _vdL, _vdz / _vdL];
+    window.IFU_VIEWER._setLiveCamCtx?.(fid, {{
+      eye, target, up_axis: body.up_axis || null,
+    }});
+    window.IFU_VIEWER.injectLiveSVG(fid, view_dir, svgText);
+    window.IFU_VIEWER.setLayout?.('split');
+    if (btnGen) {{
+      const elapsed = r.headers.get('X-Render-Seconds') || '?';
+      btnGen.innerHTML = `&#10003; ${{elapsed}}s`;
+    }}
+  }} catch (e) {{
+    console.warn('[auto-render] failed:', e?.message || e);
+    if (btnGen) btnGen.innerHTML = '&#10007; ' + (e.message || 'render failed');
+  }} finally {{
+    setTimeout(() => {{
+      if (btnGen) {{ btnGen.disabled = false; btnGen.innerHTML = orig; }}
+    }}, 3000);
+  }}
+}}
+window.generateLiveSVGForCamera = generateLiveSVGForCamera;
 
 // Decide whether the server is reachable at load time and grey the button
 // out if not (file:// or stand-alone deployment).
