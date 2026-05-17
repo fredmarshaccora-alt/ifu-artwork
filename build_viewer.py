@@ -174,8 +174,50 @@ HTML_TEMPLATE = r"""<!doctype html>
   body.project-scoped-editor [data-ed-control="hidden-layers"],
   body.project-scoped-editor [data-ed-control="group-mode"],
   body.project-scoped-editor [data-ed-control="dev-buttons"],
-  body.project-scoped-editor [data-ed-control="dev-prose"] {{
+  body.project-scoped-editor [data-ed-control="dev-prose"],
+  body.project-scoped-editor [data-ed-control="advanced-styling"] {{
     display: none !important;
+  }}
+  /* Show the preset row + actions in project mode (flex), keep them
+     hidden in the file:// / legacy path so power users see the old
+     control set. */
+  body.project-scoped-editor [data-ed-control="presets"] {{
+    display: flex !important;
+  }}
+  /* Preset buttons themselves */
+  .preset-btn {{
+    flex: 1 1 calc(50% - 6px);
+    min-width: 86px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    background: var(--c-surface);
+    border: 1px solid var(--c-line);
+    border-radius: var(--radius-1);
+    font-family: var(--font-ui, Inter, sans-serif);
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--c-text);
+    cursor: pointer;
+    transition: background 0.12s, border-color 0.12s, transform 0.06s;
+  }}
+  .preset-btn:hover {{
+    background: var(--c-accora-pale);
+    border-color: var(--c-accora);
+  }}
+  .preset-btn:active {{ transform: scale(0.98); }}
+  .preset-btn.is-active {{
+    background: var(--c-accora-pale);
+    border-color: var(--c-accora);
+    color: var(--c-accora-dark);
+    box-shadow: inset 0 0 0 1px var(--c-accora);
+  }}
+  .preset-swatch {{
+    flex: 0 0 16px;
+    height: 16px;
+    border-radius: 50%;
+    box-shadow: 0 0 0 1px rgba(0,0,0,0.06);
   }}
   /* Slim header in project mode -- the dev row + the breadcrumb were
      stacking up to ~80px before; now ~42px total. */
@@ -664,7 +706,28 @@ HTML_TEMPLATE = r"""<!doctype html>
     <p style="font-size:11px; color: var(--muted); margin: 0 0 6px 0;"
        data-ed-control="dev-prose">
       Properties applied to the currently-highlighted parts.</p>
-    <div id="style-panel" style="font-size: 12px;">
+    <!-- Presets: the one-click-applied style row, visible in project
+         mode.  Each button packages stroke + width + fill + alpha so
+         every IFU figure across a project uses a small consistent
+         vocabulary. -->
+    <div id="preset-row" data-ed-control="presets"
+         style="display:none;
+                flex-wrap: wrap;
+                gap: 6px;
+                margin: 0 0 8px 0;"></div>
+    <div id="preset-actions" data-ed-control="presets"
+         style="display:none;
+                gap: 6px;
+                margin: 0 0 12px 0;">
+      <button id="btn-preset-remove" class="btn"
+              title="Clear style on the currently-selected parts">remove style</button>
+      <button id="btn-preset-clear" class="btn"
+              title="Clear styles on every part for this figure">clear all</button>
+    </div>
+    <!-- Legacy free-form controls.  Wrapped in data-ed-control="advanced-styling"
+         so the whole block hides in project mode.  Kept for file://
+         fallback + power users. -->
+    <div id="style-panel" data-ed-control="advanced-styling" style="font-size: 12px;">
       <label style="display:flex; align-items:center; gap:6px; margin:4px 0;">
         Stroke
         <input type="color" id="sty-stroke" value="#00836a" style="width:30px;">
@@ -712,16 +775,22 @@ HTML_TEMPLATE = r"""<!doctype html>
         <button id="btn-reset-style" title="Clear style for highlighted parts">reset</button>
         <button id="btn-reset-all-style" title="Clear all style overrides for this source">reset all</button>
       </div>
-      <h3 style="margin: 12px 0 4px 0; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px;">
-        Applied styles
-      </h3>
-      <ol id="applied-styles-list" style="list-style: none; padding: 0; margin: 0; font-size: 11px; max-height: 220px; overflow-y: auto;"></ol>
       <div data-ed-control="dev-buttons"
            style="display:flex; gap:4px; margin-top:8px; flex-wrap:wrap;">
         <button id="btn-expand-parent" title="Add all siblings under the same Onshape Assembly to the selection">+ Onshape group</button>
         <button id="btn-cycle-deeper" title="In 3D mode, next click at the same pixel goes one layer deeper">depth-click ↻</button>
       </div>
     </div>
+    <!-- Applied list lives OUTSIDE #style-panel so it stays visible
+         in project mode (where the rest of the panel is hidden). -->
+    <h3 style="margin: 6px 0 4px 0; font-size: 10px; color: var(--c-text-muted);
+                text-transform: uppercase; letter-spacing: 0.5px;
+                font-weight: 600;">
+      Applied to parts
+    </h3>
+    <ol id="applied-styles-list"
+        style="list-style: none; padding: 0; margin: 0; font-size: 11px;
+                max-height: 220px; overflow-y: auto;"></ol>
     </section>
 
     <section class="ed-section" data-ed-section="callouts">
@@ -3435,6 +3504,11 @@ function applyHighlights() {{
   }}
   _dbgTime('applyHighlights3D', () =>
     window.IFU_VIEWER?.applyHighlights3D?.(set), `${{set.size}} sel`);
+  // Light up the matching preset (or clear) so the user can see at
+  // a glance what's already applied to the selection.
+  if (typeof _refreshPresetActiveState === 'function') {{
+    try {{ _refreshPresetActiveState(); }} catch (_e) {{}}
+  }}
   if (_DBG_ON) {{
     _dbgLine('applyHighlights TOTAL', performance.now() - _t0,
       `${{set.size}} sel`);
@@ -5953,6 +6027,123 @@ function renderAppliedStylesList() {{
     listEl.appendChild(li);
   }}
 }}
+
+// ---- Preset styles (project mode) ----------------------------------
+// Five fixed IFU presets so figures across a project look consistent.
+// Each preset packages stroke + width + fill so one click applies a
+// fully-specified style to the current selection.  No color pickers,
+// no sliders -- pick a vocabulary and stick to it.
+const _STYLE_PRESETS = [
+  {{ id: 'highlight', label: 'Highlight',
+     style: {{ stroke: '#00836a', width: 4.0, opacity: 1.0, dash: null,
+                 fillOn: true, fillColor: '#cce6e0', fillAlpha: 0.35 }} }},
+  {{ id: 'caution',   label: 'Caution',
+     style: {{ stroke: '#b54708', width: 4.0, opacity: 1.0, dash: null,
+                 fillOn: true, fillColor: '#fff3e0', fillAlpha: 0.40 }} }},
+  {{ id: 'info',      label: 'Info',
+     style: {{ stroke: '#1e6fa1', width: 4.0, opacity: 1.0, dash: null,
+                 fillOn: true, fillColor: '#e0f0fa', fillAlpha: 0.40 }} }},
+  {{ id: 'outline',   label: 'Outline only',
+     style: {{ stroke: '#00836a', width: 4.0, opacity: 1.0, dash: null,
+                 fillOn: false }} }},
+  {{ id: 'subtle',    label: 'Subtle',
+     style: {{ stroke: '#52525b', width: 2.0, opacity: 0.85, dash: null,
+                 fillOn: false }} }},
+];
+
+function _stylesMatch(a, b) {{
+  if (!a || !b) return false;
+  // Loose equality on the fields that visually matter
+  return a.stroke === b.stroke
+      && Math.abs((a.width || 0) - (b.width || 0)) < 0.01
+      && !!a.fillOn === !!b.fillOn
+      && (!a.fillOn || (a.fillColor === b.fillColor
+                         && Math.abs((a.fillAlpha || 0)
+                                       - (b.fillAlpha || 0)) < 0.01));
+}}
+
+function _renderPresetRow() {{
+  const row = document.getElementById('preset-row');
+  const actions = document.getElementById('preset-actions');
+  if (!row || row.children.length) return;   // already built
+  for (const p of _STYLE_PRESETS) {{
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'preset-btn';
+    btn.dataset.presetId = p.id;
+    btn.title = p.label;
+    const sw = document.createElement('span');
+    sw.className = 'preset-swatch';
+    sw.style.background = p.style.fillOn
+      ? p.style.fillColor : 'transparent';
+    sw.style.border = '2.5px solid ' + p.style.stroke;
+    btn.appendChild(sw);
+    const lab = document.createElement('span');
+    lab.textContent = p.label;
+    btn.appendChild(lab);
+    btn.addEventListener('click', () => _applyPreset(p));
+    row.appendChild(btn);
+  }}
+  if (actions) actions.style.display = '';
+}}
+
+function _applyPreset(preset) {{
+  const st = getState(fileSel.value, viewSel.value);
+  if (!st.highlights || !st.highlights.size) {{
+    (window.IFU_UI?.toast || function(){{}})(
+      'Select one or more parts first', 'error');
+    return;
+  }}
+  const m = loadPartStyles(fileSel.value);
+  for (const idx of st.highlights) m[idx] = {{ ...preset.style }};
+  persistPartStyles(fileSel.value, m);
+  applyStyleSheet();
+  // Mark active preset visually
+  document.querySelectorAll('#preset-row .preset-btn').forEach(b => {{
+    b.classList.toggle('is-active', b.dataset.presetId === preset.id);
+  }});
+}}
+
+function _refreshPresetActiveState() {{
+  // After a selection change, light up the preset that matches the
+  // applied style of (any of) the selected parts -- otherwise clear.
+  const row = document.getElementById('preset-row');
+  if (!row) return;
+  const st = getState(fileSel.value, viewSel.value);
+  const m = loadPartStyles(fileSel.value);
+  let activeId = null;
+  if (st.highlights && st.highlights.size) {{
+    for (const idx of st.highlights) {{
+      const s = m[idx];
+      if (!s) continue;
+      const match = _STYLE_PRESETS.find(p => _stylesMatch(p.style, s));
+      if (match) {{ activeId = match.id; break; }}
+    }}
+  }}
+  row.querySelectorAll('.preset-btn').forEach(b => {{
+    b.classList.toggle('is-active', b.dataset.presetId === activeId);
+  }});
+}}
+
+// Build the row at startup
+setTimeout(_renderPresetRow, 50);
+
+// Preset-remove / clear-all in project mode
+document.getElementById('btn-preset-remove')?.addEventListener('click', () => {{
+  const st = getState(fileSel.value, viewSel.value);
+  if (!st.highlights || !st.highlights.size) return;
+  const m = loadPartStyles(fileSel.value);
+  for (const idx of st.highlights) delete m[idx];
+  persistPartStyles(fileSel.value, m);
+  applyStyleSheet();
+  _refreshPresetActiveState();
+}});
+document.getElementById('btn-preset-clear')?.addEventListener('click', () => {{
+  if (!confirm('Clear ALL styled parts on this figure?')) return;
+  persistPartStyles(fileSel.value, {{}});
+  applyStyleSheet();
+  _refreshPresetActiveState();
+}});
 
 $('btn-apply-style').addEventListener('click', () => {{
   const st = getState(fileSel.value, viewSel.value);
