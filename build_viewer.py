@@ -4892,14 +4892,43 @@ function injectLiveSVG(file_id, view_dir, svgText) {{
       view_dir: view_dir,
     }});
   }}
-  // Refresh the View dropdown if this is the active source
-  if (fileSel.value === file_id) {{
-    refreshViews();
-    viewSel.value = '__live__';
-    refreshPane();
-  }} else {{
-    console.warn('[injectLiveSVG] file_id mismatch: fileSel=',
-                  fileSel.value, ' got=', file_id);
+  // Refresh the View dropdown if this is the active source.  If the
+  // fileSel value doesn't match (route switched between variants of
+  // different views, dropdown stale), force it before refreshing so
+  // we don't leave the user with a blank pane.
+  if (fileSel.value !== file_id) {{
+    const hasOpt = Array.from(fileSel.options)
+                          .some(o => o.value === file_id);
+    if (!hasOpt) {{
+      const opt = document.createElement('option');
+      opt.value = file_id; opt.textContent = file_id;
+      fileSel.appendChild(opt);
+    }}
+    fileSel.value = file_id;
+  }}
+  refreshViews();
+  viewSel.value = '__live__';
+  refreshPane();
+  // Defensive: even if refreshPane couldn't find the pane via
+  // activePane(), force the freshly-injected one to be the active
+  // (.active) one.  CSS keeps the rest at display:none, so a missing
+  // .active class is the exact "nothing shows in main view" symptom
+  // the user reported.
+  document.querySelectorAll('.svg-pane.active')
+          .forEach(p => p.classList.remove('active'));
+  pane.classList.add('active');
+  // Make sure pan/zoom transform is reset to identity for the freshly
+  // injected SVG so prior state (zoomed in, panned off-screen) from
+  // a different camera doesn't leave the new geometry invisible.
+  try {{
+    const st = getState(file_id, '__live__');
+    if (st) {{ st.tx = 0; st.ty = 0; st.scale = 1; }}
+    applyTransform(pane);
+  }} catch (_e) {{}}
+  // Force layout to split / 2D mode so the SVG is visible (some
+  // route entries leave the user on layout-3d).
+  if (typeof setLayout === 'function') {{
+    document.body.classList.contains('layout-3d') && setLayout('split');
   }}
   // Fire the assembly-wide footprint raster in the background so the
   // user's FIRST click on a part gets a closed-loop outline instantly
@@ -5233,17 +5262,94 @@ function _loadFigureIntoEditor(fig, opts) {{
   // that's supposed to inherit a parent View's drawing.
   if (opts.autoGenerate && fig.camera && fig.camera.eye && fig.camera.target
       && typeof generateLiveSVGForCamera === 'function') {{
+    // Show the spinner BEFORE the delay so the user sees something
+    // is happening while three.js settles and the render is in
+    // flight.  generateLiveSVGForCamera hides it on success.
+    if (typeof showCanvasLoading === 'function') {{
+      showCanvasLoading('rendering view...');
+    }}
     // Let three.js apply the snapped camera + the up_axis change
     // before the render fires, so the projector axes match what the
     // 3D pane is actually showing.
     setTimeout(() => {{
-      try {{ generateLiveSVGForCamera(fig.camera); }} catch (_e) {{}}
+      try {{ generateLiveSVGForCamera(fig.camera); }}
+      catch (_e) {{
+        if (typeof hideCanvasLoading === 'function') hideCanvasLoading();
+      }}
     }}, 350);
   }}
 }}
 
 // Expose for tests + ad-hoc debugging
 window._loadFigureIntoEditor = _loadFigureIntoEditor;
+
+// ---- Loading overlay -----------------------------------------------
+// Big spinner that floats over the 2D canvas while a render is in
+// flight or a variant switch is loading.  The user reported that
+// clicking a variant card felt like nothing was happening -- this is
+// the missing feedback.
+function _ensureLoadingOverlayStyles() {{
+  if (document.getElementById('_loading_overlay_styles')) return;
+  const s = document.createElement('style');
+  s.id = '_loading_overlay_styles';
+  s.textContent = `
+    .canvas-loading-overlay {{
+      position: absolute; inset: 0;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      gap: 10px;
+      background: rgba(255,255,255,0.78);
+      z-index: 50;
+      font-family: var(--font-ui, Inter, sans-serif);
+      color: var(--c-text-muted, #71717a);
+      pointer-events: none;
+      transition: opacity 0.18s ease;
+    }}
+    .canvas-loading-overlay.is-hidden {{
+      opacity: 0; pointer-events: none;
+    }}
+    .canvas-loading-spinner {{
+      width: 36px; height: 36px;
+      border: 3px solid #d4d4d8;
+      border-top-color: var(--c-accora, #00836a);
+      border-radius: 50%;
+      animation: canvas-spinner-rot 0.9s linear infinite;
+    }}
+    .canvas-loading-label {{
+      font-size: 12px; font-weight: 500;
+    }}
+    @keyframes canvas-spinner-rot {{ to {{ transform: rotate(360deg); }} }}
+  `;
+  document.head.appendChild(s);
+}}
+
+function showCanvasLoading(label) {{
+  _ensureLoadingOverlayStyles();
+  const wrap = document.getElementById('canvas-wrap');
+  if (!wrap) return;
+  // Make sure the container is positioned so absolute children land
+  // over it -- canvas-wrap is already position:relative.
+  let ov = wrap.querySelector(':scope > .canvas-loading-overlay');
+  if (!ov) {{
+    ov = document.createElement('div');
+    ov.className = 'canvas-loading-overlay';
+    ov.innerHTML = '<div class="canvas-loading-spinner"></div>'
+                 + '<div class="canvas-loading-label"></div>';
+    wrap.appendChild(ov);
+  }}
+  ov.classList.remove('is-hidden');
+  ov.querySelector('.canvas-loading-label').textContent = label || 'loading...';
+}}
+
+function hideCanvasLoading() {{
+  const wrap = document.getElementById('canvas-wrap');
+  if (!wrap) return;
+  const ov = wrap.querySelector(':scope > .canvas-loading-overlay');
+  if (ov) ov.classList.add('is-hidden');
+}}
+window.showCanvasLoading = showCanvasLoading;
+window.hideCanvasLoading = hideCanvasLoading;
+
 
 // ---- Variant strip (subview mode) ----------------------------------
 // Render a vertical strip of small cards, one per figure attached to
@@ -5294,11 +5400,16 @@ async function _renderVariantStrip(projId, viewId, activeFigId) {{
       await fetch(API_BASE + '/api/views/' + encodeURIComponent(viewId)
                     + '/figures/' + encodeURIComponent(f.id),
                     {{ method: 'POST' }});
+      // Visual feedback while the new variant loads
+      if (typeof showCanvasLoading === 'function') {{
+        showCanvasLoading('creating ' + defaultName + '...');
+      }}
       // Hop to the new variant -- editor will auto-render the view
       location.hash = '#/project/' + encodeURIComponent(projId)
                     + '/view/' + encodeURIComponent(viewId)
                     + '/figure/' + encodeURIComponent(f.id);
     }} catch (e) {{
+      if (typeof hideCanvasLoading === 'function') hideCanvasLoading();
       toast('Create failed: ' + (e.message || e), 'error');
     }}
   }});
@@ -5341,6 +5452,15 @@ async function _renderVariantStrip(projId, viewId, activeFigId) {{
     card.appendChild(meta);
     card.addEventListener('click', () => {{
       if (f.id === activeFigId) return;   // already on this variant
+      // Visual feedback: empty the SVG pane immediately and show the
+      // spinner so the user doesn't stare at a stale variant while
+      // the new one's render is in flight.
+      const livePane = document.querySelector(
+        '.svg-pane[data-file="' + (fileSel?.value || '') + '"][data-view="__live__"]');
+      if (livePane) livePane.innerHTML = '';
+      if (typeof showCanvasLoading === 'function') {{
+        showCanvasLoading('loading ' + (f.name || 'variant') + '...');
+      }}
       location.hash = '#/project/' + encodeURIComponent(projId)
                     + '/view/' + encodeURIComponent(viewId)
                     + '/figure/' + encodeURIComponent(f.id);
@@ -7878,7 +7998,10 @@ async function generateLiveSVGForCamera(camInfo) {{
   }} catch (e) {{
     console.warn('[auto-render] failed:', e?.message || e);
     if (btnGen) btnGen.innerHTML = '&#10007; ' + (e.message || 'render failed');
+    (window.IFU_UI?.toast || function(){{}})(
+      'Render failed: ' + (e.message || e), 'error');
   }} finally {{
+    if (typeof hideCanvasLoading === 'function') hideCanvasLoading();
     setTimeout(() => {{
       if (btnGen) {{ btnGen.disabled = false; btnGen.innerHTML = orig; }}
     }}, 3000);
