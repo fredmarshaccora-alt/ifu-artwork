@@ -162,8 +162,25 @@ HTML_TEMPLATE = r"""<!doctype html>
   body.project-scoped-editor [data-ed-section="project"],
   body.project-scoped-editor [data-ed-section="saved-views"],
   body.project-scoped-editor [data-ed-section="onshape-tree"],
-  body.project-scoped-editor [data-ed-section="step-order"] {{
+  body.project-scoped-editor [data-ed-section="step-order"],
+  body.project-scoped-editor [data-ed-section="pipeline"],
+  body.project-scoped-editor [data-ed-control="file-sel"],
+  body.project-scoped-editor [data-ed-control="view-sel"],
+  body.project-scoped-editor [data-ed-control="mode-pill"],
+  body.project-scoped-editor [data-ed-control="mode-btns"],
+  body.project-scoped-editor [data-ed-control="hi-detail"],
+  body.project-scoped-editor [data-ed-control="dev-readout"],
+  body.project-scoped-editor [data-ed-control="up-axis"],
+  body.project-scoped-editor [data-ed-control="hidden-layers"],
+  body.project-scoped-editor [data-ed-control="group-mode"],
+  body.project-scoped-editor [data-ed-control="dev-buttons"],
+  body.project-scoped-editor [data-ed-control="dev-prose"] {{
     display: none !important;
+  }}
+  /* Slimmer header padding when the dev controls are gone */
+  body.project-scoped-editor header {{
+    padding-top: 8px;
+    padding-bottom: 8px;
   }}
   body.layout-2d .canvas-wrap {{ grid-area: center; display: block; }}
   body.layout-2d .webgl-wrap  {{ display: none; }}
@@ -341,12 +358,14 @@ HTML_TEMPLATE = r"""<!doctype html>
 <header>
   <a href="#/" style="text-decoration: none; color: inherit;"
      title="Go to the project home page"><h1>ACCORA IFU viewer</h1></a>
-  <label>File: <select id="file-sel"></select></label>
-  <label>View: <select id="view-sel"></select></label>
-  <span class="mode-pill" id="mode-pill">smart</span>
-  <button id="btn-smart"    class="active">smart</button>
-  <button id="btn-detailed">+ smooth</button>
-  <button id="btn-hidden">+ hidden</button>
+  <label data-ed-control="file-sel">File: <select id="file-sel"></select></label>
+  <label data-ed-control="view-sel">View: <select id="view-sel"></select></label>
+  <span class="mode-pill" id="mode-pill" data-ed-control="mode-pill">smart</span>
+  <span data-ed-control="mode-btns" style="display:contents;">
+    <button id="btn-smart"    class="active">smart</button>
+    <button id="btn-detailed">+ smooth</button>
+    <button id="btn-hidden">+ hidden</button>
+  </span>
   <span style="flex:1"></span>
   <div class="seg-ctl" role="tablist" aria-label="Layout">
     <button id="lay-2d"    class="seg-btn active" title="2D drawing only">2D</button>
@@ -356,11 +375,14 @@ HTML_TEMPLATE = r"""<!doctype html>
   <span style="flex:1"></span>
   <button id="btn-annotate">+ callout</button>
   <button id="btn-clear">clear callouts</button>
-  <button id="btn-detail" title="Re-render just the visible viewport at finer mesh + sample">↕ hi-detail</button>
-  <button id="btn-detail-clear" title="Remove the hi-detail overlay" style="display:none">clear detail</button>
+  <button id="btn-detail" data-ed-control="hi-detail"
+          title="Re-render just the visible viewport at finer mesh + sample">↕ hi-detail</button>
+  <button id="btn-detail-clear" data-ed-control="hi-detail"
+          title="Remove the hi-detail overlay" style="display:none">clear detail</button>
   <button id="btn-export">export SVG</button>
   <button id="btn-screenshot" title="Save the current pane(s) as PNG">📸 PNG</button>
-  <button id="btn-server-log" title="Toggle server log overlay -- see what the backend is doing in real time">📡 log</button>
+  <button id="btn-server-log" data-ed-control="server-log"
+          title="Toggle server log overlay -- see what the backend is doing in real time">📡 log</button>
 </header>
 <main>
   <aside class="left">
@@ -474,11 +496,13 @@ HTML_TEMPLATE = r"""<!doctype html>
         &#9889; generate 2D
       </button>
       <span class="tb-sep"></span>
-      <span id="viewdir-readout">view_dir = (—, —, —)</span>
-      <button id="btn-lock-view" title="Copy view_dir tuple to clipboard">copy view_dir</button>
+      <span id="viewdir-readout" data-ed-control="dev-readout">view_dir = (—, —, —)</span>
+      <button id="btn-lock-view" data-ed-control="dev-readout"
+              title="Copy view_dir tuple to clipboard">copy view_dir</button>
       <button id="btn-reset-3d" title="Frame the model from the active 2D view direction">reset camera</button>
-      <span class="tb-sep"></span>
-      <label class="tb-label" title="Override what axis is 'up'. 3D-side preview only - paste the resulting tuple into SOURCES and rebuild to bake into 2D HLR.">Up:
+      <span class="tb-sep" data-ed-control="up-axis"></span>
+      <label class="tb-label" data-ed-control="up-axis"
+             title="Override what axis is 'up'. 3D-side preview only - paste the resulting tuple into SOURCES and rebuild to bake into 2D HLR.">Up:
         <select id="up-axis-sel">
           <option value="Z" selected>Z</option>
           <option value="Y">Y</option>
@@ -488,10 +512,12 @@ HTML_TEMPLATE = r"""<!doctype html>
           <option value="-X">-X</option>
         </select>
       </label>
-      <button id="btn-copy-orient" title="Copy pre_rotate tuple to clipboard">copy pre_rotate</button>
+      <button id="btn-copy-orient" data-ed-control="up-axis"
+              title="Copy pre_rotate tuple to clipboard">copy pre_rotate</button>
     </div>
   </div>
   <aside class="right">
+    <section class="ed-section" data-ed-section="layers">
     <h2>Layers</h2>
     <label class="layer-toggle"><input type="checkbox" data-layer="outline_v" checked>
       <span class="swatch" style="height:5px"></span> Silhouette (profile)</label>
@@ -499,13 +525,16 @@ HTML_TEMPLATE = r"""<!doctype html>
       <span class="swatch" style="height:2px"></span> Sharp edges</label>
     <label class="layer-toggle"><input type="checkbox" data-layer="smooth_v">
       <span class="swatch thin"></span> Smooth (tangent) edges</label>
-    <label class="layer-toggle"><input type="checkbox" data-layer="hidden_outline">
+    <label class="layer-toggle" data-ed-control="hidden-layers"><input type="checkbox" data-layer="hidden_outline">
       <span class="swatch dashed"></span> Hidden silhouette</label>
-    <label class="layer-toggle"><input type="checkbox" data-layer="hidden_sharp">
+    <label class="layer-toggle" data-ed-control="hidden-layers"><input type="checkbox" data-layer="hidden_sharp">
       <span class="swatch dashed"></span> Hidden sharp</label>
+    </section>
 
+    <section class="ed-section" data-ed-section="selection-styling">
     <h2>Selection styling</h2>
-    <p style="font-size:11px; color: var(--muted); margin: 0 0 6px 0;">
+    <p style="font-size:11px; color: var(--muted); margin: 0 0 6px 0;"
+       data-ed-control="dev-prose">
       Properties applied to the currently-highlighted parts.</p>
     <div id="style-panel" style="font-size: 12px;">
       <label style="display:flex; align-items:center; gap:6px; margin:4px 0;">
@@ -545,7 +574,8 @@ HTML_TEMPLATE = r"""<!doctype html>
                value="0.3" style="flex:1;">
         <span id="sty-fill-opacity-val">0.30</span>
       </label>
-      <label style="display:flex; align-items:center; gap:6px; margin:6px 0; font-size:11px;">
+      <label data-ed-control="group-mode"
+             style="display:flex; align-items:center; gap:6px; margin:6px 0; font-size:11px;">
         <input type="checkbox" id="sty-group-mode" checked style="margin:0;">
         outline as group (combined profile for multi-select)
       </label>
@@ -558,26 +588,33 @@ HTML_TEMPLATE = r"""<!doctype html>
         Applied styles
       </h3>
       <ol id="applied-styles-list" style="list-style: none; padding: 0; margin: 0; font-size: 11px; max-height: 220px; overflow-y: auto;"></ol>
-      <div style="display:flex; gap:4px; margin-top:8px; flex-wrap:wrap;">
+      <div data-ed-control="dev-buttons"
+           style="display:flex; gap:4px; margin-top:8px; flex-wrap:wrap;">
         <button id="btn-expand-parent" title="Add all siblings under the same Onshape Assembly to the selection">+ Onshape group</button>
         <button id="btn-cycle-deeper" title="In 3D mode, next click at the same pixel goes one layer deeper">depth-click ↻</button>
       </div>
     </div>
+    </section>
 
+    <section class="ed-section" data-ed-section="callouts">
     <h2>Callouts</h2>
-    <p style="font-size: 11px; color: var(--muted);">
+    <p style="font-size: 11px; color: var(--muted);"
+       data-ed-control="dev-prose">
       Click <b>+ callout</b>, then on the canvas drag from the arrow tip to the
       label position. Enter the label text when prompted.</p>
     <div id="callout-count" style="font-size: 12px; color: var(--muted);">
       0 callouts on this view
     </div>
+    </section>
 
+    <section class="ed-section" data-ed-section="pipeline">
     <h2>Pipeline</h2>
     <p style="font-size: 11px; color: var(--muted); line-height: 1.5;">
       Output is true vector SVG generated by analytical hidden-line removal
       (OCCT <code>HLRBRep</code>) per solid. Composer-equivalent pipeline:
       no rasterisation, infinite zoom, edges classified by category.
     </p>
+    </section>
   </aside>
 </main>
 
@@ -4401,6 +4438,36 @@ function _markLoadedFigureBaseline() {{
   setTimeout(() => {{ _loadedFigureBaseline = _stateSig(); }}, 800);
 }}
 
+// Auto-save state.  Three knobs:
+//   _autoSaveOn        -- master switch (user can disable in settings later)
+//   _autoSaveDelayMs   -- debounce delay; restarts on every detected
+//                          change so we only save once after a burst
+//                          of tweaks settles
+//   _autoSaveInFlight  -- true while a PUT is awaiting response; we
+//                          skip the dirty check during this window so
+//                          the indicator stays on "saving..." and we
+//                          don't fire concurrent saves
+let _autoSaveOn = true;
+const _AUTO_SAVE_DELAY_MS = 1800;
+let _autoSaveTimer = null;
+let _autoSaveLastDirtySig = null;
+let _autoSaveInFlight = false;
+
+async function _autoSaveFire() {{
+  _autoSaveTimer = null;
+  if (!_autoSaveOn || _autoSaveInFlight) return;
+  if (!AppState.currentFigureId) return;
+  if (_loadedFigureBaseline == null) return;
+  const sig = _stateSig();
+  if (sig === _loadedFigureBaseline) return;
+  _autoSaveInFlight = true;
+  try {{
+    await saveCurrentAsFigure({{ silent: true }});
+  }} finally {{
+    _autoSaveInFlight = false;
+  }}
+}}
+
 function _updateSaveStatus() {{
   const el = document.getElementById('fig-save-status');
   if (!el) return;
@@ -4411,17 +4478,36 @@ function _updateSaveStatus() {{
     return;
   }}
   el.style.display = 'block';
+  if (_autoSaveInFlight) {{
+    el.textContent = 'saving...';
+    el.style.color = 'var(--accora-teal)';
+    return;
+  }}
+  const sig = _stateSig();
   const dirty = _loadedFigureBaseline != null
-                && _stateSig() !== _loadedFigureBaseline;
+                && sig !== _loadedFigureBaseline;
   if (dirty) {{
-    el.textContent = '● unsaved changes';
+    el.textContent = _autoSaveOn
+      ? '● unsaved changes (auto-save in '
+        + Math.ceil(_AUTO_SAVE_DELAY_MS / 1000) + 's)'
+      : '● unsaved changes';
     el.style.color = '#b54708';     // amber
+    // Schedule / refresh the auto-save debounce so we save once after
+    // the user stops changing things.  If the dirty signature is the
+    // same as last tick, leave the existing timer running.
+    if (_autoSaveOn && sig !== _autoSaveLastDirtySig) {{
+      _autoSaveLastDirtySig = sig;
+      if (_autoSaveTimer) clearTimeout(_autoSaveTimer);
+      _autoSaveTimer = setTimeout(_autoSaveFire, _AUTO_SAVE_DELAY_MS);
+    }}
   }} else if (_lastSavedAt) {{
     el.textContent = 'saved ' + _humanAgo(_lastSavedAt);
     el.style.color = 'var(--muted)';
+    _autoSaveLastDirtySig = null;
   }} else {{
     el.textContent = 'loaded - no changes yet';
     el.style.color = 'var(--muted)';
+    _autoSaveLastDirtySig = null;
   }}
 }}
 
@@ -4595,8 +4681,10 @@ saveCurrentAsFigure = async function(opts) {{
     return;
   }}
   if (updatingExisting) {{
-    (window.IFU_UI?.toast || function(){{}})(
-      'Saved \"' + name + '\"', 'success');
+    if (!opts.silent) {{
+      (window.IFU_UI?.toast || function(){{}})(
+        'Saved \"' + name + '\"', 'success');
+    }}
     // Update the breadcrumb in case the name changed
     const crumb = document.querySelector('#editor-breadcrumb .current');
     if (crumb) crumb.textContent = name;
