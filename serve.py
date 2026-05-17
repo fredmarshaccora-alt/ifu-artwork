@@ -40,7 +40,8 @@ from t5_hlr_vector import (
     compute_visible_footprints, run_hlr_in_region,
 )
 from ifu import (figures_store, projects_store, revisions_store,
-                  settings_store, sources_store, onshape_fetch)
+                  settings_store, sources_store, onshape_fetch,
+                  views_store)
 from ifu.config import SOURCES
 import threading
 import functools
@@ -270,7 +271,18 @@ def boot():
             file_id=s["id"], step_path=Path(s["step_path"]),
             hlr_kw=s.get("hlr_kwargs") or {},
             pre_rotate=pre_rot if pre_rot else None)
-    print(f"Cached {len(_SHAPES)} source(s).\n")
+    print(f"Cached {len(_SHAPES)} source(s).")
+    # Migrate any existing figures that don't have a View yet -- the
+    # operation is idempotent, so this is safe on every boot.  Pre-Phase-3
+    # figures spawn a 1:1 View with their stored camera.
+    try:
+        m = views_store.migrate_existing_figures()
+        if m.get("created"):
+            print(f"Views migration: created {m['created']} view(s); "
+                  f"{m['skipped']} already linked; {m['orphan']} orphan.")
+    except Exception as exc:
+        print(f"Views migration skipped: {exc}")
+    print()
 
 
 @app.route("/")
@@ -991,6 +1003,151 @@ def figures_delete(fig_id):
     if not ok:
         return jsonify({"error": "figure not found"}), 404
     return ("", 204)
+
+
+# ---- Views (Phase 3) -------------------------------------------------
+
+@app.route("/api/projects/<proj_id>/views", methods=["GET"])
+def views_list_in_project(proj_id):
+    """All views belonging to a project, newest-first.  Includes a
+    resolved ``figures`` list so the UI can render counts + thumbnails
+    without round-tripping each figure."""
+    proj = projects_store.load(proj_id)
+    if proj is None:
+        return jsonify({"error": "project not found"}), 404
+    views = views_store.views_in_project(proj_id)
+    # Include figure count so the workspace card can show "3 figures"
+    for v in views:
+        v["figure_count"] = len(v.get("figure_ids") or [])
+    return jsonify({"project_id": proj_id, "views": views})
+
+
+@app.route("/api/views", methods=["POST"])
+def views_create():
+    body = request.get_json(silent=True) or {}
+    pid = body.get("project_id")
+    sid = body.get("source_id")
+    name = body.get("name") or "Untitled view"
+    camera = body.get("camera")
+    configuration = body.get("configuration")
+    if not pid:
+        return jsonify({"error": "project_id required"}), 400
+    if projects_store.load(pid) is None:
+        return jsonify({"error": "project not found"}), 404
+    if not sid:
+        # If the project has a primary source, default to it
+        proj = projects_store.load(pid) or {}
+        sid = proj.get("primary_source_id")
+    if not sid:
+        return jsonify({"error":
+            "source_id required (project has no primary_source_id)"}), 400
+    v = views_store.new_view(project_id=pid, source_id=sid,
+                              name=name, camera=camera,
+                              configuration=configuration)
+    views_store.save(v)
+    return jsonify(v), 201
+
+
+@app.route("/api/views/<view_id>", methods=["GET"])
+def views_get(view_id):
+    v = views_store.load(view_id)
+    if v is None:
+        return jsonify({"error": "view not found"}), 404
+    return jsonify(v)
+
+
+@app.route("/api/views/<view_id>", methods=["PUT"])
+def views_update(view_id):
+    body = request.get_json(silent=True) or {}
+    existing = views_store.load(view_id)
+    if existing is None:
+        return jsonify({"error": "view not found"}), 404
+    body["id"] = existing["id"]
+    body["created_at"] = existing.get("created_at", views_store._now_iso())
+    views_store.save(body)
+    return jsonify(body)
+
+
+@app.route("/api/views/<view_id>", methods=["DELETE"])
+def views_delete(view_id):
+    cascade = request.args.get("cascade") in ("1", "true", "yes")
+    ok = views_store.delete(view_id, cascade=cascade)
+    if not ok:
+        return jsonify({"error": "view not found"}), 404
+    return ("", 204)
+
+
+@app.route("/api/views/<view_id>/figures", methods=["GET"])
+def views_figures(view_id):
+    v = views_store.load(view_id)
+    if v is None:
+        return jsonify({"error": "view not found"}), 404
+    figs = views_store.figures_in_view(view_id)
+    return jsonify({"view_id": view_id, "figures": figs})
+
+
+@app.route("/api/views/<view_id>/figures/<fig_id>", methods=["POST"])
+def views_attach_figure(view_id, fig_id):
+    ok = views_store.attach_figure(view_id, fig_id)
+    if not ok:
+        return jsonify({"error": "view or figure not found"}), 404
+    return jsonify(views_store.load(view_id))
+
+
+@app.route("/api/views/<view_id>/figures/<fig_id>", methods=["DELETE"])
+def views_detach_figure(view_id, fig_id):
+    ok = views_store.detach_figure(view_id, fig_id)
+    if not ok:
+        return jsonify({"error": "view or figure not found"}), 404
+    return jsonify(views_store.load(view_id))
+
+
+@app.route("/api/views/<view_id>/thumbnail", methods=["GET"])
+def views_thumbnail_get(view_id):
+    p = views_store.view_thumbnail_path(view_id)
+    if not p.exists():
+        return ("", 404)
+    return send_file(p, mimetype="image/png", max_age=0)
+
+
+@app.route("/api/views/<view_id>/thumbnail", methods=["PUT", "POST"])
+def views_thumbnail_put(view_id):
+    v = views_store.load(view_id)
+    if v is None:
+        return jsonify({"error": "view not found"}), 404
+    body = request.get_json(silent=True) or {}
+    durl = body.get("data_url") or ""
+    if not isinstance(durl, str) or not durl.startswith("data:image/"):
+        return jsonify({"error": "data_url must start with 'data:image/'"}), 400
+    try:
+        header, b64 = durl.split(",", 1)
+    except ValueError:
+        return jsonify({"error": "malformed data URL"}), 400
+    import base64
+    try:
+        png = base64.b64decode(b64, validate=True)
+    except Exception:
+        return jsonify({"error": "data URL payload is not valid base64"}), 400
+    if len(png) < 16:
+        return jsonify({"error": "thumbnail payload is empty"}), 400
+    if len(png) > 200 * 1024:
+        return jsonify({"error":
+            f"thumbnail too large ({len(png)//1024}KB); cap is 200KB"}), 413
+    p = views_store.view_thumbnail_path(view_id)
+    try:
+        p.write_bytes(png)
+    except Exception as exc:
+        return jsonify({"error": f"write failed: {exc}"}), 500
+    return jsonify({"ok": True, "bytes": len(png)})
+
+
+@app.route("/api/views/migrate", methods=["POST"])
+def views_migrate():
+    """One-shot helper: walk every Figure with a project_id and spawn
+    a 1:1 View for any figure not already pointing at one.  Idempotent
+    -- re-running it is safe."""
+    counts = views_store.migrate_existing_figures()
+    return jsonify(counts)
 
 
 @app.route("/api/figures/<fig_id>/thumbnail", methods=["GET"])
