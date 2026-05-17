@@ -388,15 +388,18 @@ HTML_TEMPLATE = r"""<!doctype html>
       <h2>Figures</h2>
       <p style="font-size:11px; color: var(--muted); margin: 0 0 6px 0;">
         A figure = camera + selection + per-part styles.</p>
-      <div style="display:flex; gap:4px; margin-bottom:6px;">
+      <div style="display:flex; gap:4px; margin-bottom:4px;">
         <input type="text" id="fig-name" placeholder="figure name..."
                style="flex:1; padding:4px 6px; font-size:12px;
                       border:1px solid var(--line); border-radius:3px;">
         <button id="btn-fig-save"
-                title="Save the current selection / styles / camera">save</button>
+                title="Save the current selection / styles / camera (Ctrl+S)">save</button>
         <button id="btn-fig-save-as" style="display:none;"
                 title="Create a new figure from current state">save as new...</button>
       </div>
+      <div id="fig-save-status"
+           style="font-size:11px; color:var(--muted); margin: 0 0 6px 0;
+                  min-height: 14px; display: none;"></div>
       <ul id="figures-list" class="saved-views-list"></ul>
     </section>
 
@@ -2694,6 +2697,11 @@ async function EditorScreen(container, params) {{
                       + '" with the current camera, selection, styles';
         }}
         if (sa) sa.style.display = '';
+        // Capture the figure's loaded state as the dirty-tracking
+        // baseline.  Indicator polls every 1s.
+        if (window._markLoadedFigureBaseline) {{
+          window._markLoadedFigureBaseline();
+        }}
       }}, 100);
     }}, 200);
   }}
@@ -3210,6 +3218,15 @@ function applyHighlights() {{
 //   R        -- reset 3D camera to current view's direction
 //   F        -- fit (reset pan/zoom on active 2D pane)
 window.addEventListener('keydown', (e) => {{
+  // Ctrl/Cmd+S = save the current figure.  This works even if focus
+  // is in an <input> (e.g. the fig-name field) because we want save
+  // to be available everywhere in the editor.  Browser default is
+  // "save page" -- preventDefault so we capture it.
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {{
+    e.preventDefault();
+    if (typeof saveCurrentAsFigure === 'function') saveCurrentAsFigure();
+    return;
+  }}
   const t = e.target;
   if (t && /^(INPUT|TEXTAREA|SELECT)$/i.test(t.tagName)) return;
   if (e.key === 'Escape') return clearHighlights();
@@ -4350,6 +4367,85 @@ $('fig-name').addEventListener('keydown', (e) => {{
 }});
 $('btn-fig-save-as').addEventListener('click', () =>
   saveCurrentAsFigure({{ forceNew: true }}));
+
+// ---- Dirty-state indicator -----------------------------------------
+// When a figure is loaded (via /#/project/.../figure/<fid>) we track
+// the state we loaded and compare to the live state.  Drift = unsaved
+// changes.  The status line under the save button surfaces this so
+// the user knows when to hit save.
+let _loadedFigureBaseline = null;     // JSON snapshot at load-time
+let _lastSavedAt = null;              // ISO time string
+
+function _stateSig() {{
+  // Cheap hash of the parts of state we persist.  JSON.stringify is
+  // fine here -- the keys are small dicts / short arrays.
+  try {{
+    const s = _gatherCurrentState();
+    // Don't compare layers when the cb wiring hasn't booted yet
+    return JSON.stringify({{
+      source_id: s.source_id,
+      view_id:   s.view_id,
+      camera:    s.camera,
+      selection: (s.selection || []).slice().sort((a, b) => a - b),
+      styles:    s.styles_per_part || {{}},
+      layers:    s.layers_on || {{}},
+      annot:     (s.annotations || []).length,
+    }});
+  }} catch (_e) {{ return ''; }}
+}}
+
+function _markLoadedFigureBaseline() {{
+  // Capture the moment after _loadFigureIntoEditor finishes restoring
+  // the figure -- the editor's state IS the loaded figure now, so
+  // dirty=false until the user touches something.
+  setTimeout(() => {{ _loadedFigureBaseline = _stateSig(); }}, 800);
+}}
+
+function _updateSaveStatus() {{
+  const el = document.getElementById('fig-save-status');
+  if (!el) return;
+  const inFigure = (typeof AppState !== 'undefined')
+                     && !!AppState.currentFigureId;
+  if (!inFigure) {{
+    el.style.display = 'none';
+    return;
+  }}
+  el.style.display = 'block';
+  const dirty = _loadedFigureBaseline != null
+                && _stateSig() !== _loadedFigureBaseline;
+  if (dirty) {{
+    el.textContent = '● unsaved changes';
+    el.style.color = '#b54708';     // amber
+  }} else if (_lastSavedAt) {{
+    el.textContent = 'saved ' + _humanAgo(_lastSavedAt);
+    el.style.color = 'var(--muted)';
+  }} else {{
+    el.textContent = 'loaded - no changes yet';
+    el.style.color = 'var(--muted)';
+  }}
+}}
+
+function _humanAgo(iso) {{
+  const ms = Date.now() - new Date(iso).getTime();
+  if (ms < 5000) return 'just now';
+  if (ms < 60000) return Math.floor(ms / 1000) + 's ago';
+  if (ms < 3600000) return Math.floor(ms / 60000) + 'm ago';
+  return Math.floor(ms / 3600000) + 'h ago';
+}}
+
+// Poll for state drift.  1s is fine -- the indicator doesn't need to
+// react instantly, and we want to keep this cheap.
+setInterval(_updateSaveStatus, 1000);
+
+// Expose so EditorScreen / saveCurrentAsFigure can poke them
+window._markLoadedFigureBaseline = _markLoadedFigureBaseline;
+window._setLastSavedAt = (iso) => {{
+  _lastSavedAt = iso || new Date().toISOString();
+  // Reset baseline to the just-saved state so the indicator flips
+  // back to "saved Xs ago" right away.
+  _loadedFigureBaseline = _stateSig();
+  _updateSaveStatus();
+}};
 // Initial load (once the server probe says we're online)
 // probeServer fires its .then before this; refresh manually after a beat.
 setTimeout(refreshFiguresList, 1500);
@@ -4504,6 +4600,7 @@ saveCurrentAsFigure = async function(opts) {{
     // Update the breadcrumb in case the name changed
     const crumb = document.querySelector('#editor-breadcrumb .current');
     if (crumb) crumb.textContent = name;
+    if (window._setLastSavedAt) window._setLastSavedAt();
   }} else {{
     (window.IFU_UI?.toast || function(){{}})(
       'Created \"' + name + '\"', 'success');
