@@ -33,13 +33,25 @@ def _ensure_dir() -> None:
     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _safe_fig_id(fig_id: str) -> str:
+    """Defensive: figure ids come from URL paths, never let them escape."""
+    return "".join(c for c in fig_id if c.isalnum() or c in "-_")
+
+
 def figure_path(fig_id: str) -> Path:
     """Path to the JSON file backing a figure id.  Caller is responsible
     for checking ``.exists()`` before reading."""
     _ensure_dir()
-    # Defensive: figure ids come from URL paths, never let them escape
-    safe = "".join(c for c in fig_id if c.isalnum() or c in "-_")
-    return FIGURES_DIR / f"{safe}.json"
+    return FIGURES_DIR / f"{_safe_fig_id(fig_id)}.json"
+
+
+def figure_thumbnail_path(fig_id: str) -> Path:
+    """Path to the PNG thumbnail for this figure.  Sits next to the
+    JSON in out/figures/.  Caller checks ``.exists()`` -- absent
+    thumbnails are normal for figures saved before the feature
+    landed (or that the client failed to capture)."""
+    _ensure_dir()
+    return FIGURES_DIR / f"{_safe_fig_id(fig_id)}.png"
 
 
 def new_figure(name: str, source_id: str,
@@ -92,15 +104,25 @@ def load(fig_id: str) -> Optional[dict]:
 
 
 def delete(fig_id: str) -> bool:
-    """Remove the figure's JSON file.  Returns True if it existed."""
+    """Remove the figure's JSON file (and any thumbnail).  Returns
+    True if the JSON existed."""
     p = figure_path(fig_id)
     if not p.exists():
         return False
     try:
         p.unlink()
-        return True
     except Exception:
         return False
+    # Best-effort: clear the thumbnail too if it exists.  Failure here
+    # doesn't fail the delete -- the figure's gone, the orphan PNG
+    # just wastes a few KB.
+    try:
+        tp = figure_thumbnail_path(fig_id)
+        if tp.exists():
+            tp.unlink()
+    except Exception:
+        pass
+    return True
 
 
 def list_all() -> list[dict]:

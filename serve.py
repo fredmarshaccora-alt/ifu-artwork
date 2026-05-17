@@ -993,6 +993,57 @@ def figures_delete(fig_id):
     return ("", 204)
 
 
+@app.route("/api/figures/<fig_id>/thumbnail", methods=["GET"])
+def figures_thumbnail_get(fig_id):
+    """Serve the PNG thumbnail captured at save-time.  404 when the
+    figure has never been saved with one (older figures, or capture
+    failed client-side)."""
+    p = figures_store.figure_thumbnail_path(fig_id)
+    if not p.exists():
+        return ("", 404)
+    return send_file(p, mimetype="image/png", max_age=0)
+
+
+@app.route("/api/figures/<fig_id>/thumbnail", methods=["PUT", "POST"])
+def figures_thumbnail_put(fig_id):
+    """Store a PNG thumbnail for this figure.  Body: ``{data_url:
+    "data:image/png;base64,..."}`` -- the data URL produced by
+    canvas.toDataURL on the client.
+
+    Caps the stored thumbnail at 200 KB to keep the figures folder
+    light; larger blobs are rejected so a misbehaving client can't
+    fill the disk.
+    """
+    fig = figures_store.load(fig_id)
+    if fig is None:
+        return jsonify({"error": "figure not found"}), 404
+    body = request.get_json(silent=True) or {}
+    durl = body.get("data_url") or ""
+    if not isinstance(durl, str) or not durl.startswith("data:image/"):
+        return jsonify({"error": "data_url must start with 'data:image/'"}), 400
+    try:
+        header, b64 = durl.split(",", 1)
+    except ValueError:
+        return jsonify({"error": "malformed data URL"}), 400
+    import base64
+    try:
+        png = base64.b64decode(b64, validate=True)
+    except Exception:
+        return jsonify({"error": "data URL payload is not valid base64"}), 400
+    if len(png) < 16:
+        return jsonify({"error": "thumbnail payload is empty"}), 400
+    if len(png) > 200 * 1024:
+        return jsonify({"error":
+            f"thumbnail too large ({len(png)//1024}KB); cap is 200KB"}), 413
+    p = figures_store.figure_thumbnail_path(fig_id)
+    try:
+        p.write_bytes(png)
+    except Exception as exc:
+        return jsonify({"error": f"write failed: {exc}"}), 500
+    return jsonify({"ok": True, "bytes": len(png),
+                    "url": f"/api/figures/{fig_id}/thumbnail"})
+
+
 @app.route("/api/render_region", methods=["POST"])
 @_occt_serialised
 def render_region():

@@ -181,6 +181,119 @@ HTML_TEMPLATE = r"""<!doctype html>
   body.project-scoped-editor header {{
     padding-top: 8px;
     padding-bottom: 8px;
+    background: var(--c-surface);
+    border-bottom: 1px solid var(--c-line);
+    box-shadow: var(--shadow-1);
+  }}
+  body.project-scoped-editor header h1 {{
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--c-accora-dark);
+    letter-spacing: 0.2px;
+  }}
+  /* Re-skin the legacy buttons in project mode to match the G.0
+     design system (Onshape-style chrome: subtle borders, teal accents
+     on hover, primary-tinted for active, no garish grey). */
+  body.project-scoped-editor header button,
+  body.project-scoped-editor .three-toolbar button {{
+    font-family: var(--font-ui, Inter, sans-serif);
+    font-size: 12.5px;
+    font-weight: 500;
+    padding: 5px 10px;
+    border: 1px solid var(--c-line);
+    background: var(--c-surface);
+    color: var(--c-text);
+    border-radius: var(--radius-1);
+    cursor: pointer;
+    transition: background 0.12s, border-color 0.12s, color 0.12s;
+  }}
+  body.project-scoped-editor header button:hover,
+  body.project-scoped-editor .three-toolbar button:hover {{
+    background: var(--c-accora-pale);
+    border-color: var(--c-accora);
+    color: var(--c-accora-dark);
+  }}
+  body.project-scoped-editor header button.active {{
+    background: var(--c-accora);
+    border-color: var(--c-accora);
+    color: #fff;
+  }}
+  body.project-scoped-editor header button.active:hover {{
+    background: var(--c-accora-dark);
+    border-color: var(--c-accora-dark);
+  }}
+  body.project-scoped-editor .three-toolbar button.primary {{
+    background: var(--c-accora);
+    border-color: var(--c-accora);
+    color: #fff;
+  }}
+  body.project-scoped-editor .three-toolbar button.primary:hover {{
+    background: var(--c-accora-dark);
+    border-color: var(--c-accora-dark);
+    color: #fff;
+  }}
+  body.project-scoped-editor .seg-ctl {{
+    border-color: var(--c-line);
+    border-radius: var(--radius-1);
+    overflow: hidden;
+  }}
+  body.project-scoped-editor .seg-btn {{
+    font-family: var(--font-ui, Inter, sans-serif);
+    font-size: 12.5px;
+    font-weight: 500;
+    background: var(--c-surface);
+    color: var(--c-text-muted);
+    border-right: 1px solid var(--c-line);
+  }}
+  body.project-scoped-editor .seg-btn:hover {{
+    background: var(--c-accora-pale);
+    color: var(--c-accora-dark);
+  }}
+  body.project-scoped-editor .seg-btn.active {{
+    background: var(--c-accora);
+    color: #fff;
+  }}
+  /* Back-to-project pill: sits right after the logo, primary action
+     to leave the editor.  Visually distinct so it's discoverable. */
+  body.project-scoped-editor .back-to-project {{
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12.5px;
+    font-weight: 500;
+    padding: 5px 12px;
+    border-radius: 16px;
+    border: 1px solid var(--c-line);
+    background: var(--c-surface);
+    color: var(--c-text-muted);
+    text-decoration: none;
+    transition: background 0.12s, color 0.12s, border-color 0.12s;
+    cursor: pointer;
+  }}
+  body.project-scoped-editor .back-to-project:hover {{
+    background: var(--c-accora-pale);
+    border-color: var(--c-accora);
+    color: var(--c-accora-dark);
+  }}
+  /* The whole legacy crumb strip below the header looks dev-y in
+     project mode; restyle to match the rest of the chrome. */
+  body.project-scoped-editor #editor-breadcrumb {{
+    background: var(--c-surface-1);
+    border-bottom: 1px solid var(--c-line);
+    color: var(--c-text-muted);
+    padding: 6px 16px;
+  }}
+  body.project-scoped-editor #editor-breadcrumb .current {{
+    color: var(--c-text);
+    font-weight: 600;
+  }}
+  body.project-scoped-editor #editor-breadcrumb a {{
+    color: var(--c-text-muted);
+    text-decoration: none;
+  }}
+  body.project-scoped-editor #editor-breadcrumb a:hover {{
+    color: var(--c-accora);
+    text-decoration: underline;
   }}
   body.layout-2d .canvas-wrap {{ grid-area: center; display: block; }}
   body.layout-2d .webgl-wrap  {{ display: none; }}
@@ -933,6 +1046,12 @@ const _DESIGN_CSS = `
   align-items: center; justify-content: center;
   color: var(--c-text-muted); cursor: pointer;
   font-size: var(--t-strong);
+}}
+.card.figure-card {{
+  min-height: 200px;
+}}
+.card.figure-card .card-title {{
+  margin-top: auto;
 }}
 .card.placeholder:hover {{
   background: var(--c-surface); border-style: solid;
@@ -1945,7 +2064,40 @@ async function ProjectScreen(container, params) {{
   grid.appendChild(newCard);
 
   for (const fig of figs) {{
-    const card = h('div.card');
+    const card = h('div.card.figure-card');
+    // Thumbnail: <img> with onerror hiding itself if the figure
+    // was saved before the thumbnail feature landed (404 ok).
+    // Cache-bust with updated_at so a fresh save reloads it.
+    const thumb = h('img', {{
+      src: API_BASE + '/api/figures/' + encodeURIComponent(fig.id)
+           + '/thumbnail?v=' + encodeURIComponent(fig.updated_at || ''),
+      alt: '',
+      style: {{ width: '100%', height: '120px',
+                  objectFit: 'contain',
+                  background: 'var(--c-surface-1)',
+                  borderRadius: 'var(--radius-1)',
+                  marginBottom: '6px',
+                  border: '1px solid var(--c-line)' }},
+    }});
+    thumb.onerror = () => {{
+      // No thumbnail yet -- show a tasteful placeholder
+      thumb.removeAttribute('src');
+      thumb.style.display = 'flex';
+      thumb.style.alignItems = 'center';
+      thumb.style.justifyContent = 'center';
+      thumb.replaceWith(h('div', {{
+        style: {{ width: '100%', height: '120px',
+                    background: 'var(--c-surface-1)',
+                    borderRadius: 'var(--radius-1)',
+                    border: '1px dashed var(--c-line)',
+                    marginBottom: '6px',
+                    display: 'flex', alignItems: 'center',
+                    justifyContent: 'center',
+                    color: 'var(--c-text-muted)',
+                    fontSize: '11px', fontStyle: 'italic' }} }},
+        'no preview yet'));
+    }};
+    card.appendChild(thumb);
     card.appendChild(h('div.card-title', fig.name || '(untitled)'));
     const meta = h('div.card-meta', [
       h('span', fig.source_id || '?'),
@@ -2739,6 +2891,20 @@ async function EditorScreen(container, params) {{
         if (window._markLoadedFigureBaseline) {{
           window._markLoadedFigureBaseline();
         }}
+        // Inject a "back to project" pill in the legacy header so
+        // there's an obvious exit.  Sits right after the logo.
+        const hdr = document.querySelector('header');
+        if (hdr && !hdr.querySelector('.back-to-project')) {{
+          const pill = document.createElement('a');
+          pill.className = 'back-to-project';
+          pill.href = '#/project/' + encodeURIComponent(projId);
+          pill.title = 'Return to ' + (proj?.name || 'project') + ' workspace';
+          pill.innerHTML = '<span style="font-size:13px;">←</span> '
+                            + (proj?.name || 'Project');
+          const h1 = hdr.querySelector('h1')?.parentElement;
+          if (h1) h1.insertAdjacentElement('afterend', pill);
+          else hdr.insertBefore(pill, hdr.firstChild);
+        }}
       }}, 100);
     }}, 200);
   }}
@@ -2767,6 +2933,10 @@ async function EditorScreen(container, params) {{
     if (typeof AppState !== 'undefined') {{
       AppState.currentFigureId = null;
     }}
+    // Pull the back-to-project pill so non-project routes don't
+    // inherit a stale exit
+    document.querySelectorAll('header .back-to-project')
+            .forEach(el => el.remove());
   }};
 }}
 
@@ -4532,6 +4702,83 @@ window._setLastSavedAt = (iso) => {{
   _loadedFigureBaseline = _stateSig();
   _updateSaveStatus();
 }};
+
+// ---- Thumbnail capture ---------------------------------------------
+// Rasterize the currently-active SVG pane into a small PNG and PUT
+// it to /api/figures/<fid>/thumbnail.  The Project workspace cards
+// use this as their preview image.  Fire-and-forget: the figure's
+// save path still completes if thumbnail capture fails.
+async function _captureFigureThumbnail() {{
+  const pane = typeof activePane === 'function' ? activePane() : null;
+  const svg = pane?.querySelector('svg');
+  if (!svg) return null;
+  // Strip any pan/zoom view-transform group temporarily so the
+  // thumbnail captures the WHOLE figure, not whatever the user
+  // happens to have panned to.
+  const viewG = svg.querySelector(':scope > g.view-transform');
+  const prevTransform = viewG?.getAttribute('transform');
+  if (viewG) viewG.removeAttribute('transform');
+  let outDataUrl = null;
+  try {{
+    const xml = new XMLSerializer().serializeToString(svg);
+    const blob = new Blob([xml], {{ type: 'image/svg+xml;charset=utf-8' }});
+    const url = URL.createObjectURL(blob);
+    try {{
+      const img = await new Promise((res, rej) => {{
+        const i = new Image();
+        i.onload = () => res(i);
+        i.onerror = rej;
+        i.src = url;
+      }});
+      const W = 320, H = 240;
+      const canvas = document.createElement('canvas');
+      canvas.width = W; canvas.height = H;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, W, H);
+      // Fit-inside, preserve aspect, centred
+      const iw = img.width || W, ih = img.height || H;
+      const ar = iw / ih;
+      let dw = W, dh = H, dx = 0, dy = 0;
+      if (ar > W / H) {{ dh = W / ar; dy = (H - dh) / 2; }}
+      else {{ dw = H * ar; dx = (W - dw) / 2; }}
+      ctx.drawImage(img, dx, dy, dw, dh);
+      outDataUrl = canvas.toDataURL('image/png');
+    }} finally {{
+      URL.revokeObjectURL(url);
+    }}
+  }} catch (e) {{
+    console.warn('[thumbnail] capture failed:', e?.message || e);
+    outDataUrl = null;
+  }}
+  if (viewG && prevTransform !== null) {{
+    viewG.setAttribute('transform', prevTransform);
+  }}
+  return outDataUrl;
+}}
+
+// Debounce wrapper -- many auto-saves can fire close together.  We
+// only want one thumbnail PUT per "burst".
+let _thumbTimer = null;
+function _scheduleThumbnailUpload(figId) {{
+  if (!figId) return;
+  if (_thumbTimer) clearTimeout(_thumbTimer);
+  _thumbTimer = setTimeout(async () => {{
+    _thumbTimer = null;
+    const durl = await _captureFigureThumbnail();
+    if (!durl) return;
+    try {{
+      await fetch(API_BASE + '/api/figures/'
+                    + encodeURIComponent(figId) + '/thumbnail',
+                    {{ method: 'PUT',
+                       headers: {{ 'Content-Type': 'application/json' }},
+                       body: JSON.stringify({{ data_url: durl }}) }});
+    }} catch (e) {{
+      console.warn('[thumbnail] upload failed:', e?.message || e);
+    }}
+  }}, 800);
+}}
+window._scheduleThumbnailUpload = _scheduleThumbnailUpload;
 // Initial load (once the server probe says we're online)
 // probeServer fires its .then before this; refresh manually after a beat.
 setTimeout(refreshFiguresList, 1500);
@@ -4689,6 +4936,11 @@ saveCurrentAsFigure = async function(opts) {{
     const crumb = document.querySelector('#editor-breadcrumb .current');
     if (crumb) crumb.textContent = name;
     if (window._setLastSavedAt) window._setLastSavedAt();
+    // Re-capture the thumbnail so workspace cards stay in sync with
+    // whatever the user has been styling.  Fire-and-forget.
+    if (window._scheduleThumbnailUpload) {{
+      window._scheduleThumbnailUpload(loadedFigId);
+    }}
   }} else {{
     (window.IFU_UI?.toast || function(){{}})(
       'Created \"' + name + '\"', 'success');
