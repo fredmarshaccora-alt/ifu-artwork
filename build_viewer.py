@@ -393,7 +393,9 @@ HTML_TEMPLATE = r"""<!doctype html>
                style="flex:1; padding:4px 6px; font-size:12px;
                       border:1px solid var(--line); border-radius:3px;">
         <button id="btn-fig-save"
-                title="Capture current state as a new figure">save</button>
+                title="Save the current selection / styles / camera">save</button>
+        <button id="btn-fig-save-as" style="display:none;"
+                title="Create a new figure from current state">save as new...</button>
       </div>
       <ul id="figures-list" class="saved-views-list"></ul>
     </section>
@@ -2675,6 +2677,23 @@ async function EditorScreen(container, params) {{
           pSel.value = projId;
           pSel.dispatchEvent(new Event('change'));
         }}
+        // Pre-fill the figure-name input + retitle the save button
+        // so the user knows hitting save UPDATES this figure, not
+        // creates a duplicate.  Reveal the secondary "save as new"
+        // action for explicit forking.
+        const fn = document.getElementById('fig-name');
+        const sb = document.getElementById('btn-fig-save');
+        const sa = document.getElementById('btn-fig-save-as');
+        if (fn && fig) {{
+          fn.value = fig.name || '';
+          fn.placeholder = 'rename to save under different name';
+        }}
+        if (sb) {{
+          sb.textContent = 'save';
+          sb.title = 'Update "' + (fig?.name || 'this figure')
+                      + '" with the current camera, selection, styles';
+        }}
+        if (sa) sa.style.display = '';
       }}, 100);
     }}, 200);
   }}
@@ -2690,6 +2709,19 @@ async function EditorScreen(container, params) {{
   return () => {{
     _removeCrumb();
     document.body.classList.remove('project-scoped-editor');
+    // Restore the original save button + hide save-as-new
+    const fn = document.getElementById('fig-name');
+    const sb = document.getElementById('btn-fig-save');
+    const sa = document.getElementById('btn-fig-save-as');
+    if (fn) {{ fn.value = ''; fn.placeholder = 'figure name...'; }}
+    if (sb) {{
+      sb.textContent = 'save';
+      sb.title = 'Capture current state as a new figure';
+    }}
+    if (sa) sa.style.display = 'none';
+    if (typeof AppState !== 'undefined') {{
+      AppState.currentFigureId = null;
+    }}
   }};
 }}
 
@@ -4316,6 +4348,8 @@ $('btn-fig-save').addEventListener('click', saveCurrentAsFigure);
 $('fig-name').addEventListener('keydown', (e) => {{
   if (e.key === 'Enter') saveCurrentAsFigure();
 }});
+$('btn-fig-save-as').addEventListener('click', () =>
+  saveCurrentAsFigure({{ forceNew: true }}));
 // Initial load (once the server probe says we're online)
 // probeServer fires its .then before this; refresh manually after a beat.
 setTimeout(refreshFiguresList, 1500);
@@ -4405,26 +4439,88 @@ refreshFiguresList = async function() {{
   }}
 }};
 
-// Override save so it sets project_id from the current selection
+// Override save so it sets project_id from the current selection.
+// Also: if the user navigated in via /#/project/<pid>/figure/<fid>,
+// "save" should UPDATE that figure (PUT) rather than create a new
+// one (POST).  The previous behaviour silently spammed duplicate
+// figures whenever you tweaked styles and pressed save.
 const _origSaveCurrentAsFigure = saveCurrentAsFigure;
-saveCurrentAsFigure = async function() {{
+saveCurrentAsFigure = async function(opts) {{
+  opts = opts || {{}};
   const nameInput = $('fig-name');
-  const name = (nameInput.value || '').trim();
+  // Bind: if an existing figure is loaded (via figure route),
+  //   default to that name and UPDATE in place.
+  // Free-form: caller passed forceNew, OR no figure is loaded ->
+  //   require a name from the input and POST a new figure.
+  const loadedFigId = (typeof AppState !== 'undefined')
+                       ? AppState.currentFigureId : null;
+  const updatingExisting = !!loadedFigId && !opts.forceNew;
+
+  let name = (nameInput.value || '').trim();
+  if (!name && updatingExisting) {{
+    // Look up the figure's stored name so a save with an empty
+    // input doesn't blank the name field.
+    try {{
+      const r0 = await fetch(API_BASE + '/api/figures/'
+                              + encodeURIComponent(loadedFigId));
+      if (r0.ok) name = (await r0.json()).name || '';
+    }} catch (_e) {{}}
+  }}
   if (!name) {{ nameInput.focus(); return; }}
+
   const body = {{ name, ..._gatherCurrentState() }};
   const pid = projectSel?.value || '';
   if (pid && pid !== '__orphans__') body.project_id = pid;
-  const r = await fetch(API_BASE + '/api/figures', {{
-    method: 'POST',
-    headers: {{ 'Content-Type': 'application/json' }},
-    body: JSON.stringify(body),
-  }});
-  if (!r.ok) {{
-    alert('Save figure failed: ' + r.status);
+
+  let url, method;
+  if (updatingExisting) {{
+    url = API_BASE + '/api/figures/' + encodeURIComponent(loadedFigId);
+    method = 'PUT';
+    body.id = loadedFigId;
+  }} else {{
+    url = API_BASE + '/api/figures';
+    method = 'POST';
+  }}
+  let r;
+  try {{
+    r = await fetch(url, {{
+      method,
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify(body),
+    }});
+  }} catch (e) {{
+    (window.IFU_UI?.toast || function(){{}})(
+      'Save failed: ' + (e.message || e), 'error');
     return;
   }}
-  nameInput.value = '';
-  refreshFiguresList();
+  if (!r.ok) {{
+    (window.IFU_UI?.toast || function(){{}})(
+      'Save failed: HTTP ' + r.status, 'error');
+    return;
+  }}
+  if (updatingExisting) {{
+    (window.IFU_UI?.toast || function(){{}})(
+      'Saved \"' + name + '\"', 'success');
+    // Update the breadcrumb in case the name changed
+    const crumb = document.querySelector('#editor-breadcrumb .current');
+    if (crumb) crumb.textContent = name;
+  }} else {{
+    (window.IFU_UI?.toast || function(){{}})(
+      'Created \"' + name + '\"', 'success');
+    nameInput.value = '';
+    refreshFiguresList();
+    // If we just forked, hop into the new figure so subsequent
+    // saves update it.  /api/figures returns the new record.
+    if (opts.forceNew) {{
+      try {{
+        const fig = await r.json();
+        if (fig && fig.id && pid) {{
+          location.hash = '#/project/' + encodeURIComponent(pid)
+                          + '/figure/' + encodeURIComponent(fig.id);
+        }}
+      }} catch (_e) {{}}
+    }}
+  }}
 }};
 
 $('btn-project-new').addEventListener('click', async () => {{
