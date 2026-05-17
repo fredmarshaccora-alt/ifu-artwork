@@ -177,19 +177,34 @@ HTML_TEMPLATE = r"""<!doctype html>
   body.project-scoped-editor [data-ed-control="dev-prose"] {{
     display: none !important;
   }}
-  /* Slimmer header padding when the dev controls are gone */
+  /* Slim header in project mode -- the dev row + the breadcrumb were
+     stacking up to ~80px before; now ~42px total. */
   body.project-scoped-editor header {{
-    padding-top: 8px;
-    padding-bottom: 8px;
+    padding: 2px 16px;
+    gap: 12px;
+    min-height: 0;
     background: var(--c-surface);
     border-bottom: 1px solid var(--c-line);
-    box-shadow: var(--shadow-1);
+    box-shadow: none;
   }}
   body.project-scoped-editor header h1 {{
-    font-size: 15px;
-    font-weight: 600;
+    font-size: 13px;
+    font-weight: 700;
     color: var(--c-accora-dark);
     letter-spacing: 0.2px;
+    line-height: 28px;
+  }}
+  /* Tighten the per-button vertical space */
+  body.project-scoped-editor header button,
+  body.project-scoped-editor header .seg-btn {{
+    padding-top: 3px;
+    padding-bottom: 3px;
+    line-height: 18px;
+  }}
+  /* Breadcrumb is now redundant with the back-to-project pill; hide
+     it in project mode to claw back another row of vertical space. */
+  body.project-scoped-editor #editor-breadcrumb {{
+    display: none;
   }}
   /* Re-skin the legacy buttons in project mode to match the G.0
      design system (Onshape-style chrome: subtle borders, teal accents
@@ -2664,8 +2679,15 @@ async function SettingsScreen(container) {{
         headers: {{ 'Content-Type': 'application/json' }},
         body: JSON.stringify(patch),
       }});
-      if (r.ok) settings = await r.json();
-    }} catch (_e) {{}}
+      if (r.ok) {{
+        settings = await r.json();
+        toast('Settings saved', 'success');
+      }} else {{
+        toast('Save failed: HTTP ' + r.status, 'error');
+      }}
+    }} catch (e) {{
+      toast('Save failed: ' + (e.message || e), 'error');
+    }}
   }}
 
   // ---- General ----
@@ -4179,6 +4201,33 @@ function injectLiveSVG(file_id, view_dir, svgText) {{
   // attached flag must be cleared so attachInteractivity rewires the new svg
   pane.querySelector('svg')?.removeAttribute('data-attached');
 
+  // Mine the SVG for its part indices.  Dynamic Onshape sources have
+  // no baked CATALOGUE parts list, but the SVG itself contains
+  //   <g class="part part-NNN" data-part="N">
+  // for every part with visible geometry.  Reading those means we
+  // can prefetch the assembly footprint raster ahead of the user's
+  // first click -- otherwise that first click eats a ~46s wait
+  // before the closed-loop outline appears.
+  try {{
+    const ids = new Set();
+    pane.querySelectorAll('[data-part]').forEach(g => {{
+      const n = parseInt(g.dataset.part, 10);
+      if (Number.isFinite(n)) ids.add(n);
+    }});
+    if (ids.size) {{
+      // Update / create the CATALOGUE entry's parts list so
+      // refreshPartList + prefetchFootprintsForCurrentView find them.
+      let cf = CATALOGUE.find(x => x.file_id === file_id);
+      if (!cf) {{
+        cf = {{ file_id, file_label: file_id, parts: [], views: [] }};
+        CATALOGUE.push(cf);
+      }}
+      const sorted = [...ids].sort((a, b) => a - b);
+      cf.parts = sorted.map(idx => ({{ idx, label: 'part_'
+                                          + String(idx).padStart(3, '0') }}));
+    }}
+  }} catch (_e) {{}}
+
   // Add or update the "Live" option in the View dropdown (per-source).
   // Dynamic Onshape imports aren't in the baked CATALOGUE -- create
   // a stub entry on the fly so refreshViews() can populate the View
@@ -4211,6 +4260,15 @@ function injectLiveSVG(file_id, view_dir, svgText) {{
   }} else {{
     console.warn('[injectLiveSVG] file_id mismatch: fileSel=',
                   fileSel.value, ' got=', file_id);
+  }}
+  // Fire the assembly-wide footprint raster in the background so the
+  // user's FIRST click on a part gets a closed-loop outline instantly
+  // -- not the 46-second wait that made the outline look "stuck on
+  // partial open polylines".  The endpoint memoises per-view so this
+  // pays the raster cost once; further selections in the same view
+  // hit the cache.
+  if (typeof prefetchFootprintsForCurrentView === 'function') {{
+    setTimeout(() => prefetchFootprintsForCurrentView(), 100);
   }}
 }}
 
@@ -5395,14 +5453,16 @@ function applySilhouetteFill(svg, highlights, fillOn, fillColor, fillAlpha,
   // ---- 2) BOLD EDGE stroke (always) -------------------------------
   // Prefer the rasterized FOOTPRINT polygon (one closed loop per
   // visible piece -- so a part occluded in 3 places gets 3 separate
-  // bold loops, exactly what you'd expect).  Falls back to the local
-  // HLR paths if the server hasn't responded yet.
+  // bold loops, exactly what you'd expect).  PER-PART decision so a
+  // single missing footprint doesn't fall every part back to open
+  // polylines.
   const strokeSubpaths = [];
-  let useFootprint = false;
+  const _fallbackIdx = [];
+  let _withFp = 0;
   for (const idx of idxList) {{
     const fp = _getFootprint(fid, vid, idx);
     if (fp && fp.length) {{
-      useFootprint = true;
+      _withFp++;
       fp.forEach(pl => {{
         if (!pl || pl.length < 2) return;
         strokeSubpaths.push(
@@ -5410,17 +5470,21 @@ function applySilhouetteFill(svg, highlights, fillOn, fillColor, fillAlpha,
                   .join(' L ') + ' Z'
         );
       }});
+    }} else {{
+      _fallbackIdx.push(idx);
     }}
   }}
-  if (!useFootprint) {{
-    // Fallback: open polylines from assembly HLR (immediate, no fetch
-    // round trip).  These are visibility-aware but never closed.
-    if (_DBG_ON || console) {{
-      console.log('[silhouette] no footprint cache for sel='
-        + JSON.stringify(idxList) + ' fid=' + fid + ' vid=' + vid
-        + ' -- falling back to open polylines');
+  // Open-polyline fallback ONLY for the parts that have no footprint yet
+  // (still in flight or genuinely empty from server).  This is the
+  // "partial outline" the user sees during the ~46s assembly raster on
+  // first click of a heavy source -- the prefetch in injectLiveSVG
+  // should make this window short.
+  if (_fallbackIdx.length) {{
+    if (console) {{
+      console.log('[silhouette] ' + _withFp + ' parts using footprint, '
+        + _fallbackIdx.length + ' falling back: ' + JSON.stringify(_fallbackIdx));
     }}
-    for (const idx of idxList) {{
+    for (const idx of _fallbackIdx) {{
       const partCls = '.part-' + String(idx).padStart(3, '0');
       svg.querySelectorAll(
         '.layer-outline_v ' + partCls + ' path, '
@@ -5431,8 +5495,8 @@ function applySilhouetteFill(svg, highlights, fillOn, fillColor, fillAlpha,
       }});
     }}
   }} else if (_DBG_ON) {{
-    console.log('[silhouette] using footprint loops for sel='
-      + JSON.stringify(idxList) + ': ' + strokeSubpaths.length + ' subpaths');
+    console.log('[silhouette] all ' + _withFp + ' selected parts have '
+      + 'closed-loop footprints');
   }}
   if (strokeSubpaths.length) {{
     const strokePath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
