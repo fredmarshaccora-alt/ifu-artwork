@@ -1200,6 +1200,22 @@ def part_footprints():
           f"parts={part_indices[:8]}{'...' if len(part_indices)>8 else ''} "
           f"hits={len(part_indices)-len(misses)} misses={len(misses)} "
           f"raster={t_raster:.2f}s")
+    # Surface a breakdown in the debug log so the user can see, per
+    # selection: how many parts came back with closed loops, how many
+    # were empty (= fully occluded or off-screen), and the total
+    # number of polylines drawn.
+    n_with_polys = sum(1 for v in out_polys.values() if v)
+    n_polylines = sum(len(v) for v in out_polys.values())
+    n_points = sum(len(pl) for v in out_polys.values() for pl in v)
+    _log_event(level="info" if n_with_polys else "warn",
+                op="part_footprints",
+                source_id=file_id,
+                parts=len(part_indices),
+                with_polys=n_with_polys,
+                empty=len(part_indices) - n_with_polys,
+                polylines=n_polylines,
+                points=n_points,
+                raster_sec=round(t_raster, 2))
     return jsonify(payload)
 
 

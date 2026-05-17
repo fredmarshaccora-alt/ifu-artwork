@@ -155,6 +155,16 @@ HTML_TEMPLATE = r"""<!doctype html>
   aside.left  {{ grid-area: left; }}
   aside.right {{ grid-area: right; }}
   /* 2D-only (default) */
+  /* Project-scoped editor: only the figure list and selection summary
+     are relevant when the user navigated in from a project workspace.
+     Hide the legacy / dev sections so the sidebar stops looking like
+     a developer dashboard. */
+  body.project-scoped-editor [data-ed-section="project"],
+  body.project-scoped-editor [data-ed-section="saved-views"],
+  body.project-scoped-editor [data-ed-section="onshape-tree"],
+  body.project-scoped-editor [data-ed-section="step-order"] {{
+    display: none !important;
+  }}
   body.layout-2d .canvas-wrap {{ grid-area: center; display: block; }}
   body.layout-2d .webgl-wrap  {{ display: none; }}
   /* 3D-only */
@@ -354,62 +364,75 @@ HTML_TEMPLATE = r"""<!doctype html>
 </header>
 <main>
   <aside class="left">
-    <h2>Project</h2>
-    <p style="font-size:11px; color: var(--muted); margin: 0 0 6px 0;">
-      Group figures together for one IFU / doc.  Switch project to
-      filter the figures list below.</p>
-    <div style="display:flex; gap:4px; margin-bottom:6px;">
-      <select id="project-sel" style="flex:1; padding:4px 6px; font-size:12px;">
-        <option value="">— All figures —</option>
-      </select>
-      <button id="btn-project-new" title="Create a new project">+</button>
-      <button id="btn-project-del" title="Delete current project (keeps figures)">✕</button>
-    </div>
-    <div style="display:flex; gap:4px; margin-bottom:6px; font-size:11px;">
-      <button id="btn-revs-refresh"
-              title="Pull the latest Versions list from Onshape for the active source. Updates the 'behind by N' badge on every figure bound to that source."
-              style="font-size:11px;">↻ refresh versions</button>
-      <span id="revs-status" style="color:var(--muted); align-self:center;"></span>
-    </div>
+    <section class="ed-section" data-ed-section="project">
+      <h2>Project</h2>
+      <p style="font-size:11px; color: var(--muted); margin: 0 0 6px 0;">
+        Group figures together for one IFU / doc.  Switch project to
+        filter the figures list below.</p>
+      <div style="display:flex; gap:4px; margin-bottom:6px;">
+        <select id="project-sel" style="flex:1; padding:4px 6px; font-size:12px;">
+          <option value="">— All figures —</option>
+        </select>
+        <button id="btn-project-new" title="Create a new project">+</button>
+        <button id="btn-project-del" title="Delete current project (keeps figures)">✕</button>
+      </div>
+      <div style="display:flex; gap:4px; margin-bottom:6px; font-size:11px;">
+        <button id="btn-revs-refresh"
+                title="Pull the latest Versions list from Onshape for the active source. Updates the 'behind by N' badge on every figure bound to that source."
+                style="font-size:11px;">↻ refresh versions</button>
+        <span id="revs-status" style="color:var(--muted); align-self:center;"></span>
+      </div>
+    </section>
 
-    <h2>Figures</h2>
-    <p style="font-size:11px; color: var(--muted); margin: 0 0 6px 0;">
-      A figure = camera + selection + per-part styles.  Saved figures
-      get attached to the selected project above.</p>
-    <div style="display:flex; gap:4px; margin-bottom:6px;">
-      <input type="text" id="fig-name" placeholder="figure name..."
-             style="flex:1; padding:4px 6px; font-size:12px;
-                    border:1px solid var(--line); border-radius:3px;">
-      <button id="btn-fig-save"
-              title="Capture current state as a new figure">save</button>
-    </div>
-    <ul id="figures-list" class="saved-views-list"></ul>
+    <section class="ed-section" data-ed-section="figures">
+      <h2>Figures</h2>
+      <p style="font-size:11px; color: var(--muted); margin: 0 0 6px 0;">
+        A figure = camera + selection + per-part styles.</p>
+      <div style="display:flex; gap:4px; margin-bottom:6px;">
+        <input type="text" id="fig-name" placeholder="figure name..."
+               style="flex:1; padding:4px 6px; font-size:12px;
+                      border:1px solid var(--line); border-radius:3px;">
+        <button id="btn-fig-save"
+                title="Capture current state as a new figure">save</button>
+      </div>
+      <ul id="figures-list" class="saved-views-list"></ul>
+    </section>
 
-    <h2 style="margin-top: 14px;">Saved views (legacy)</h2>
-    <p style="font-size:11px; color: var(--muted); margin: 0 0 6px 0;">
-      Camera angles only (no selection/style).  Pre-Phase-A.</p>
-    <div style="display:flex; gap:4px; margin-bottom:6px;">
-      <input type="text" id="view-name" placeholder="name..."
-             style="flex:1; padding:4px 6px; font-size:12px;
-                    border:1px solid var(--line); border-radius:3px;">
-      <button id="btn-save-view" title="Save current camera angle">save</button>
-    </div>
-    <ul id="saved-views" class="saved-views-list"></ul>
+    <section class="ed-section" data-ed-section="saved-views">
+      <h2 style="margin-top: 14px;">Saved views (legacy)</h2>
+      <p style="font-size:11px; color: var(--muted); margin: 0 0 6px 0;">
+        Camera angles only (no selection/style).  Pre-Phase-A.</p>
+      <div style="display:flex; gap:4px; margin-bottom:6px;">
+        <input type="text" id="view-name" placeholder="name..."
+               style="flex:1; padding:4px 6px; font-size:12px;
+                      border:1px solid var(--line); border-radius:3px;">
+        <button id="btn-save-view" title="Save current camera angle">save</button>
+      </div>
+      <ul id="saved-views" class="saved-views-list"></ul>
+    </section>
 
-    <h2>Onshape tree</h2>
-    <input type="search" id="tree-search" placeholder="filter tree..."
-           autocomplete="off" spellcheck="false">
-    <p style="font-size:11px; color: var(--muted); margin: 4px 0 8px 0;"
-       id="tree-status">No tree for this source.</p>
-    <ul class="tree-root" id="tree-root"></ul>
-    <h2>Solids (STEP order)</h2>
-    <p style="font-size:11px; color: var(--muted); margin: 0 0 8px 0;">
-      Click a row to highlight. Click again to clear.</p>
-    <ul class="part-list" id="part-list"></ul>
-    <h2>Selection</h2>
-    <div id="selection-info" style="font-size: 12px; color: var(--muted);">
-      Nothing selected
-    </div>
+    <section class="ed-section" data-ed-section="onshape-tree">
+      <h2>Onshape tree</h2>
+      <input type="search" id="tree-search" placeholder="filter tree..."
+             autocomplete="off" spellcheck="false">
+      <p style="font-size:11px; color: var(--muted); margin: 4px 0 8px 0;"
+         id="tree-status">No tree for this source.</p>
+      <ul class="tree-root" id="tree-root"></ul>
+    </section>
+
+    <section class="ed-section" data-ed-section="step-order">
+      <h2>Solids (STEP order)</h2>
+      <p style="font-size:11px; color: var(--muted); margin: 0 0 8px 0;">
+        Click a row to highlight. Click again to clear.</p>
+      <ul class="part-list" id="part-list"></ul>
+    </section>
+
+    <section class="ed-section" data-ed-section="selection">
+      <h2>Selection</h2>
+      <div id="selection-info" style="font-size: 12px; color: var(--muted);">
+        Nothing selected
+      </div>
+    </section>
   </aside>
   <div class="canvas-wrap" id="canvas-wrap">
     {svg_blocks}
@@ -2634,12 +2657,39 @@ async function EditorScreen(container, params) {{
     setTimeout(() => {{
       try {{ window._loadFigureIntoEditor(fig, {{ skipConfirm: true }}); }}
       catch (_e) {{}}
+      // Bind the legacy sidebar's project filter to THIS project so
+      // the figures list only shows figures in this project, not
+      // every figure ever made.  Defer one more tick so the project
+      // selector has finished populating from /api/projects.
+      setTimeout(() => {{
+        const pSel = document.getElementById('project-sel');
+        if (pSel && projId) {{
+          // Make sure the option exists (it should, but defensively
+          // add it if /api/projects hasn't returned yet).
+          if (!Array.from(pSel.options).some(o => o.value === projId)) {{
+            const opt = document.createElement('option');
+            opt.value = projId;
+            opt.textContent = proj?.name || projId;
+            pSel.appendChild(opt);
+          }}
+          pSel.value = projId;
+          pSel.dispatchEvent(new Event('change'));
+        }}
+      }}, 100);
     }}, 200);
   }}
 
-  // Teardown: remove the breadcrumb when the route changes
+  // Hide legacy sidebar sections that just add noise inside a
+  // project (Saved views legacy / Onshape tree / STEP-order parts
+  // list aren't useful for a project-bound figure).  CSS hook lives
+  // in the design system so the editor stays uncluttered.
+  document.body.classList.add('project-scoped-editor');
+
+  // Teardown: remove the breadcrumb + restore the global view when
+  // the user navigates away.
   return () => {{
     _removeCrumb();
+    document.body.classList.remove('project-scoped-editor');
   }};
 }}
 
@@ -4832,6 +4882,11 @@ function applySilhouetteFill(svg, highlights, fillOn, fillColor, fillAlpha,
   if (!useFootprint) {{
     // Fallback: open polylines from assembly HLR (immediate, no fetch
     // round trip).  These are visibility-aware but never closed.
+    if (_DBG_ON || console) {{
+      console.log('[silhouette] no footprint cache for sel='
+        + JSON.stringify(idxList) + ' fid=' + fid + ' vid=' + vid
+        + ' -- falling back to open polylines');
+    }}
     for (const idx of idxList) {{
       const partCls = '.part-' + String(idx).padStart(3, '0');
       svg.querySelectorAll(
@@ -4842,6 +4897,9 @@ function applySilhouetteFill(svg, highlights, fillOn, fillColor, fillAlpha,
         if (d) strokeSubpaths.push(d);
       }});
     }}
+  }} else if (_DBG_ON) {{
+    console.log('[silhouette] using footprint loops for sel='
+      + JSON.stringify(idxList) + ': ' + strokeSubpaths.length + ' subpaths');
   }}
   if (strokeSubpaths.length) {{
     const strokePath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
@@ -4880,7 +4938,12 @@ async function fetchSelectedFootprints() {{
   for (const idx of st.highlights) {{
     if (!_getFootprint(fid, vid, idx)) missing.push(idx);
   }}
-  if (!missing.length) return;
+  if (!missing.length) {{
+    if (_DBG_ON) console.log('[footprint] no missing parts, skipping fetch');
+    return;
+  }}
+  console.log('[footprint] fetching ' + missing.length + ' parts: '
+              + JSON.stringify(missing) + ' for fid=' + fid + ' vid=' + vid);
 
   // Camera body (same logic as the other fetchers)
   const fe = CATALOGUE.find(x => x.file_id === fid);
@@ -4895,9 +4958,12 @@ async function fetchSelectedFootprints() {{
     body.view_dir = ve.view_dir;
     body.focal = [0, 0, 0];
   }} else {{
+    console.warn('[footprint] no camera context for fid=' + fid + ' vid=' + vid
+                  + ' -- bailing');
     return;
   }}
   body.part_indices = missing;
+  console.log('[footprint] camera body:', JSON.stringify(body));
   try {{
     const r = await fetch(apiBase + '/api/part_footprints', {{
       method: 'POST',
@@ -4907,9 +4973,15 @@ async function fetchSelectedFootprints() {{
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const data = await r.json();
     if (fileSel.value !== fid || viewSel.value !== vid) return;
+    let _empty = 0, _nonempty = 0;
     for (const [idxStr, polys] of Object.entries(data.polylines || {{}})) {{
+      if (!polys || !polys.length) _empty++;
+      else _nonempty++;
       _setFootprint(fid, vid, parseInt(idxStr), polys);
     }}
+    console.log('[footprint] returned ' + _nonempty + ' parts with polys, '
+                + _empty + ' empty.  Stats: '
+                + JSON.stringify(data.stats || {{}}));
     applyHighlights();   // re-render bold edge with the new footprints
   }} catch (e) {{
     console.warn('[footprint] fetch failed:', e.message || e);
