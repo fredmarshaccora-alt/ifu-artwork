@@ -1137,6 +1137,16 @@ const _DESIGN_CSS = `
 .card.figure-card .card-title {{
   margin-top: auto;
 }}
+.card.project-card {{
+  min-height: 230px;
+}}
+.card.placeholder.project-new {{
+  min-height: 230px;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 8px;
+}}
 .card.placeholder:hover {{
   background: var(--c-surface); border-style: solid;
   color: var(--c-accora);
@@ -1582,23 +1592,71 @@ async function HomeScreen(container) {{
     if (fr.ok) figures = (await fr.json()).figures || [];
   }} catch (_e) {{}}
 
-  // Projects
+  // Per-project view counts + first-view thumbnail.  Fetched in
+  // parallel so the home page doesn't pay an N-projects-deep wait.
+  const viewsByProject = {{}};
+  await Promise.all(projects.map(async (p) => {{
+    try {{
+      const r = await fetch(API_BASE + '/api/projects/'
+                              + encodeURIComponent(p.id) + '/views');
+      if (r.ok) viewsByProject[p.id] = (await r.json()).views || [];
+    }} catch (_e) {{ viewsByProject[p.id] = []; }}
+  }}));
+
+  // Projects -- big tiles with preview thumbnail (from the project's
+  // most-recently-updated view) at the top.
   main.appendChild(h('div.section-title', `Projects (${{projects.length}})`));
   const grid = h('div.card-grid');
-  const newCard = h('div.card.placeholder', '+ new project');
+  const newCard = h('div.card.placeholder.project-new',
+    [h('div', {{ style: {{ fontSize: '32px', color: 'var(--c-accora)' }} }}, '+'),
+     h('div', 'New project')]);
   newCard.addEventListener('click', () => _openNewProjectModal());
   grid.appendChild(newCard);
 
   for (const p of projects) {{
-    const card = h('div.card');
+    const card = h('div.card.project-card');
+    const projViews = viewsByProject[p.id] || [];
+    const figcount = projViews.reduce(
+      (acc, v) => acc + (v.figure_count || 0), 0);
+    // Preview: latest view's thumbnail.  If no view, fall back to a
+    // generated "monogram" tile from the project name initials.
+    if (projViews.length) {{
+      const v = projViews[0];   // newest-first from /api/projects/.../views
+      const thumb = h('img', {{
+        src: API_BASE + '/api/views/' + encodeURIComponent(v.id)
+             + '/thumbnail?v=' + encodeURIComponent(v.updated_at || ''),
+        alt: '',
+        style: {{ width: '100%', height: '140px',
+                    objectFit: 'contain',
+                    background: 'var(--c-surface-1)',
+                    borderRadius: 'var(--radius-1)',
+                    marginBottom: '8px',
+                    border: '1px solid var(--c-line)' }},
+      }});
+      thumb.onerror = () => {{
+        thumb.replaceWith(_monogramTile(p.name));
+      }};
+      card.appendChild(thumb);
+    }} else {{
+      card.appendChild(_monogramTile(p.name));
+    }}
     card.appendChild(h('div.card-title', p.name));
-    const figcount = (p.figure_ids || []).length;
-    const meta = h('div.card-meta', [
+    if (p.description) {{
+      card.appendChild(h('div', {{ style: {{ fontSize: '11px',
+                                                color: 'var(--c-text-muted)',
+                                                margin: '2px 0 4px 0',
+                                                whiteSpace: 'nowrap',
+                                                overflow: 'hidden',
+                                                textOverflow: 'ellipsis' }} }},
+                          p.description));
+    }}
+    card.appendChild(h('div.card-meta', [
+      h('span', `${{projViews.length}} view${{projViews.length === 1 ? '' : 's'}}`),
+      h('span', '·'),
       h('span', `${{figcount}} figure${{figcount === 1 ? '' : 's'}}`),
       h('span', '·'),
       h('span', (p.updated_at || '').slice(0, 10)),
-    ]);
-    card.appendChild(meta);
+    ]));
     card.addEventListener('click', () => {{
       location.hash = '#/project/' + encodeURIComponent(p.id);
     }});
@@ -1638,6 +1696,30 @@ async function HomeScreen(container) {{
     }}
     main.appendChild(recentGrid);
   }}
+}}
+
+// "Monogram" placeholder for projects that have no view (and thus no
+// real thumbnail).  Uses the project name's initials, two-tone teal
+// background.  Better than a generic "no preview" box for visual
+// rhythm on the home page.
+function _monogramTile(name) {{
+  const initials = (name || '?').split(/\s+/).slice(0, 2)
+                                  .map(w => w[0] || '')
+                                  .join('').toUpperCase() || '?';
+  const tile = h('div', {{
+    style: {{ width: '100%', height: '140px',
+                background: 'linear-gradient(135deg, var(--c-accora) 0%, '
+                            + 'var(--c-accora-dark) 100%)',
+                color: '#fff',
+                borderRadius: 'var(--radius-1)',
+                marginBottom: '8px',
+                display: 'flex', alignItems: 'center',
+                justifyContent: 'center',
+                fontSize: '42px', fontWeight: 700,
+                letterSpacing: '2px',
+                fontFamily: 'var(--font-ui, Inter, sans-serif)' }} }},
+    initials);
+  return tile;
 }}
 
 registerRoute(/^#\/$/, HomeScreen);
