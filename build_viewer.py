@@ -7147,7 +7147,10 @@ function init() {{
   // they pop the same way Onshape's do.
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 1.05;
+  // Tuned to match Onshape's soft, slightly-cool default render: a
+  // touch under 1.0 keeps the pastel palette from blowing out under
+  // direct light.
+  renderer.toneMappingExposure = 0.95;
   // Shadow maps for the contact shadow plane below the model
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -7169,13 +7172,14 @@ function init() {{
     console.warn('[3d] IBL setup failed; falling back to lights only:', e);
   }}
 
-  // ---- Lights: still useful as a sun+fill on top of the IBL --------
-  // IBL handles ambient; these add directional shape so cylindrical
-  // tubes still read as 3D in solid-coloured renders.  Lower
-  // intensities than before since the environment is doing most of
-  // the work now.
-  scene.add(new THREE.AmbientLight(0xffffff, 0.15));
-  const sun = new THREE.DirectionalLight(0xffffff, 0.65);
+  // ---- Lights: gentle sun+fill on top of IBL -----------------------
+  // IBL provides the ambient + reflections that make MeshStandardMaterial
+  // look like CAD plastic; the directional sun adds just enough
+  // direction-sense that cylinders read as round and plates have a
+  // soft side.  Onshape's default render has very soft, almost
+  // shadowless lighting; matching that means low sun intensity.
+  scene.add(new THREE.AmbientLight(0xffffff, 0.10));
+  const sun = new THREE.DirectionalLight(0xffffff, 0.42);
   sun.position.set(1000, -2000, 2500);
   sun.castShadow = true;
   sun.shadow.mapSize.set(1024, 1024);
@@ -7186,9 +7190,9 @@ function init() {{
   sun.shadow.camera.top = 3000;
   sun.shadow.camera.bottom = -3000;
   sun.shadow.bias = -0.0008;
-  sun.shadow.radius = 4;
+  sun.shadow.radius = 6;
   scene.add(sun);
-  const fill = new THREE.DirectionalLight(0xffffff, 0.20);
+  const fill = new THREE.DirectionalLight(0xffffff, 0.15);
   fill.position.set(-2000, 1000, 500);
   scene.add(fill);
 
@@ -7199,7 +7203,7 @@ function init() {{
   // "ground" surface, just like Onshape.
   const shadowMat = new THREE.ShadowMaterial({{
     color: 0x000000,
-    opacity: 0.18,
+    opacity: 0.12,    // softer to match the gentler sun
     transparent: true,
   }});
   const shadowPlane = new THREE.Mesh(
@@ -7441,11 +7445,17 @@ function loadSource(file_id) {{
     // how much the environment shows up on each material.
     grp.traverse(obj => {{
       if (obj.isMesh) {{
+        // Pick a palette colour for this part so multi-part assemblies
+        // read distinctly the way Onshape's auto-assigned colours do.
+        // We look up the part idx (set by trimesh as the "part_NNN"
+        // node name) and index into the palette deterministically --
+        // the same part always gets the same colour across reloads.
+        const baseColor = _bodyColorForObject(obj);
         obj.material = new THREE.MeshStandardMaterial({{
-          color: 0xd9dbde,
-          metalness: 0.10,
-          roughness: 0.65,
-          envMapIntensity: 0.9,
+          color: baseColor,
+          metalness: 0.05,
+          roughness: 0.72,
+          envMapIntensity: 1.1,
           transparent: false,
           side: THREE.DoubleSide,
           polygonOffset: true,
@@ -7458,22 +7468,23 @@ function loadSource(file_id) {{
         obj.receiveShadow = true;
         // Feature edges only: 45deg threshold (was 30) skips most of
         // the curved-cylinder facet noise that EdgesGeometry would
-        // otherwise overlay on every revolute surface.  Thinner, dark
-        // grey instead of pure black so they read as drawing edges
-        // rather than a comic-book outline.
+        // otherwise overlay on every revolute surface.  Very low
+        // opacity -- Onshape's edges are barely there at normal
+        // zoom, they just hint at facet geometry without dominating
+        // the surface read.
         const edges = new THREE.EdgesGeometry(obj.geometry, 45);
         const lines = new THREE.LineSegments(
           edges,
           new THREE.LineBasicMaterial({{
-            color: 0x303035,
+            color: 0x3a4554,
             transparent: true,
-            opacity: 0.55,
+            opacity: 0.22,
             linewidth: 1,
           }})
         );
         lines.userData.isEdge = true;
         obj.add(lines);
-        obj.userData.baseColor = 0xd9dbde;
+        obj.userData.baseColor = baseColor;
       }}
     }});
     loaded.set(file_id, grp);
@@ -7801,6 +7812,52 @@ function _partIdxOf(obj) {{
   return null;
 }}
 
+// Onshape-inspired soft pastel palette.  Stays in the low-saturation
+// range so the assembly reads as "CAD" rather than "primary-coloured
+// toy".  All entries should look fine on the gradient backdrop with
+// SSAO darkening corners -- avoid anything that goes muddy when
+// shaded.  The first entry is intentionally the steel-blue Onshape
+// uses by default so single-part figures look familiar.
+const _BODY_PALETTE = [
+  0x9dbcda,  // steel blue (Onshape default)
+  0xa6c8d6,  // sky
+  0xb9c8ce,  // light grey-blue
+  0xb5d2bd,  // mint
+  0xc5d2a8,  // pale olive
+  0xd6d199,  // pale sand
+  0xd6b094,  // peach
+  0xd5a3b3,  // rose
+  0xc8a8cd,  // lavender
+  0xa9b4d3,  // periwinkle
+  0xa8cbc4,  // pale teal
+  0xbac4b0,  // sage
+];
+
+function _hexHash(s) {{
+  // Cheap deterministic hash so unidentified parts (no idx) still
+  // get a stable colour based on whatever name we DO have.
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) {{
+    h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  }}
+  return Math.abs(h);
+}}
+
+function _bodyColorForObject(obj) {{
+  // 1) Onshape import / trimesh GLB: "part_NNN" -> idx -> palette
+  let cur = obj;
+  let nameStack = [];
+  while (cur) {{
+    if (cur.name) nameStack.push(cur.name);
+    const m = cur.name && cur.name.match(/^part_(\d+)$/);
+    if (m) return _BODY_PALETTE[parseInt(m[1]) % _BODY_PALETTE.length];
+    cur = cur.parent;
+  }}
+  // 2) Fall back to hashing the deepest name we found
+  const key = nameStack.join('|') || (obj.uuid || 'unknown');
+  return _BODY_PALETTE[_hexHash(key) % _BODY_PALETTE.length];
+}}
+
 function applyHighlights3D(set) {{
   if (!active) return;
   const any = set && set.size > 0;
@@ -7808,7 +7865,14 @@ function applyHighlights3D(set) {{
     if (!o.isMesh) return;
     const idx = _partIdxOf(o);
     const hit = any && idx != null && set.has(idx);
-    o.material.color.setHex(hit ? 0x00836a : 0xe8e8ea);
+    // Restore the part's PALETTE colour when not selected, instead of
+    // the old hardcoded grey -- otherwise clearing a selection makes
+    // every part wash to the same shade.  userData.baseColor was set
+    // at material-creation time in _hookGroup().
+    const baseColor = (o.userData && o.userData.baseColor != null)
+                       ? o.userData.baseColor
+                       : _bodyColorForObject(o);
+    o.material.color.setHex(hit ? 0x00836a : baseColor);
     if (any && !hit) {{
       o.material.opacity = 0.18;
       o.material.transparent = true;
@@ -7894,6 +7958,29 @@ window.IFU_VIEWER.getCurrentViewDir = () => {{
   const d = camera.position.clone().sub(controls.target).normalize();
   return [d.x, d.y, d.z];
 }};
+
+// Per-part colour info for tests + tooling.  Returns an array of
+// objects with keys idx + color_hex for every mesh in the active group.
+window.IFU_VIEWER.getActivePartColors = () => {{
+  if (!active) return null;
+  const out = [];
+  active.traverse(o => {{
+    if (!o.isMesh) return;
+    const idx = _partIdxOf(o);
+    if (idx == null) return;
+    const c = o.material && o.material.color;
+    out.push({{
+      idx,
+      color_hex: c ? '#' + c.getHexString() : null,
+      base_hex: (o.userData && o.userData.baseColor != null)
+                  ? '#' + o.userData.baseColor.toString(16).padStart(6, '0')
+                  : null,
+    }});
+  }});
+  return out;
+}};
+
+window.IFU_VIEWER.getBodyPalette = () => _BODY_PALETTE.slice();
 
 // Renderer + scene state inspector -- used by tests + the future
 // graphics-quality controls.  Returns null when the 3D viewer hasn't
