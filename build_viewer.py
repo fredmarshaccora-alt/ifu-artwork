@@ -451,19 +451,7 @@ HTML_TEMPLATE = r"""<!doctype html>
                 font-size: 11px; font-weight: bold; margin-right: 6px; }}
   .canvas-wrap {{ position: relative; overflow: hidden; background: white; }}
   .webgl-wrap  {{ position: relative; overflow: hidden;
-                   /* Studio backdrop: subtle vertical gradient with a soft
-                      horizon at ~62%.  Reads as "looking out across a
-                      light grey floor" instead of a flat white box.  The
-                      WebGL canvas is alpha:true so this shows through. */
-                   background:
-                     radial-gradient(ellipse 80% 30% at 50% 78%,
-                                     rgba(0,0,0,0.06) 0%,
-                                     rgba(0,0,0,0) 70%),
-                     linear-gradient(180deg,
-                                     #fbfbfc 0%,
-                                     #f3f4f6 55%,
-                                     #e3e6eb 85%,
-                                     #d7dbe1 100%); }}
+                   background: #f3f4f6; }}
   .webgl-wrap canvas {{ width: 100%; height: 100%; display: block;
                          cursor: grab; }}
   .webgl-wrap canvas.dragging {{ cursor: grabbing; }}
@@ -7115,11 +7103,12 @@ function init() {{
   inited = true;
 
   scene = new THREE.Scene();
-  // Subtle gradient backdrop instead of flat white -- this is what
-  // makes Onshape's viewport feel like a "studio" instead of a
-  // sterile white box.  We layer a CSS gradient on #webgl-wrap and
-  // leave the scene background transparent so the canvas reveals it.
-  scene.background = null;
+  // Soft, slightly-cool studio backdrop directly in three.js.  We
+  // tried transparent canvas + CSS gradient first but the post-
+  // process composer wipes the alpha to opaque black, which made
+  // the canvas read as empty.  Painting the gradient as a scene
+  // background works in both render paths (composer or plain).
+  scene.background = new THREE.Color(0xf3f4f6);
 
   const r = canvas.getBoundingClientRect();
   // OrthographicCamera, NOT perspective: OCCT HLR uses orthographic
@@ -7138,7 +7127,6 @@ function init() {{
     canvas,
     antialias: true,
     preserveDrawingBuffer: true,  // required for screenshot exporter
-    alpha: true,                  // so the CSS gradient shows through
   }});
   renderer.setSize(r.width, r.height, false);
   renderer.setPixelRatio(window.devicePixelRatio || 1);
@@ -7234,31 +7222,34 @@ function init() {{
   controls.dampingFactor = 0.08;
   controls.update();
 
-  // ---- Postprocessing: SSAO ----------------------------------------
-  // SSAO darkens corners and crevices in proportion to local geometry
-  // density.  It's the visual cue that distinguishes "flat-shaded
-  // CAD" from "this looks like a real product photo".  Onshape uses
-  // it heavily.
-  try {{
-    composer = new EffectComposer(renderer);
-    composer.setPixelRatio(window.devicePixelRatio || 1);
-    composer.setSize(r.width || 800, r.height || 600);
-    composer.addPass(new RenderPass(scene, camera));
-    ssaoPass = new SSAOPass(scene, camera, r.width || 800, r.height || 600);
-    // Tuned for orthographic CAD: small kernel radius scales with
-    // the bbox in frame(), large minDistance avoids haloes around
-    // small parts.
-    ssaoPass.kernelRadius = 24;
-    ssaoPass.minDistance = 0.0008;
-    ssaoPass.maxDistance = 0.06;
-    ssaoPass.output = SSAOPass.OUTPUT.Default;
-    composer.addPass(ssaoPass);
-    composer.addPass(new OutputPass());
-  }} catch (e) {{
-    console.warn('[3d] postprocess setup failed; running plain renderer:', e);
-    composer = null;
-    ssaoPass = null;
-    _useComposer = false;
+  // ---- Postprocessing: SSAO (opt-in, ?ssao=1) ----------------------
+  // SSAO via three.js's SSAOPass is unreliable with OrthographicCamera
+  // -- it sometimes leaves the canvas completely blank because the
+  // depth-reconstruction shader assumes perspective.  IBL + tone
+  // mapping already gives a big chunk of the Onshape look without it,
+  // so leave the composer OFF by default and let curious users opt in
+  // via the URL flag to experiment.
+  const ssaoOptIn = (new URLSearchParams(location.search)).get('ssao') === '1';
+  if (ssaoOptIn) {{
+    try {{
+      composer = new EffectComposer(renderer);
+      composer.setPixelRatio(window.devicePixelRatio || 1);
+      composer.setSize(r.width || 800, r.height || 600);
+      composer.addPass(new RenderPass(scene, camera));
+      ssaoPass = new SSAOPass(scene, camera, r.width || 800, r.height || 600);
+      ssaoPass.kernelRadius = 24;
+      ssaoPass.minDistance = 0.0008;
+      ssaoPass.maxDistance = 0.06;
+      ssaoPass.output = SSAOPass.OUTPUT.Default;
+      composer.addPass(ssaoPass);
+      composer.addPass(new OutputPass());
+      _useComposer = true;
+    }} catch (e) {{
+      console.warn('[3d] SSAO setup failed; running plain renderer:', e);
+      composer = null; ssaoPass = null; _useComposer = false;
+    }}
+  }} else {{
+    composer = null; ssaoPass = null; _useComposer = false;
   }}
 
   // ViewHelper (orientation gizmo): the floating axis-cube in the corner.
