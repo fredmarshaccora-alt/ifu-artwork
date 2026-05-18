@@ -417,14 +417,49 @@ HTML_TEMPLATE = r"""<!doctype html>
   /* 3D-only */
   body.layout-3d .webgl-wrap  {{ grid-area: center; display: block; }}
   body.layout-3d .canvas-wrap {{ display: none; }}
-  /* Split view: a 4-column grid with both panes visible */
+  /* Split view: a 5-column grid with both panes visible and a
+     draggable splitter between them.  The two centre columns use a
+     CSS custom property so the splitter JS can resize at runtime
+     without churning grid-template-columns string parsing. */
   body.layout-split main {{
-    grid-template-columns: 240px 1fr 1fr 260px;
-    grid-template-areas: "left center2d center3d right";
+    grid-template-columns: 240px var(--split-2d, 1fr) 6px var(--split-3d, 1fr) 260px;
+    grid-template-areas: "left center2d splitter center3d right";
   }}
   body.layout-split .canvas-wrap {{ grid-area: center2d; display: block;
                                      border-right: 1px solid var(--line); }}
   body.layout-split .webgl-wrap  {{ grid-area: center3d; display: block; }}
+  body.layout-split #pane-splitter {{
+    grid-area: splitter;
+    display: block;
+    background: var(--line);
+    cursor: col-resize;
+    user-select: none;
+    position: relative;
+    transition: background 0.12s;
+  }}
+  body.layout-split #pane-splitter:hover,
+  body.layout-split #pane-splitter.is-dragging {{
+    background: var(--accora-teal);
+  }}
+  /* Subtle "grip" hint in the middle of the splitter */
+  body.layout-split #pane-splitter::after {{
+    content: '';
+    position: absolute;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    width: 2px; height: 28px;
+    background: var(--muted);
+    border-radius: 1px;
+    opacity: 0.45;
+    pointer-events: none;
+  }}
+  body.layout-split #pane-splitter:hover::after,
+  body.layout-split #pane-splitter.is-dragging::after {{
+    background: white;
+    opacity: 0.9;
+  }}
+  /* When NOT in split layout, hide the splitter entirely */
+  body:not(.layout-split) #pane-splitter {{ display: none; }}
   /* In any layout the panes themselves are the same */
   aside.left, aside.right {{ background: var(--panel);
                               border-right: 1px solid var(--line);
@@ -714,6 +749,8 @@ HTML_TEMPLATE = r"""<!doctype html>
     <footer>Wheel = zoom &nbsp;&middot;&nbsp; Drag = pan &nbsp;&middot;&nbsp; Click part to highlight &nbsp;&middot;&nbsp; Callout mode: drag to place arrow</footer>
     <div class="tooltip" id="tooltip"></div>
   </div>
+  <div id="pane-splitter" role="separator" aria-orientation="vertical"
+       title="Drag to resize 2D / 3D panes (double-click to reset)"></div>
   <div class="webgl-wrap" id="webgl-wrap">
     <canvas id="webgl-canvas"></canvas>
     <!-- Configuration panel: shown when the active source has Onshape
@@ -5028,6 +5065,77 @@ $('lay-2d').addEventListener('click', () => setLayout('2d'));
 $('lay-split').addEventListener('click', () => setLayout('split'));
 $('lay-3d').addEventListener('click', () => setLayout('3d'));
 
+// ---- Splitter drag (resize 2D / 3D panes in split layout) ----------
+// The grid uses two CSS variables (--split-2d, --split-3d) for the
+// two centre columns; dragging the splitter writes both to body
+// style so the panes resize live.  Width is persisted to
+// localStorage so the choice survives reloads.  Double-click resets.
+(function setupPaneSplitter() {{
+  const splitter = document.getElementById('pane-splitter');
+  if (!splitter) return;
+  const STORAGE_KEY = 'ifu:split_2d_fraction';
+  const MIN_FRACTION = 0.15;   // each pane keeps at least 15% of the central band
+
+  function applyFraction(f) {{
+    const a = Math.max(MIN_FRACTION, Math.min(1 - MIN_FRACTION, f));
+    document.body.style.setProperty('--split-2d', a + 'fr');
+    document.body.style.setProperty('--split-3d', (1 - a) + 'fr');
+    localStorage.setItem(STORAGE_KEY, a.toFixed(4));
+    // Notify three.js so its renderer can resize its viewport
+    setTimeout(() => {{
+      window.IFU_VIEWER?.resize3D?.();
+    }}, 0);
+  }}
+
+  // Restore saved fraction (default 50/50)
+  let saved = parseFloat(localStorage.getItem(STORAGE_KEY));
+  if (!Number.isFinite(saved)) saved = 0.5;
+  applyFraction(saved);
+
+  let dragging = false;
+  let startX = 0;
+  let startA = 0.5;
+  let totalCentralPx = 0;
+
+  splitter.addEventListener('pointerdown', (e) => {{
+    if (!document.body.classList.contains('layout-split')) return;
+    dragging = true;
+    splitter.classList.add('is-dragging');
+    startX = e.clientX;
+    startA = parseFloat(localStorage.getItem(STORAGE_KEY)) || 0.5;
+    // Measure the combined central band width (canvas-wrap + splitter
+    // + webgl-wrap) so drag distance converts to fraction reliably
+    // regardless of side-panel widths.
+    const cw = document.getElementById('canvas-wrap');
+    const ww = document.getElementById('webgl-wrap');
+    totalCentralPx = (cw ? cw.getBoundingClientRect().width : 0)
+                    + splitter.getBoundingClientRect().width
+                    + (ww ? ww.getBoundingClientRect().width : 0);
+    e.preventDefault();
+  }});
+  // pointermove + pointerup live on the DOCUMENT so the drag tracks
+  // even when the cursor moves off the splitter (the standard
+  // resize-handle pattern -- much more reliable than setPointerCapture
+  // which doesn't work for synthetic events in tests).
+  document.addEventListener('pointermove', (e) => {{
+    if (!dragging) return;
+    const dx = e.clientX - startX;
+    if (totalCentralPx <= 0) return;
+    const f = startA + dx / totalCentralPx;
+    applyFraction(f);
+  }});
+  function _endDrag() {{
+    if (!dragging) return;
+    dragging = false;
+    splitter.classList.remove('is-dragging');
+  }}
+  document.addEventListener('pointerup', _endDrag);
+  document.addEventListener('pointercancel', _endDrag);
+
+  // Double-click resets to 50/50
+  splitter.addEventListener('dblclick', () => applyFraction(0.5));
+}})();
+
 // --- Saved views --------------------------------------------------------
 // Per-source list of {{name, eye, target, up_axis}} kept in localStorage so
 // the camera angles a user has dialled in survive reloads.  No server
@@ -7995,6 +8103,12 @@ window.IFU_VIEWER.applyUpAxisOverride = (rot) => {{
   applyUpAxisOverride(rot);
 }};
 window.IFU_VIEWER.set3DActive = set3DActive;
+// Trigger a resize: used by the splitter drag handler so the 3D
+// canvas / composer / ortho frustum keep up with the canvas's new
+// bounding rect mid-drag.
+window.IFU_VIEWER.resize3D = () => {{
+  if (typeof resize === 'function') resize();
+}};
 window.IFU_VIEWER.getCurrentViewDir = () => {{
   if (!camera || !controls) return null;
   const d = camera.position.clone().sub(controls.target).normalize();
@@ -8170,6 +8284,11 @@ async function probeServer() {{
 async function generateLiveSVG() {{
   if (!camera || !controls) return;
   const fid = window.IFU_VIEWER.getActiveFileId();
+  // User explicitly asked for a fresh angle -- drop any previous
+  // highlights so they don't carry across cameras (a body that was
+  // visible at one angle may not be at another, and the cached
+  // footprints belong to the old projection anyway).
+  if (typeof clearHighlights === 'function') clearHighlights();
   // Send the camera as {{eye, target}} -- two explicit world-space points.
   // Unambiguous: HLR sets up its projection from the exact same camera
   // OrbitControls is currently driving.  No view_dir sign convention,
