@@ -5352,6 +5352,76 @@ window.showCanvasLoading = showCanvasLoading;
 window.hideCanvasLoading = hideCanvasLoading;
 
 
+// ---- Shaded-outline loading badge ----------------------------------
+// Small pill that floats in the bottom-left of the 2D pane while the
+// server is still rastering the assembly footprint.  Avoids the
+// "half-baked outline" the user used to see during the ~46s first-
+// click delay.  Auto-rolls back to hidden once the closed-loop
+// outline is ready.
+function _ensureShadedOutlineStyles() {{
+  if (document.getElementById('_shaded_outline_styles')) return;
+  const s = document.createElement('style');
+  s.id = '_shaded_outline_styles';
+  s.textContent = `
+    .shaded-outline-loading {{
+      position: absolute;
+      left: 12px;
+      bottom: 12px;
+      z-index: 60;
+      display: flex; align-items: center; gap: 8px;
+      padding: 6px 12px 6px 8px;
+      background: rgba(255,255,255,0.95);
+      border: 1px solid var(--c-line, #d4d4d8);
+      border-radius: 16px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+      font-family: var(--font-ui, Inter, sans-serif);
+      font-size: 11px;
+      color: var(--c-text, #18181b);
+      pointer-events: none;
+      transition: opacity 0.18s ease;
+    }}
+    .shaded-outline-loading.is-hidden {{
+      opacity: 0;
+      pointer-events: none;
+    }}
+    .shaded-outline-loading .sp {{
+      width: 14px; height: 14px;
+      border: 2px solid #d4d4d8;
+      border-top-color: var(--c-accora, #00836a);
+      border-radius: 50%;
+      animation: shaded-spinner-rot 0.9s linear infinite;
+    }}
+    @keyframes shaded-spinner-rot {{ to {{ transform: rotate(360deg); }} }}
+  `;
+  document.head.appendChild(s);
+}}
+
+function showShadedOutlineLoading(nParts) {{
+  _ensureShadedOutlineStyles();
+  const host = document.getElementById('canvas-wrap');
+  if (!host) return;
+  let el = host.querySelector(':scope > .shaded-outline-loading');
+  if (!el) {{
+    el = document.createElement('div');
+    el.className = 'shaded-outline-loading';
+    el.innerHTML = '<div class="sp"></div><span class="lbl"></span>';
+    host.appendChild(el);
+  }}
+  el.classList.remove('is-hidden');
+  el.querySelector('.lbl').textContent =
+      'shaded outline computing for '
+    + nParts + ' part' + (nParts === 1 ? '' : 's') + '...';
+}}
+function hideShadedOutlineLoading() {{
+  const host = document.getElementById('canvas-wrap');
+  if (!host) return;
+  const el = host.querySelector(':scope > .shaded-outline-loading');
+  if (el) el.classList.add('is-hidden');
+}}
+window.showShadedOutlineLoading = showShadedOutlineLoading;
+window.hideShadedOutlineLoading = hideShadedOutlineLoading;
+
+
 // ---- Variant strip (subview mode) ----------------------------------
 // Render a vertical strip of small cards, one per figure attached to
 // the active View, with thumbnails.  The currently-open figure is
@@ -6331,14 +6401,15 @@ function applySilhouetteFill(svg, highlights, fillOn, fillColor, fillAlpha,
     }}
   }}
 
-  // ---- 2) BOLD EDGE stroke (always) -------------------------------
-  // Prefer the rasterized FOOTPRINT polygon (one closed loop per
-  // visible piece -- so a part occluded in 3 places gets 3 separate
-  // bold loops, exactly what you'd expect).  PER-PART decision so a
-  // single missing footprint doesn't fall every part back to open
-  // polylines.
+  // ---- 2) BOLD EDGE stroke ----------------------------------------
+  // Use the rasterized FOOTPRINT polygon (closed loop per visible
+  // piece).  When a footprint hasn't arrived yet we DON'T draw the
+  // old open-polyline fallback -- that "half-baked outline" was
+  // misleading.  Instead we surface a "loading shaded outline..."
+  // status near the canvas so the user knows the closed loop is
+  // still computing, and only draw real closed loops here.
   const strokeSubpaths = [];
-  const _fallbackIdx = [];
+  const _waitingIdx = [];
   let _withFp = 0;
   for (const idx of idxList) {{
     const fp = _getFootprint(fid, vid, idx);
@@ -6352,32 +6423,14 @@ function applySilhouetteFill(svg, highlights, fillOn, fillColor, fillAlpha,
         );
       }});
     }} else {{
-      _fallbackIdx.push(idx);
+      _waitingIdx.push(idx);
     }}
   }}
-  // Open-polyline fallback ONLY for the parts that have no footprint yet
-  // (still in flight or genuinely empty from server).  This is the
-  // "partial outline" the user sees during the ~46s assembly raster on
-  // first click of a heavy source -- the prefetch in injectLiveSVG
-  // should make this window short.
-  if (_fallbackIdx.length) {{
-    if (console) {{
-      console.log('[silhouette] ' + _withFp + ' parts using footprint, '
-        + _fallbackIdx.length + ' falling back: ' + JSON.stringify(_fallbackIdx));
-    }}
-    for (const idx of _fallbackIdx) {{
-      const partCls = '.part-' + String(idx).padStart(3, '0');
-      svg.querySelectorAll(
-        '.layer-outline_v ' + partCls + ' path, '
-        + '.layer-sharp_v ' + partCls + ' path'
-      ).forEach(pathEl => {{
-        const d = (pathEl.getAttribute('d') || '').trim();
-        if (d) strokeSubpaths.push(d);
-      }});
-    }}
-  }} else if (_DBG_ON) {{
-    console.log('[silhouette] all ' + _withFp + ' selected parts have '
-      + 'closed-loop footprints');
+  if (_waitingIdx.length && typeof showShadedOutlineLoading === 'function') {{
+    showShadedOutlineLoading(_waitingIdx.length);
+  }} else if (!_waitingIdx.length
+              && typeof hideShadedOutlineLoading === 'function') {{
+    hideShadedOutlineLoading();
   }}
   if (strokeSubpaths.length) {{
     const strokePath = document.createElementNS('http://www.w3.org/2000/svg', 'path');

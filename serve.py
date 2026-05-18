@@ -197,6 +197,72 @@ _FOOT_CACHE_MAX = 2000
 # up_axis_key) so we don't redo the assembly raster within the same view
 # when extra parts are requested.
 _FOOT_RASTER_DONE: dict[tuple, bool] = {}
+# In-flight raster tracker so /api/render doesn't spawn duplicate
+# background threads for the same view, and /api/part_footprints can
+# tell the client "still computing" instead of starting another one.
+_FOOT_RASTER_INFLIGHT: dict[tuple, bool] = {}
+_FOOT_INFLIGHT_LOCK = threading.Lock()
+
+
+def _kick_footprint_raster(file_id: str, shape, view_dir,
+                             focal, up_axis_key,
+                             vd_key, focal_key, mesh_defl: float) -> None:
+    """Run the assembly footprint raster in a background thread so the
+    cache is warm by the time the user clicks a part.  Idempotent --
+    if a raster for the same view is already in flight or already done,
+    this is a no-op."""
+    view_key = (file_id, vd_key, focal_key, up_axis_key)
+    with _FOOT_INFLIGHT_LOCK:
+        if _FOOT_RASTER_DONE.get(view_key):
+            return
+        if _FOOT_RASTER_INFLIGHT.get(view_key):
+            return
+        _FOOT_RASTER_INFLIGHT[view_key] = True
+
+    def _run():
+        from t5_hlr_vector import compute_visible_footprints, split_solids
+        t0 = time.time()
+        # The cache-warming raster runs at a deliberately coarser
+        # mesh_defl + lower resolution than the default
+        # /api/part_footprints call.  Reason: the closed-loop outline
+        # is for visualisation only -- a 1mm coarser mesh / 1500x
+        # raster looks fine on screen but cuts the raster cost from
+        # ~5 min to ~1 min for a 138-part assembly.  When a user
+        # explicitly asks for a higher-fidelity outline later we can
+        # re-raster at full quality on that single click.
+        coarse_defl = max(1.0, mesh_defl * 1.5)
+        _log_event(level="info", op="footprint.prefetch.start",
+                    source_id=file_id, view=str(vd_key),
+                    mesh_defl=round(coarse_defl, 2))
+        # OCCT calls aren't thread-safe; share _HLR_LOCK with /api/render.
+        with _HLR_LOCK:
+            try:
+                all_indices = list(range(len(list(split_solids(shape)))))
+                full = compute_visible_footprints(
+                    shape, all_indices, view_dir, focal=focal,
+                    mesh_defl=coarse_defl,
+                    resolution=1500)
+                for idx, polys in (full or {}).items():
+                    ck = view_key + (idx,)
+                    if len(_FOOT_CACHE) >= _FOOT_CACHE_MAX:
+                        _FOOT_CACHE.pop(next(iter(_FOOT_CACHE)))
+                    _FOOT_CACHE[ck] = polys
+                _FOOT_RASTER_DONE[view_key] = True
+                _log_event(level="ok", op="footprint.prefetch.done",
+                            source_id=file_id,
+                            seconds=round(time.time() - t0, 2),
+                            parts=len(all_indices))
+            except Exception as exc:
+                _log_event(level="err", op="footprint.prefetch",
+                            source_id=file_id,
+                            error=f"{type(exc).__name__}: {exc}")
+            finally:
+                with _FOOT_INFLIGHT_LOCK:
+                    _FOOT_RASTER_INFLIGHT.pop(view_key, None)
+
+    t = threading.Thread(target=_run, daemon=True,
+                          name=f"footprint-prefetch-{file_id}")
+    t.start()
 
 
 def _load_step_as_compound(step_path: Path):
@@ -435,6 +501,18 @@ def render():
     if len(_RENDER_CACHE) >= _RENDER_CACHE_MAX:
         _RENDER_CACHE.pop(next(iter(_RENDER_CACHE)))
     _RENDER_CACHE[cache_key] = svg_bytes
+
+    # Background: kick off the visible-footprint raster for this view
+    # so by the time the user has finished scanning the SVG and clicks
+    # a part, the closed-loop outline cache is already warm.  Without
+    # this, the first click eats a ~46s wait for a 77-part assembly.
+    # The thread takes _HLR_LOCK so it doesn't fight any concurrent
+    # /api/render; the user's request has already returned by then.
+    _kick_footprint_raster(
+        file_id=file_id, shape=shape, view_dir=view_dir,
+        focal=focal, up_axis_key=up_axis_key,
+        vd_key=vd_key, focal_key=focal_key,
+        mesh_defl=hlr_kw.get("mesh_defl", 0.8))
 
     return Response(svg_bytes, mimetype="image/svg+xml", headers={
         "X-Render-Seconds": f"{elapsed:.2f}",
@@ -1395,6 +1473,8 @@ def part_footprints():
         for idx in misses:
             out_polys[idx] = full.get(idx, [])
 
+    raster_inflight = bool(_FOOT_RASTER_INFLIGHT.get(view_key))
+    raster_done = bool(_FOOT_RASTER_DONE.get(view_key))
     payload = {
         "part_indices": part_indices,
         "polylines": {str(i): out_polys.get(i, []) for i in part_indices},
@@ -1402,6 +1482,8 @@ def part_footprints():
             "hits": len(part_indices) - len(misses),
             "misses": len(misses),
             "raster_seconds": round(t_raster, 3),
+            "raster_inflight": raster_inflight,
+            "raster_done": raster_done,
         },
     }
     print(f"  /api/part_footprints {file_id:<10s} "
