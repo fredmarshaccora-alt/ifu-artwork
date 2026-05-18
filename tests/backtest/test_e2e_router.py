@@ -23,20 +23,24 @@ def test_app_shell_exposes_router_api(page):
     assert info["has_render"], "renderRoute missing"
 
 
-def test_empty_hash_shows_legacy_editor(page):
-    """No hash falls through to the legacy header+main.  The Home screen
-    is opt-in via the logo link (or explicit '#/' URL).  Once the
-    editor is fully migrated, we'll flip the default."""
+def test_empty_hash_redirects_to_home(page):
+    """Post-Phase-3 the editor only makes sense within a figure
+    route, so empty-hash now redirects to '#/' (Home).  Previously
+    the user was dropped on the bare legacy editor, which read as
+    "an old page" after a refresh."""
     page.evaluate("location.hash = ''")
-    page.wait_for_timeout(300)
+    page.wait_for_timeout(400)
     state = page.evaluate("""() => ({
-        header_visible: getComputedStyle(document.querySelector('header')).display !== 'none',
-        main_visible: getComputedStyle(document.querySelector('main')).display !== 'none',
+        hash: location.hash,
         app_root_visible: getComputedStyle(document.getElementById('app-root')).display !== 'none',
+        header_visible: getComputedStyle(document.querySelector('header')).display !== 'none',
     })""")
-    assert state["header_visible"]
-    assert state["main_visible"]
-    assert not state["app_root_visible"]
+    assert state["hash"] == "#/", \
+        f"empty hash didn't redirect to '#/': got {state['hash']!r}"
+    assert state["app_root_visible"], \
+        "Home (app-root) should be visible after redirect"
+    assert not state["header_visible"], \
+        "legacy header should be hidden when Home is showing"
 
 
 def test_unknown_route_shows_stub_and_hides_legacy(page):

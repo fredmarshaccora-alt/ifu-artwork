@@ -50,22 +50,20 @@ def _cleanup(page, pid):
     }}""")
 
 
-def test_dev_controls_visible_outside_figure_route(page):
-    """Without project mode active, every dev-mode control is visible
-    -- this is the global / file:// fallback the original editor
-    supported."""
-    page.evaluate("location.hash = ''")
+def test_project_scoped_class_clears_when_leaving_figure_route(page):
+    """The project-scoped-editor CSS class must be removed when the
+    user navigates AWAY from a figure route -- otherwise it leaks
+    into Home/Settings/Project views and hides their dev tools.
+
+    (Previously this test asserted the legacy editor was visible
+    on an empty hash; post-Phase-3, empty hash redirects to Home, so
+    the meaningful invariant is just: the body class clears on
+    teardown.)"""
+    page.evaluate("location.hash = '#/'")
     page.wait_for_timeout(400)
     body_cls = page.evaluate("document.body.className")
     assert 'project-scoped-editor' not in body_cls, \
-        f"unexpected project-scoped class outside route: {body_cls!r}"
-    # Spot-check a couple of dev controls are visible
-    visible = page.evaluate("""() => {
-        const el = document.querySelector('[data-ed-control="up-axis"]');
-        if (!el) return null;
-        return getComputedStyle(el).display !== 'none';
-    }""")
-    assert visible is True, "Up: dev control should be visible outside project route"
+        f"unexpected project-scoped class on Home: {body_cls!r}"
 
 
 def test_dev_controls_hidden_in_figure_route(page):

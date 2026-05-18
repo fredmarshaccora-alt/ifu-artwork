@@ -66,8 +66,13 @@ def test_project_card_uses_view_thumbnail_when_view_exists(page):
     pid = seed['proj']['id']
     vid = seed['view']['id']
     try:
+        # Force re-render -- empty hash now auto-redirects to #/ at
+        # page load, so setting hash='#/' is a no-op if the page is
+        # already there.  Call renderRoute() directly so HomeScreen
+        # re-fetches the freshly-seeded project + view.
         page.evaluate("location.hash = '#/'")
-        page.wait_for_timeout(1000)
+        page.evaluate("window.IFU_APP && window.IFU_APP.renderRoute()")
+        page.wait_for_timeout(1200)
         info = page.evaluate(f"""() => {{
             const cards = document.querySelectorAll('.card.project-card');
             for (const c of cards) {{
@@ -95,7 +100,8 @@ def test_project_card_monogram_when_no_view(page):
     pid = proj['id']
     try:
         page.evaluate("location.hash = '#/'")
-        page.wait_for_timeout(800)
+        page.evaluate("window.IFU_APP && window.IFU_APP.renderRoute()")
+        page.wait_for_timeout(1000)
         text = page.evaluate("""() => {
             const cards = document.querySelectorAll('.card.project-card');
             for (const c of cards) {

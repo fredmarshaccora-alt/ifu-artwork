@@ -1007,21 +1007,19 @@ async function renderRoute() {{
   const header = document.querySelector('header');
   const main = document.querySelector('main');
 
-  // Empty hash falls through to the legacy editor.  The Home screen
-  // is opt-in via the logo link in the legacy header (and the explicit
-  // '#/' URL).  We don't redirect because too much of the e2e test
-  // suite (and existing muscle memory) expects the legacy editor as
-  // the default landing page.  When the editor is fully migrated into
-  // the route shape (post-F.5+), we can flip this.
+  // Empty hash -> Home.  Post-Phase-3 the legacy editor is project-
+  // scoped and only meaningful inside a figure route; landing on it
+  // without a route is the "old page" symptom users hit after a
+  // refresh.  Redirect to '#/' so the Home screen is the default.
+  // Use replaceState-equivalent (location.hash = '#/') so the back
+  // button doesn't loop through the empty-hash entry.
   if (!hash || hash === '#') {{
     if (_currentTeardown) {{
       try {{ _currentTeardown(); }} catch (_e) {{}}
       _currentTeardown = null;
     }}
-    if (appRoot) appRoot.style.display = 'none';
-    if (header) header.style.display = '';
-    if (main) main.style.display = '';
-    return;
+    location.hash = '#/';
+    return;   // the hashchange listener will re-enter and render Home
   }}
 
   const matched = _matchRoute(hash);
