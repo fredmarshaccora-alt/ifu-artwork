@@ -1,173 +1,103 @@
-# Accora IFU artwork generator
+# IFU artwork
 
-Generates publication-clean line-art illustrations from Onshape/STEP assemblies
-for use in Instructions For Use (IFU) documents.
+Local Python + Flask + OCCT + three.js tool that turns Onshape /
+STEP assemblies into publication-clean line-art illustrations for
+Accora's Instructions For Use (IFU) documents.
 
 ## What it does
 
-Takes a STEP file of an assembly (Presto bed, Folding siderail, Contesa, etc.),
-runs analytical hidden-line removal on the B-rep, and emits:
+You import a CAD model from Onshape (or pick one of the bundled
+demo assemblies), pose a camera angle in the live 3D viewer, and
+the server runs **analytical hidden-line removal** on the
+B-rep to produce a true-vector SVG drawing. You then click parts
+to **highlight** them with preset styles and stack callouts.
 
-- per-part-tagged **SVG** (vector, publication-grade at any zoom)
-- a **PNG** raster for inline preview
-- an interactive **HTML viewer** with pan/zoom, part highlight, callout
-  arrows, layer toggles, and annotated-SVG export
+Output is a per-part tagged SVG file you can drop straight into an
+IFU document; no rasterisation, infinite zoom, edges classified by
+category (silhouette / sharp / smooth / hidden).
 
-Each edge is classified into the same buckets Composer exposes —
-**Profile / Sharp / Smooth** — so the look matches the IFU style Accora has
-been using.
-
-## Pipeline
-
-```
-STEP file
-   │
-   ▼  cadquery.importers.importStep
-TopoDS_Shape
-   │
-   ▼  rotate_shape (per-source pre-rotation → long axis along world X)
-oriented shape
-   │
-   ▼  HLRBRep_PolyAlgo + HLRBRep_PolyHLRToShape
-edges classified (visible / hidden × silhouette / sharp / smooth)
-   │
-   ▼  GCPnts_UniformDeflection on each curve
-projected polylines (u,v)
-   │
-   ├─► write_svg_parts → per-solid tagged SVG
-   └─► PIL rasterise   → PNG preview
-```
-
-`build_viewer.py` then bundles every (file × view × mode) into a single
-self-contained `out/viewer.html`.
-
-## Files
-
-| file | role |
-|---|---|
-| `t5_hlr_vector.py` | Core HLR + SVG/PNG writers. `STD_VIEWS` = camera dirs. |
-| `build_viewer.py` | Orchestrator. `SOURCES` lists STEP inputs + pre-rotation. |
-| `common.py` | STEP → vtkPolyData helper and shared camera setup. |
-| `slim_svg.py` | Strip whitespace + decimals from generated SVGs. |
-| `rebuild_html.py` | Re-bundle existing SVGs into a fresh `viewer.html` without re-running HLR. |
-| `render_all.py` | Convenience runner for the legacy raster tests. |
-| `progression.py` | Generates the technique-comparison montage. |
-| `t1_pbr_metal.py` / `t2_ssao_clay.py` / `t3_toon.py` / `t4_shaded_outline.py` | Earlier raster experiments kept for reference. |
-| `fetch_contesa_step.py` | Pulls the Contesa STEP from Onshape via API. |
-
-Older exploration (HLR vs mesh-silhouette vs VTK-EDL etc.) lives next door in
-`../step_lineart_test/`.
-
-## Viewer UI
-
-`out/viewer.html` is a single-file deliverable that bundles all generated
-SVGs plus a per-source GLB and an Onshape feature tree.  Open it in any
-modern browser - no server needed.
-
-**Header pickers**
-| control | does |
-|---|---|
-| File | choose source (`siderail` / `presto` / `contesa`) |
-| View | choose the 2D HLR projection (`iso` / `front` / `side`) |
-| `smart` / `+ smooth` / `+ hidden` | edge category preset |
-| `3D view-finder` | toggle WebGL orbit mode (see below) |
-| `+ callout` | annotate the current 2D view with arrow + label |
-| `export SVG` | download the annotated SVG of the current view |
-
-**Left sidebar** shows the live Onshape instance tree (collapsible) plus
-the STEP solid list.  Click any leaf-Part in the tree or any row in the
-solid list to highlight that part in both 2D and 3D views.  Tree-to-solid
-linkage is *positional* in v1 (i-th leaf-Part in the tree maps to i-th
-STEP solid) - good enough for most assemblies, replace with name
-extraction via `STEPCAFControl_Reader` if misalignments matter.
-
-**Right sidebar** has per-category layer toggles, callout counts, and
-the pipeline note.
-
-### 3D view-finder
-
-A three.js orbit panel that shares the centre cell with the 2D viewer.
-Click `3D view-finder` to switch in; click again to switch back.
-
-- **Camera up is locked to world Z**, so vertical edges in the model
-  always project vertical no matter where you orbit to.  Free azimuth +
-  elevation; verticals stay vertical.
-- **Drag** to orbit, **wheel** to zoom, **right-drag** to pan.
-- The floating toolbar shows the live `view_dir = (x, y, z)` tuple.
-  Click **copy view_dir** to put it on the clipboard.  Paste into
-  `STD_VIEWS` in `t5_hlr_vector.py` (or `VIEWS` in `build_viewer.py`) to
-  add a new HLR preset at that angle.
-- Click **reset camera** to snap back to the 2D view's preset direction.
-
-The GLB is meshed coarser than the HLR (so the inline blob stays under
-~30 MB even for Contesa's 778 parts).  This is a view-finder, not a
-print pipeline; the locked angle should still go through HLR for the
-final image.
-
-### Tree-to-solid linkage
-
-Onshape exports STEP with `grouping: True`, which preserves the assembly
-tree but cadquery's STEP importer drops the per-instance names.  v1 of
-the tree sidebar therefore links by *position*: leaf-Part instances are
-flattened in tree order, then mapped 1:1 to STEP solids in their
-extraction order.
-
-This works when Onshape and STEP agree on traversal order (the common
-case).  If a tree click highlights the wrong part, the fix is to swap
-the cadquery import for `STEPCAFControl_Reader` and read the real
-instance names from the STEP product structure.
-
-## Running
-
-### Quick start (Windows)
-
-Double-click **`Start IFU Artwork.bat`** in the repo folder.  It
-starts the server (1-3 minutes on first boot while the STEP files
-load into memory) and opens the tool in your default browser
-automatically.  Close the window when you're done.
-
-To get a desktop shortcut + Start-menu entry, right-click
-**`install-shortcut.ps1`** -> "Run with PowerShell" once.  After that
-you can launch the tool from your desktop or by typing "IFU Artwork"
-in the Start menu.
-
-### Manual / development
+## Quick start
 
 ```bash
-python serve.py          # starts server at http://localhost:5000
+# 1. install python deps (cadquery-ocp, flask, requests, trimesh, opencv, etc.)
+pip install -r requirements.txt    # (or whatever your env uses)
 
-# Pipeline operations (rarely needed in normal use)
-python build_viewer.py   # full HLR rebuild of viewer.html (~5 min)
-python rebuild_html.py   # re-bundle from cached SVGs (fast)
-python t5_hlr_vector.py  # single STEP smoke test
+# 2. start the local server
+python serve.py
+
+# 3. open http://localhost:5000 in a browser
 ```
 
-Outputs land in `out/` (gitignored).
+The server boots the bundled STEP files into memory (~30 s the first
+time), loads any imported Onshape sources, and serves the UI at the
+root path.
 
-## Adding a new source
+## Workflow
 
-1. Drop the STEP file somewhere on disk (or fetch via API).
-2. Add an entry to `SOURCES` in `build_viewer.py`:
-   ```python
-   ("mysource", "Friendly label", Path(r"...\file.step"),
-    {"mesh_defl": 1.5, "sample_defl": 1.0},
-    pre_rotate),   # ((axis), angle_deg) — or None if model is already X-long, Z-up
-   ```
-3. The bbox snapshot printed at load time tells you whether a pre-rotation
-   is needed: a bed should have its largest extent on X.
+1. **Home** — project tiles. Click `+ New project`.
+2. **New project modal** — name + either paste an Onshape URL
+   (which triggers a STEP translation + download in the background)
+   or pick one of the bundled demo assemblies.
+3. **Project workspace** — Views grid. Each View is a saved camera
+   angle for the project's model. Click `+ New view`.
+4. **Editor** opens on a view's first figure. The 2D pane shows the
+   HLR drawing; the 3D pane shows the same model interactively.
+   Drag the splitter to resize.
+5. **Highlight parts** — click parts on either pane. Pick a preset
+   style from the right sidebar (Highlight / Caution / Info / Outline
+   only / Subtle). Changes auto-save.
+6. **Add variants** — the left sidebar has a strip of thumbnail
+   cards, one per highlight variant of the current view, plus a `+`
+   card. Each variant is a separate Figure under the same View.
+7. **Export** — `export SVG` in the header writes the styled,
+   annotated drawing to disk.
 
-## Orientation convention
+## Documentation
 
-`STD_VIEWS` assume **X = length, Z = up**.  Each source is pre-rotated to
-that frame so the iso/front/side views all line up.  Models that come in
-with a different convention (e.g. Presto's native Z-along-length) get a
-one-line rotation entry in `SOURCES`.
+See `docs/`:
 
-## Dependencies
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md) — system layers, where the
+  3D viewer, HLR pipeline, router, and storage live
+- [DATA_MODEL.md](docs/DATA_MODEL.md) — Project → View → Figure +
+  Source schemas, persistence layout on disk
+- [API.md](docs/API.md) — every HTTP endpoint, request/response shape
+- [USER_FLOWS.md](docs/USER_FLOWS.md) — the canonical workflows
+  end-to-end (import, create view, switch variants, export)
+- [DEVELOPMENT.md](docs/DEVELOPMENT.md) — how to build the viewer
+  HTML, run the test suite, debug a render
+- [AUDIT.md](docs/AUDIT.md) — known reliability gaps + the plan for
+  hardening them
 
-- `cadquery` (brings OCCT bindings via `OCP`)
-- `vtk`
-- `Pillow`
-- `numpy`
+## Testing
 
-No package manifest yet — install ad-hoc in the active Python env.
+```bash
+python -m pytest tests/backtest/test_e2e_*.py -q
+```
+
+The full e2e suite runs against a live server on `127.0.0.1:5000`
+and takes ~5–10 min. Unit + API tests (subsets) are faster:
+
+```bash
+python -m pytest tests/backtest/test_projector.py tests/backtest/test_footprint.py -q
+```
+
+## Layout
+
+```
+serve.py             Flask server + the HLR / footprint endpoints
+build_viewer.py      Builds out/viewer.html (single self-contained file)
+rebuild_html.py      Rebuilds viewer.html without re-running HLR
+t5_hlr_vector.py     OCCT HLR pipeline + footprint rasterizer
+ifu/                 Python persistence + Onshape integration
+  config.py            SOURCES, VIEWS, OUT
+  sources.py           dynamic-source registry (imports)
+  projects.py          Project CRUD
+  views.py             View CRUD + migration
+  figures.py           Figure CRUD + thumbnails
+  onshape_fetch.py     Onshape URL parsing, STEP translation, configurations
+  onshape_client.py    auth + transport
+  ...
+out/                 Runtime artefacts (figures, views, sources, imports, viewer.html)
+tests/backtest/      pytest suites (unit + API + e2e)
+docs/                Architecture + flows + audit notes
+```
