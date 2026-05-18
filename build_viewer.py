@@ -450,7 +450,20 @@ HTML_TEMPLATE = r"""<!doctype html>
                 background: var(--accora-teal-pale); color: var(--accora-teal);
                 font-size: 11px; font-weight: bold; margin-right: 6px; }}
   .canvas-wrap {{ position: relative; overflow: hidden; background: white; }}
-  .webgl-wrap  {{ position: relative; overflow: hidden; background: white; }}
+  .webgl-wrap  {{ position: relative; overflow: hidden;
+                   /* Studio backdrop: subtle vertical gradient with a soft
+                      horizon at ~62%.  Reads as "looking out across a
+                      light grey floor" instead of a flat white box.  The
+                      WebGL canvas is alpha:true so this shows through. */
+                   background:
+                     radial-gradient(ellipse 80% 30% at 50% 78%,
+                                     rgba(0,0,0,0.06) 0%,
+                                     rgba(0,0,0,0) 70%),
+                     linear-gradient(180deg,
+                                     #fbfbfc 0%,
+                                     #f3f4f6 55%,
+                                     #e3e6eb 85%,
+                                     #d7dbe1 100%); }}
   .webgl-wrap canvas {{ width: 100%; height: 100%; display: block;
                          cursor: grab; }}
   .webgl-wrap canvas.dragging {{ cursor: grabbing; }}
@@ -7058,6 +7071,19 @@ window.THREE = THREE;
 import {{ OrbitControls }} from 'three/addons/controls/OrbitControls.js';
 import {{ GLTFLoader }} from 'three/addons/loaders/GLTFLoader.js';
 import {{ ViewHelper }} from 'three/addons/helpers/ViewHelper.js';
+// Onshape-quality look: room IBL + SSAO + tone mapping.  Without these
+// the renderer ships pre-PBR-era graphics (raw colors, no soft shading,
+// no environment).
+import {{ RoomEnvironment }}
+  from 'three/addons/environments/RoomEnvironment.js';
+import {{ EffectComposer }}
+  from 'three/addons/postprocessing/EffectComposer.js';
+import {{ RenderPass }}
+  from 'three/addons/postprocessing/RenderPass.js';
+import {{ SSAOPass }}
+  from 'three/addons/postprocessing/SSAOPass.js';
+import {{ OutputPass }}
+  from 'three/addons/postprocessing/OutputPass.js';
 
 const canvas = document.getElementById('webgl-canvas');
 const wrap3d = document.getElementById('webgl-wrap');
@@ -7072,6 +7098,10 @@ const is3DVisible = () => {{
 }};
 
 let scene, camera, renderer, controls, viewHelper;
+let composer = null;       // EffectComposer for SSAO postprocess
+let ssaoPass = null;       // tunable
+let envTexture = null;     // PMREM-baked room environment map
+let _useComposer = true;   // toggleable for perf-debug
 // ViewHelper rendering also needs the main renderer's auto-clear off,
 // then we manually clear before main + after main draw the gizmo.
 let _viewHelperClock = null;
@@ -7085,7 +7115,11 @@ function init() {{
   inited = true;
 
   scene = new THREE.Scene();
-  scene.background = new THREE.Color(0xffffff);
+  // Subtle gradient backdrop instead of flat white -- this is what
+  // makes Onshape's viewport feel like a "studio" instead of a
+  // sterile white box.  We layer a CSS gradient on #webgl-wrap and
+  // leave the scene background transparent so the canvas reveals it.
+  scene.background = null;
 
   const r = canvas.getBoundingClientRect();
   // OrthographicCamera, NOT perspective: OCCT HLR uses orthographic
@@ -7104,26 +7138,86 @@ function init() {{
     canvas,
     antialias: true,
     preserveDrawingBuffer: true,  // required for screenshot exporter
+    alpha: true,                  // so the CSS gradient shows through
   }});
   renderer.setSize(r.width, r.height, false);
   renderer.setPixelRatio(window.devicePixelRatio || 1);
+  // ACES Filmic + sRGB output: the single most-impactful one-liner.
+  // Without this, MeshStandardMaterial colors are crushed; with it,
+  // they pop the same way Onshape's do.
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.05;
+  // Shadow maps for the contact shadow plane below the model
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
-  scene.add(new THREE.AmbientLight(0xffffff, 0.55));
-  const sun = new THREE.DirectionalLight(0xffffff, 0.85);
-  sun.position.set(1, -1, 1.5);
+  // ---- Image-based lighting (IBL) -----------------------------------
+  // RoomEnvironment is a built-in scene of soft-coloured panels that,
+  // when PMREM-baked, gives every MeshStandardMaterial in the scene
+  // sky-lit ambient + soft reflections.  This is the difference
+  // between "lit by three point lights" and "looks like a real CAD
+  // workspace".
+  try {{
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    pmrem.compileEquirectangularShader();
+    const roomScene = new RoomEnvironment(renderer);
+    envTexture = pmrem.fromScene(roomScene, 0.04).texture;
+    scene.environment = envTexture;
+    pmrem.dispose();
+  }} catch (e) {{
+    console.warn('[3d] IBL setup failed; falling back to lights only:', e);
+  }}
+
+  // ---- Lights: still useful as a sun+fill on top of the IBL --------
+  // IBL handles ambient; these add directional shape so cylindrical
+  // tubes still read as 3D in solid-coloured renders.  Lower
+  // intensities than before since the environment is doing most of
+  // the work now.
+  scene.add(new THREE.AmbientLight(0xffffff, 0.15));
+  const sun = new THREE.DirectionalLight(0xffffff, 0.65);
+  sun.position.set(1000, -2000, 2500);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(1024, 1024);
+  sun.shadow.camera.near = 100;
+  sun.shadow.camera.far  = 12000;
+  sun.shadow.camera.left = -3000;
+  sun.shadow.camera.right = 3000;
+  sun.shadow.camera.top = 3000;
+  sun.shadow.camera.bottom = -3000;
+  sun.shadow.bias = -0.0008;
+  sun.shadow.radius = 4;
   scene.add(sun);
-  const fill = new THREE.DirectionalLight(0xffffff, 0.30);
-  fill.position.set(-1, 0.5, -0.5);
+  const fill = new THREE.DirectionalLight(0xffffff, 0.20);
+  fill.position.set(-2000, 1000, 500);
   scene.add(fill);
-  const rim = new THREE.DirectionalLight(0xffffff, 0.20);
-  rim.position.set(0, 1, -1);
-  scene.add(rim);
 
-  // Ground grid + world axes for orientation reference.  Sized
-  // generously so they remain visible at any source bbox; auto-resize
-  // happens in frame() once the model is loaded.
-  const grid = new THREE.GridHelper(4000, 40, 0xcccccc, 0xeeeeee);
-  grid.rotation.x = Math.PI / 2;  // GridHelper is XZ-plane; flip to XY (Z-up)
+  // ---- Floor: contact shadow only, no grid lines -------------------
+  // A big horizontal plane sits just below the model and ONLY receives
+  // a soft shadow from the sun (transparent ShadowMaterial).  No
+  // visible grid lines -- the gradient backdrop reads as the
+  // "ground" surface, just like Onshape.
+  const shadowMat = new THREE.ShadowMaterial({{
+    color: 0x000000,
+    opacity: 0.18,
+    transparent: true,
+  }});
+  const shadowPlane = new THREE.Mesh(
+    new THREE.PlaneGeometry(20000, 20000), shadowMat);
+  shadowPlane.position.z = -10;
+  shadowPlane.receiveShadow = true;
+  shadowPlane.userData._helper = true;
+  shadowPlane.userData._shadowPlane = true;
+  scene.add(shadowPlane);
+
+  // A faint grid for orientation reference -- shown subtly via a
+  // helper that the existing perf code already filters by
+  // userData._helper.  Drawn smaller and lighter than before so it
+  // doesn't dominate the new studio-style backdrop.
+  const grid = new THREE.GridHelper(6000, 60, 0xd4d4d8, 0xeaeaec);
+  grid.rotation.x = Math.PI / 2;
+  grid.material.transparent = true;
+  grid.material.opacity = 0.35;
   grid.userData._helper = true;
   scene.add(grid);
   const axes = new THREE.AxesHelper(300);
@@ -7135,6 +7229,33 @@ function init() {{
   controls.enableDamping = true;
   controls.dampingFactor = 0.08;
   controls.update();
+
+  // ---- Postprocessing: SSAO ----------------------------------------
+  // SSAO darkens corners and crevices in proportion to local geometry
+  // density.  It's the visual cue that distinguishes "flat-shaded
+  // CAD" from "this looks like a real product photo".  Onshape uses
+  // it heavily.
+  try {{
+    composer = new EffectComposer(renderer);
+    composer.setPixelRatio(window.devicePixelRatio || 1);
+    composer.setSize(r.width || 800, r.height || 600);
+    composer.addPass(new RenderPass(scene, camera));
+    ssaoPass = new SSAOPass(scene, camera, r.width || 800, r.height || 600);
+    // Tuned for orthographic CAD: small kernel radius scales with
+    // the bbox in frame(), large minDistance avoids haloes around
+    // small parts.
+    ssaoPass.kernelRadius = 24;
+    ssaoPass.minDistance = 0.0008;
+    ssaoPass.maxDistance = 0.06;
+    ssaoPass.output = SSAOPass.OUTPUT.Default;
+    composer.addPass(ssaoPass);
+    composer.addPass(new OutputPass());
+  }} catch (e) {{
+    console.warn('[3d] postprocess setup failed; running plain renderer:', e);
+    composer = null;
+    ssaoPass = null;
+    _useComposer = false;
+  }}
 
   // ViewHelper (orientation gizmo): the floating axis-cube in the corner.
   // Click a face -> camera animates to that direction.  Renders as its
@@ -7247,6 +7368,10 @@ function resize() {{
     camera.aspect = r.width / r.height;
   }}
   camera.updateProjectionMatrix();
+  if (composer) {{
+    composer.setSize(r.width, r.height);
+    if (ssaoPass && ssaoPass.setSize) ssaoPass.setSize(r.width, r.height);
+  }}
 }}
 
 function animate() {{
@@ -7264,17 +7389,22 @@ function animate() {{
       renderer.domElement.height !== Math.round(r.height * (window.devicePixelRatio || 1))) {{
     resize();
   }}
-  // Main scene, then overlay the orientation gizmo on top.
-  // ViewHelper.render() leaves the WebGL viewport pointing at its
-  // tiny corner region; if we don't restore it, the next frame's main
-  // render ends up scribbling into the corner instead of filling the
-  // canvas.  Save+restore explicitly to avoid the regression.
-  renderer.autoClear = true;
-  renderer.render(scene, camera);
+  // Main scene through the EffectComposer (SSAO + output) when
+  // available; fall back to the raw renderer.render path when the
+  // composer failed to set up (no SSAO support / old WebGL).
+  if (_useComposer && composer) {{
+    composer.render();
+  }} else {{
+    renderer.autoClear = true;
+    renderer.render(scene, camera);
+  }}
+  // Overlay the orientation gizmo on top.  ViewHelper.render() leaves
+  // the WebGL viewport pointing at its tiny corner region; restore
+  // the full viewport explicitly so the next frame's main render
+  // fills the whole canvas.
   if (viewHelper) {{
     renderer.autoClear = false;
     viewHelper.render(renderer);
-    const r = canvas.getBoundingClientRect();
     const dpr = window.devicePixelRatio || 1;
     renderer.setViewport(0, 0, r.width * dpr, r.height * dpr);
   }}
@@ -7304,21 +7434,46 @@ function loadSource(file_id) {{
   // which meshes the server-side shape on demand.
   const bakedB64 = GLB_B64[file_id];
   const _hookGroup = (grp) => {{
+    // Onshape-style materials: low metalness for most parts so they
+    // read like neutral CAD plastic / aluminium-equivalent surfaces.
+    // The IBL environment provides ambient + reflections so we don't
+    // need high roughness to hide flat shading.  EnvMapIntensity dials
+    // how much the environment shows up on each material.
     grp.traverse(obj => {{
       if (obj.isMesh) {{
         obj.material = new THREE.MeshStandardMaterial({{
-          color: 0xe8e8ea, metalness: 0.15, roughness: 0.55,
-          transparent: false, side: THREE.DoubleSide,
-          polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1,
+          color: 0xd9dbde,
+          metalness: 0.10,
+          roughness: 0.65,
+          envMapIntensity: 0.9,
+          transparent: false,
+          side: THREE.DoubleSide,
+          polygonOffset: true,
+          polygonOffsetFactor: 1,
+          polygonOffsetUnits: 1,
         }});
-        const edges = new THREE.EdgesGeometry(obj.geometry, 30);
+        // Shadow casting + receiving so SSAO + the contact shadow plane
+        // get accurate occlusion data.
+        obj.castShadow = true;
+        obj.receiveShadow = true;
+        // Feature edges only: 45deg threshold (was 30) skips most of
+        // the curved-cylinder facet noise that EdgesGeometry would
+        // otherwise overlay on every revolute surface.  Thinner, dark
+        // grey instead of pure black so they read as drawing edges
+        // rather than a comic-book outline.
+        const edges = new THREE.EdgesGeometry(obj.geometry, 45);
         const lines = new THREE.LineSegments(
           edges,
-          new THREE.LineBasicMaterial({{ color: 0x000000, linewidth: 1 }})
+          new THREE.LineBasicMaterial({{
+            color: 0x303035,
+            transparent: true,
+            opacity: 0.55,
+            linewidth: 1,
+          }})
         );
         lines.userData.isEdge = true;
         obj.add(lines);
-        obj.userData.baseColor = 0xe8e8ea;
+        obj.userData.baseColor = 0xd9dbde;
       }}
     }});
     loaded.set(file_id, grp);
@@ -7738,6 +7893,27 @@ window.IFU_VIEWER.getCurrentViewDir = () => {{
   if (!camera || !controls) return null;
   const d = camera.position.clone().sub(controls.target).normalize();
   return [d.x, d.y, d.z];
+}};
+
+// Renderer + scene state inspector -- used by tests + the future
+// graphics-quality controls.  Returns null when the 3D viewer hasn't
+// initialised yet.
+window.IFU_VIEWER.getRendererState = () => {{
+  if (!renderer || !scene) return null;
+  let hasShadowPlane = false;
+  scene.traverse(o => {{
+    if (o.userData && o.userData._shadowPlane) hasShadowPlane = true;
+  }});
+  return {{
+    toneMapping: renderer.toneMapping,
+    outputColorSpace: renderer.outputColorSpace,
+    toneMappingExposure: renderer.toneMappingExposure,
+    shadowMapEnabled: !!(renderer.shadowMap && renderer.shadowMap.enabled),
+    hasEnvironment: !!scene.environment,
+    hasComposer: !!composer,
+    hasSSAO: !!ssaoPass,
+    hasShadowPlane,
+  }};
 }};
 
 // Camera position + target as world-space tuples.  Used by the saved-views
