@@ -73,24 +73,19 @@ That's the happy path. **Read the open items before relying on it.**
 
 These are real and I could not resolve them from here:
 
-1. **Auth — there is none.** The app has no login. Before the team uses
-   it (especially for Accora product/QMS data), put an identity proxy in
-   front of **both** origins:
-   - Recommended: **Cloudflare Access** (free tier) gating by your
-     IdP / email domain — sits in front of the Render URL and the Vercel
-     URL, no app changes.
-   - Or Vercel's password/SSO protection for the UI + a shared-secret
-     header (or IP allowlist) on the Render API.
-   Don't expose the Render API publicly without this.
+1. **Auth — there is none in the app.** Put **Cloudflare Access** in
+   front of both origins (gates by your Accora identity, no app login).
+   Full step-by-step in **`CLOUDFLARE.md`**. It needs a custom domain on
+   Cloudflare + your IdP, and one small app-side credential change I'll
+   make once you've picked the domain structure. Don't expose the Render
+   API publicly before this.
 
-2. **Onshape import is a local dependency.** `ifu/onshape_client.py`
-   loads the client from a hardcoded path
-   (`C:\Users\...\Projects\onshape-analytics`) that won't exist on
-   Render. So *importing new Onshape documents* won't work in the
-   container until that client is either **vendored into this repo** or
-   published so `requirements.txt` can install it. Everything else
-   (rendering, highlighting, IFU export of already-imported sources)
-   works without it. Tell me which (vendor vs package) and I'll wire it.
+2. **Onshape import — RESOLVED (vendored).** The client used to load from
+   a hardcoded local path; it's now vendored into the repo
+   (`ifu/onshape_client_vendored.py`) and used automatically when the
+   local copy isn't present (i.e. on Render). Set `ONSHAPE_ACCESS_KEY` /
+   `ONSHAPE_SECRET_KEY` as Render secrets and imports work in the
+   container. (Dev still uses your local sibling project if present.)
 
 3. **Existing data + STEP files.** Your current figures/views/projects
    and imported `*.step` live in the local `out/` folder. The Render disk

@@ -33,5 +33,12 @@ try:
     from onshape_analytics.client import OnshapeClient as _OnshapeClient
     OnshapeClient = _OnshapeClient
 except Exception as _exc:
-    print(f"  (Onshape client unavailable: {_exc}; feature trees will be empty)",
-          flush=True)
+    # The sibling project isn't present (e.g. on the Render server) --
+    # fall back to the vendored copy that ships in this repo.  Keys come
+    # from ONSHAPE_ACCESS_KEY / ONSHAPE_SECRET_KEY in the environment.
+    try:
+        from .onshape_client_vendored import OnshapeClient as _Vendored
+        OnshapeClient = _Vendored
+    except Exception as _exc2:
+        print(f"  (Onshape client unavailable: {_exc} / {_exc2}; "
+              f"feature trees + imports will be disabled)", flush=True)
