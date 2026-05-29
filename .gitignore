@@ -1,7 +1,16 @@
-# Generated outputs
-out/
+# Generated outputs + runtime data (figures/views/projects/thumbs/STEPs).
+# Keep ONLY viewer.html -- the Vercel build needs it as the static UI.
+out/*
+!out/viewer.html
 build_log.txt
 progression.png
+
+# Design snapshots / agent scratch / backups (never push proprietary art)
+debug_captures/
+tests/audit/
+tests/debug_shots/
+*.bak
+*.phase0bak
 
 # Source STEP files (large binaries, sourced externally)
 *.step

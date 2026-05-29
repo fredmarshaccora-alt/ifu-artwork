@@ -1,0 +1,35 @@
+# Render Blueprint for the IFU compute back-end.
+# Deploy: push this repo to GitHub, then in Render "New > Blueprint" and
+# point it here.  Set the two ONShape secrets in the dashboard.
+services:
+  - type: web
+    name: ifu-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    # OCCT + a loaded assembly are memory-hungry. 'standard' = 2GB is a
+    # starting point; bump to 'pro' (4GB) if big assemblies OOM.
+    plan: standard
+    region: frankfurt          # EU (nearest to UK for data residency)
+    healthCheckPath: /api/healthz
+    # Durable storage for figures / views / projects / sources / imported
+    # STEPs / thumbnails.  Without this, all data is lost on every deploy.
+    disk:
+      name: ifu-data
+      mountPath: /data
+      sizeGB: 10
+    envVars:
+      - key: IFU_DATA_DIR
+        value: /data
+      # The Vercel front-end origin allowed to call this API (CORS).
+      # Replace with your real Vercel URL after the front-end is deployed.
+      - key: IFU_ALLOWED_ORIGIN
+        value: https://YOUR-APP.vercel.app
+      - key: WEB_THREADS
+        value: "8"
+      # Onshape API credentials -- set these as SECRETS in the Render
+      # dashboard (sync:false keeps them out of the repo).  Needed only
+      # for importing new Onshape documents; existing sources work without.
+      - key: ONSHAPE_ACCESS_KEY
+        sync: false
+      - key: ONSHAPE_SECRET_KEY
+        sync: false

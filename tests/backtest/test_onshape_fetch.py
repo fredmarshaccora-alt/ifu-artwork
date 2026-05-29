@@ -239,3 +239,46 @@ class TestParseConfigurationResponse:
         out = self._norm({"configurationParameters": []})
         assert out["has_config"] is False
         assert out["parameters"] == []
+
+    def test_length_parameter_treated_as_quantity(self):
+        """Some legacy Onshape docs declare configuration params with
+        btType BTMConfigurationParameterLength rather than Quantity.
+        Treat them the same so the UI widget renders."""
+        raw = {"configurationParameters": [{
+            "btType": "BTMConfigurationParameterLength-100",
+            "parameterId": "WidthL", "parameterName": "Width",
+            "rangeAndDefault": {
+                "defaultValue": 100, "minValue": 50, "maxValue": 200,
+                "units": "millimeter",
+            },
+        }]}
+        p = self._norm(raw)["parameters"][0]
+        assert p["type"] == "quantity"
+        assert p["unit"] == "millimeter"
+        assert p["default"] == 100
+
+    def test_list_parameter_falls_back_to_string(self):
+        """List / matrix params expose a single encoded value -- map
+        to 'string' so the user gets an editable input, and surface
+        raw_type so a power-user UI can hint at the underlying type."""
+        raw = {"configurationParameters": [{
+            "btType": "BTMConfigurationParameterList-7",
+            "parameterId": "ListX", "parameterName": "Layout",
+            "defaultValue": "a;b;c",
+        }]}
+        p = self._norm(raw)["parameters"][0]
+        assert p["type"] == "string"
+        assert p["default"] == "a;b;c"
+        assert "List" in p["raw_type"]
+
+    def test_unknown_parameter_exposes_raw_type(self):
+        """A genuinely unknown btType should still round-trip with a
+        raw_type so the UI can render a debug hint."""
+        raw = {"configurationParameters": [{
+            "btType": "BTMConfigurationParameterSomeNewThing-9999",
+            "parameterId": "FooBar", "parameterName": "Foo",
+            "defaultValue": None,
+        }]}
+        p = self._norm(raw)["parameters"][0]
+        assert p["type"] == "unknown"
+        assert p["raw_type"] == "BTMConfigurationParameterSomeNewThing-9999"

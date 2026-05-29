@@ -165,15 +165,32 @@ def get_element_configuration(did: str, wv: str, wvid: str,
     params = resp.get("configurationParameters") or []
     out_params = []
     for p in params:
-        bt_type = (p.get("btType") or "").lower()
-        # Derive a short kind from the btType prefix
+        bt_type_raw = p.get("btType") or ""
+        bt_type = bt_type_raw.lower()
+        # Derive a short kind from the btType prefix.  Be inclusive:
+        # Onshape ships BTMConfigurationParameterEnum, Boolean,
+        # Quantity (Quantity covers LENGTH/ANGLE/etc.), Length (a
+        # distinct legacy alias on some docs), String, and a couple
+        # of list-of-enum / matrix variants that we treat as enum +
+        # a "raw" fallback so the UI can show something better than
+        # a blank.
         if "enum" in bt_type:
             kind = "enum"
         elif "boolean" in bt_type:
             kind = "boolean"
         elif "quantity" in bt_type:
             kind = "quantity"
+        # "Length" appears in older configs as its own bt-type.
+        # Treat it as a length-flavoured quantity so the same UI
+        # widget (numeric input + unit) renders.
+        elif "length" in bt_type:
+            kind = "quantity"
         elif "string" in bt_type:
+            kind = "string"
+        # List / matrix params expose a single string that Onshape's
+        # configuration encoder concatenates.  Surface them as
+        # 'string' so the user can at least edit the raw value.
+        elif "list" in bt_type or "matrix" in bt_type:
             kind = "string"
         else:
             kind = "unknown"
@@ -199,12 +216,16 @@ def get_element_configuration(did: str, wv: str, wvid: str,
                 "max": rad.get("maxValue"),
                 "units": rad.get("units"),
             }
-            unit = rad.get("units") or p.get("quantityType")
+            unit = (rad.get("units") or p.get("quantityType")
+                    or ("length" if "length" in bt_type else None))
 
         out_params.append({
             "id": param_id,
             "name": name,
             "type": kind,
+            "raw_type": bt_type_raw,  # exposed so a "raw" UI mode
+                                      # can show users what we
+                                      # couldn't classify
             "default": default,
             "options": opts,
             "unit": unit,
@@ -435,11 +456,27 @@ def list_jobs() -> list[dict]:
         return [dict(j) for j in _JOBS.values()]
 
 
+class _ImportCancelled(Exception):
+    """Raised inside a worker when the job's cancel flag has been set."""
+
+
+def _is_cancelled(job_id: str) -> bool:
+    with _JOBS_LOCK:
+        return bool(_JOBS.get(job_id, {}).get("cancel_requested"))
+
+
+def _checkpoint_cancel(job_id: str) -> None:
+    """Raise _ImportCancelled if the user requested cancel."""
+    if _is_cancelled(job_id):
+        raise _ImportCancelled()
+
+
 def _run_import(job_id: str, url: str) -> None:
     """Body of the import worker thread.  Updates _JOBS in place."""
     try:
         _update_job(job_id, status="resolving", progress=5,
                      message="parsing URL...")
+        _checkpoint_cancel(job_id)
         ids = parse_onshape_url(url)
         did, wv, wvid, eid = ids["did"], ids["wv"], ids["wvid"], ids["eid"]
         if not eid:
@@ -448,6 +485,7 @@ def _run_import(job_id: str, url: str) -> None:
 
         _update_job(job_id, status="resolving", progress=15,
                      message="fetching document metadata...")
+        _checkpoint_cancel(job_id)
         doc = get_document_info(did)
         elem = get_element_info(did, wv, wvid, eid)
         _update_job(job_id,
@@ -461,6 +499,7 @@ def _run_import(job_id: str, url: str) -> None:
 
         _update_job(job_id, status="translating", progress=25,
                      message=f"translating {elem['name']} to STEP...")
+        _checkpoint_cancel(job_id)
         tr = start_step_translation(did, wv, wvid, eid,
                                      element_type=elem["type"])
         tid = tr["translation_id"]
@@ -474,6 +513,7 @@ def _run_import(job_id: str, url: str) -> None:
         last_state = "ACTIVE"
         while time.time() < deadline:
             time.sleep(3.0)
+            _checkpoint_cancel(job_id)
             st = poll_translation(tid)
             last_state = st["state"]
             if last_state == "DONE":
@@ -497,6 +537,7 @@ def _run_import(job_id: str, url: str) -> None:
 
         _update_job(job_id, status="downloading", progress=75,
                      message="downloading STEP...")
+        _checkpoint_cancel(job_id)
         # Filename: doc-name slug + first 6 chars of did to disambiguate
         slug = re.sub(r"[^A-Za-z0-9_-]+", "_",
                        doc["name"])[:48].strip("_") or "onshape"
@@ -512,9 +553,30 @@ def _run_import(job_id: str, url: str) -> None:
                      message="ready",
                      source_id=source_id,
                      step_path=str(step_path))
+    except _ImportCancelled:
+        _update_job(job_id, status="cancelled", progress=100,
+                     message="cancelled by user")
     except Exception as e:
         _update_job(job_id, status="error", progress=100,
                      error=str(e), message=f"error: {e}")
+
+
+def cancel_import(job_id: str) -> Optional[dict]:
+    """Request that an in-flight import be cancelled.  The worker
+    checks its cancel flag at each progress checkpoint and bails out
+    with status='cancelled'.  Returns the current job dict, or None
+    if the job id is unknown."""
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if job is None:
+            return None
+        # If the job already finished, leave it alone -- can't cancel
+        # what's already done.
+        if job.get("status") in ("ready", "error", "cancelled"):
+            return dict(job)
+        job["cancel_requested"] = True
+        job["message"] = "cancel requested..."
+        return dict(job)
 
 
 def start_import(url: str) -> dict:

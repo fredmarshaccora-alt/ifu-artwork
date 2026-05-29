@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Accora IFU viewer  -  HLR vector</title>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+<link rel="stylesheet" href="/static/css/viewer.css"/>
+<!-- Sets window.IFU_API_BASE before the app scripts run.  Empty =
+     same-origin (local / single-host).  On Vercel, point it at the
+     Render API.  Loads first so API_BASE resolves correctly. -->
+<script src="/static/config.js"></script>
+</head>
+<body>
+<header>
+  <a href="#/" style="text-decoration: none; color: inherit;"
+     title="Go to the project home page"><h1>ACCORA IFU viewer</h1></a>
+  <label data-ed-control="file-sel">File: <select id="file-sel"></select></label>
+  <label data-ed-control="view-sel">View: <select id="view-sel"></select></label>
+  <span class="mode-pill" id="mode-pill" data-ed-control="mode-pill">smart</span>
+  <span data-ed-control="mode-btns" style="display:contents;">
+    <button id="btn-smart"    class="active">smart</button>
+    <button id="btn-detailed">+ smooth</button>
+    <button id="btn-hidden">+ hidden</button>
+  </span>
+  <span style="flex:1"></span>
+  <div class="seg-ctl" role="tablist" aria-label="Layout">
+    <button id="lay-2d"    class="seg-btn active" title="2D drawing only">2D</button>
+    <button id="lay-split" class="seg-btn"        title="2D + 3D side-by-side">Split</button>
+    <button id="lay-3d"    class="seg-btn"        title="3D explore only">3D</button>
+  </div>
+  <span style="flex:1"></span>
+  <button id="btn-annotate">+ callout</button>
+  <button id="btn-clear">clear callouts</button>
+  <button id="btn-detail" data-ed-control="hi-detail"
+          title="Re-render just the visible viewport at finer mesh + sample">↕ hi-detail</button>
+  <button id="btn-detail-clear" data-ed-control="hi-detail"
+          title="Remove the hi-detail overlay" style="display:none">clear detail</button>
+  <button id="btn-export">export SVG</button>
+  <button id="btn-screenshot" title="Save the current pane(s) as PNG">📸 PNG</button>
+  <button id="btn-iact-track"
+          title="Toggle interaction log -- records every click and selection change so you can see what the app is doing">🔎 track</button>
+  <button id="btn-show-regions"
+          title="Colour each part region uniquely so you can see which pixels belong to which part. Useful for debugging 'this highlighted other parts too'">🎨 regions</button>
+  <button id="btn-iact-capture"
+          title="Snapshot the current 2D state (live SVG + what you clicked + tracker log) to the server so it can be rendered and screenshotted for debugging">📸 capture state</button>
+  <button id="btn-server-log" data-ed-control="server-log"
+          title="Toggle server log overlay -- see what the backend is doing in real time">📡 log</button>
+</header>
+<main>
+  <aside class="left">
+    <section class="ed-section" data-ed-section="project">
+      <h2>Project</h2>
+      <p style="font-size:11px; color: var(--muted); margin: 0 0 6px 0;">
+        Group figures together for one IFU / doc.  Switch project to
+        filter the figures list below.</p>
+      <div style="display:flex; gap:4px; margin-bottom:6px;">
+        <select id="project-sel" style="flex:1; padding:4px 6px; font-size:12px;">
+          <option value="">— All figures —</option>
+        </select>
+        <button id="btn-project-new" title="Create a new project">+</button>
+        <button id="btn-project-del" title="Delete current project (keeps figures)">✕</button>
+      </div>
+      <div style="display:flex; gap:4px; margin-bottom:6px; font-size:11px;">
+        <button id="btn-revs-refresh"
+                title="Pull the latest Versions list from Onshape for the active source. Updates the 'behind by N' badge on every figure bound to that source."
+                style="font-size:11px;">↻ refresh versions</button>
+        <span id="revs-status" style="color:var(--muted); align-self:center;"></span>
+      </div>
+    </section>
+
+    <section class="ed-section" data-ed-section="figures">
+      <h2 data-ed-control="legacy-figures">Figures</h2>
+      <p data-ed-control="legacy-figures"
+         style="font-size:11px; color: var(--muted); margin: 0 0 6px 0;">
+        A figure = camera + selection + per-part styles.</p>
+      <div data-ed-control="legacy-figures"
+           style="display:flex; gap:4px; margin-bottom:4px;">
+        <input type="text" id="fig-name" placeholder="figure name..."
+               style="flex:1; padding:4px 6px; font-size:12px;
+                      border:1px solid var(--line); border-radius:3px;">
+        <button id="btn-fig-save"
+                title="Save the current selection / styles / camera (Ctrl+S)">save</button>
+        <button id="btn-fig-save-as" style="display:none;"
+                title="Create a new figure from current state">save as new...</button>
+      </div>
+      <div id="fig-save-status"
+           style="font-size:11px; color:var(--muted); margin: 0 0 6px 0;
+                  min-height: 14px; display: none;"></div>
+      <ul id="figures-list" class="saved-views-list"
+          data-ed-control="legacy-figures"></ul>
+      <!-- Variant sidebar (project-scoped editor / subview mode).
+           Replaces the project-wide figures list with a vertical
+           strip of thumbnail cards, all of which are highlight
+           variants of the active View.  Auto-save means switching
+           cards is safe. -->
+      <h2 id="variants-header"
+          style="display:none; margin: 0 0 6px 0; font-size: 13px;">
+        Variants</h2>
+      <p id="variants-help" style="display:none;
+            font-size: 11px; color: var(--c-text-muted); margin: 0 0 8px 0;">
+        Different highlights of this view.  Click + for a new variant;
+        edits auto-save.</p>
+      <div id="variants-strip"
+           style="display:none; flex-direction: column; gap: 6px;"></div>
+    </section>
+
+    <section class="ed-section" data-ed-section="saved-views">
+      <h2 style="margin-top: 14px;">Saved views (legacy)</h2>
+      <p style="font-size:11px; color: var(--muted); margin: 0 0 6px 0;">
+        Camera angles only (no selection/style).  Pre-Phase-A.</p>
+      <div style="display:flex; gap:4px; margin-bottom:6px;">
+        <input type="text" id="view-name" placeholder="name..."
+               style="flex:1; padding:4px 6px; font-size:12px;
+                      border:1px solid var(--line); border-radius:3px;">
+        <button id="btn-save-view" title="Save current camera angle">save</button>
+      </div>
+      <ul id="saved-views" class="saved-views-list"></ul>
+    </section>
+
+    <section class="ed-section" data-ed-section="onshape-tree">
+      <h2>Onshape tree</h2>
+      <input type="search" id="tree-search" placeholder="filter tree..."
+             autocomplete="off" spellcheck="false">
+      <p style="font-size:11px; color: var(--muted); margin: 4px 0 8px 0;"
+         id="tree-status">No tree for this source.</p>
+      <ul class="tree-root" id="tree-root"></ul>
+    </section>
+
+    <section class="ed-section" data-ed-section="step-order">
+      <h2>Solids (STEP order)</h2>
+      <p style="font-size:11px; color: var(--muted); margin: 0 0 8px 0;">
+        Click a row to highlight. Click again to clear.</p>
+      <ul class="part-list" id="part-list"></ul>
+    </section>
+
+    <section class="ed-section" data-ed-section="selection">
+      <h2>Selection</h2>
+      <div id="selection-info" style="font-size: 12px; color: var(--muted);">
+        Nothing selected
+      </div>
+    </section>
+  </aside>
+  <div class="canvas-wrap" id="canvas-wrap">
+    <div class="svg-pane" data-file="siderail" data-view="iso" data-svg-id="svg_siderail_iso" data-svg-src="/api/baked_svg/siderail/iso"></div>
+<div class="svg-pane" data-file="siderail" data-view="front" data-svg-id="svg_siderail_front" data-svg-src="/api/baked_svg/siderail/front"></div>
+<div class="svg-pane" data-file="siderail" data-view="side" data-svg-id="svg_siderail_side" data-svg-src="/api/baked_svg/siderail/side"></div>
+<div class="svg-pane" data-file="presto" data-view="iso" data-svg-id="svg_presto_iso" data-svg-src="/api/baked_svg/presto/iso"></div>
+<div class="svg-pane" data-file="presto" data-view="front" data-svg-id="svg_presto_front" data-svg-src="/api/baked_svg/presto/front"></div>
+<div class="svg-pane" data-file="presto" data-view="side" data-svg-id="svg_presto_side" data-svg-src="/api/baked_svg/presto/side"></div>
+<div class="svg-pane" data-file="contesa" data-view="iso" data-svg-id="svg_contesa_iso" data-svg-src="/api/baked_svg/contesa/iso"></div>
+    <footer>Wheel = zoom &nbsp;&middot;&nbsp; Drag = pan &nbsp;&middot;&nbsp; Click part to highlight &nbsp;&middot;&nbsp; Callout mode: drag to place arrow</footer>
+    <div class="tooltip" id="tooltip"></div>
+  </div>
+  <div id="pane-splitter" role="separator" aria-orientation="vertical"
+       title="Drag to resize 2D / 3D panes (double-click to reset)"></div>
+  <div class="webgl-wrap" id="webgl-wrap">
+    <canvas id="webgl-canvas"></canvas>
+    <!-- Configuration panel: shown when the active source has Onshape
+         ids and the document defines configurable parameters.  Changing
+         a value re-translates the source and reloads the 3D mesh. -->
+    <div id="cfg-panel"
+         style="position:absolute;top:50px;right:8px;z-index:10;
+                width:240px;background:rgba(255,255,255,.96);
+                border:1px solid #d4d4d8;border-radius:6px;
+                box-shadow:0 4px 14px rgba(0,0,0,.08);
+                padding:10px;font-size:12px;display:none;">
+      <div id="cfg-header"
+           style="display:flex;align-items:center;justify-content:space-between;
+                  font-weight:600;color:#18181b;margin-bottom:8px;">
+        <span>Onshape configuration</span>
+        <button id="cfg-collapse"
+                title="Collapse"
+                style="background:transparent;border:none;color:#71717a;
+                       font-size:14px;cursor:pointer;padding:0 4px;line-height:1;">−</button>
+      </div>
+      <div id="cfg-body"></div>
+      <div id="cfg-status"
+           style="font-size:11px;color:#71717a;margin-top:8px;min-height:14px;"></div>
+    </div>
+    <div class="three-toolbar">
+      <button id="btn-generate" class="primary"
+              title="Render an HLR SVG of the current camera angle and show it on the left. Requires the local server (python serve.py).">
+        &#9889; generate 2D
+      </button>
+      <span class="tb-sep"></span>
+      <span id="viewdir-readout" data-ed-control="dev-readout">view_dir = (—, —, —)</span>
+      <button id="btn-lock-view" data-ed-control="dev-readout"
+              title="Copy view_dir tuple to clipboard">copy view_dir</button>
+      <button id="btn-reset-3d" title="Frame the model from the active 2D view direction">reset camera</button>
+      <span class="tb-sep" data-ed-control="up-axis"></span>
+      <label class="tb-label" data-ed-control="up-axis"
+             title="Override what axis is 'up'. 3D-side preview only - paste the resulting tuple into SOURCES and rebuild to bake into 2D HLR.">Up:
+        <select id="up-axis-sel">
+          <option value="Z" selected>Z</option>
+          <option value="Y">Y</option>
+          <option value="X">X</option>
+          <option value="-Z">-Z</option>
+          <option value="-Y">-Y</option>
+          <option value="-X">-X</option>
+        </select>
+      </label>
+      <button id="btn-copy-orient" data-ed-control="up-axis"
+              title="Copy pre_rotate tuple to clipboard">copy pre_rotate</button>
+    </div>
+  </div>
+  <aside class="right">
+    <section class="ed-section" data-ed-section="layers">
+    <h2>Layers</h2>
+    <label class="layer-toggle"><input type="checkbox" data-layer="outline_v" checked>
+      <span class="swatch" style="height:5px"></span> Silhouette (profile)</label>
+    <label class="layer-toggle"><input type="checkbox" data-layer="sharp_v" checked>
+      <span class="swatch" style="height:2px"></span> Sharp edges</label>
+    <label class="layer-toggle"><input type="checkbox" data-layer="smooth_v">
+      <span class="swatch thin"></span> Smooth (tangent) edges</label>
+    <label class="layer-toggle" data-ed-control="hidden-layers"><input type="checkbox" data-layer="hidden_outline">
+      <span class="swatch dashed"></span> Hidden silhouette</label>
+    <label class="layer-toggle" data-ed-control="hidden-layers"><input type="checkbox" data-layer="hidden_sharp">
+      <span class="swatch dashed"></span> Hidden sharp</label>
+    </section>
+
+    <!-- Drawing weights + shading: live CSS overrides on the SVG so
+         the user can dial print weights / contrast without a server
+         re-render.  Each row stores its value in localStorage keyed
+         by source_id so a project keeps the look it shipped with.
+         Secondary controls (contrast / colour family / paper) live
+         inside a <details> so the panel reads compact by default.  -->
+    <section class="ed-section" data-ed-section="drawing">
+    <h2>Drawing</h2>
+    <label class="draw-row" title="Width of the heavy silhouette lines that trace each part's outer profile (outline_v category)">
+      Silhouette
+      <input type="range" id="draw-outline-w" min="0.2" max="3.0" step="0.05" value="0.7">
+      <span id="draw-outline-w-val">0.70</span>mm
+    </label>
+    <label class="draw-row" title="Width of visible sharp edges (sharp_v category)">
+      Sharp
+      <input type="range" id="draw-sharp-w" min="0.05" max="1.5" step="0.05" value="0.30">
+      <span id="draw-sharp-w-val">0.30</span>mm
+    </label>
+    <label class="draw-row" title="Width of smooth / tangent edges (smooth_v category)">
+      Smooth
+      <input type="range" id="draw-smooth-w" min="0.05" max="1.0" step="0.05" value="0.20">
+      <span id="draw-smooth-w-val">0.20</span>mm
+    </label>
+    <label class="draw-row" title="Width of hidden (dashed) lines">
+      Hidden
+      <input type="range" id="draw-hidden-w" min="0.05" max="1.5" step="0.05" value="0.30">
+      <span id="draw-hidden-w-val">0.30</span>mm
+    </label>
+    <hr style="border:none; border-top:1px dotted var(--c-line); margin:8px 0;"/>
+    <label class="draw-row" title="Width of the bold outline drawn around highlighted parts (the persistent silhouette overlay)">
+      Highlight
+      <input type="range" id="draw-hl-w" min="0.5" max="15" step="0.5" value="3">
+      <span id="draw-hl-w-val">3.0</span>mm
+    </label>
+    <details class="ed-disclosure">
+      <summary>more</summary>
+    <label class="draw-row" title="Overall contrast / boldness multiplier applied to all baseline weights">
+      Contrast
+      <input type="range" id="draw-contrast" min="0.5" max="2.5" step="0.05" value="1">
+      <span id="draw-contrast-val">1.00</span>×
+    </label>
+    <label class="draw-row" title="Opacity of the smooth (tangent) edges -- dim or hide them without changing visibility toggles">
+      Smooth α
+      <input type="range" id="draw-smooth-alpha" min="0" max="1" step="0.05" value="1">
+      <span id="draw-smooth-alpha-val">1.00</span>
+    </label>
+    <label class="draw-row" title="Line colour family">
+      Lines
+      <select id="draw-line-color" style="flex:1; padding:2px;">
+        <option value="black">Black (print)</option>
+        <option value="ink">Ink (#1a1f24)</option>
+        <option value="teal">Accora teal</option>
+        <option value="grey">Muted grey</option>
+      </select>
+    </label>
+    <label class="draw-row" title="Background colour of the 2D canvas">
+      Paper
+      <select id="draw-paper" style="flex:1; padding:2px;">
+        <option value="white">White</option>
+        <option value="cream">Cream</option>
+        <option value="cool">Cool grey</option>
+        <option value="dark">Dark (for export preview)</option>
+      </select>
+    </label>
+    <div style="display:flex; gap:6px; margin-top:8px;">
+      <button id="btn-draw-reset" class="btn"
+              title="Restore the IFU print defaults">reset weights</button>
+      <button id="btn-draw-save-default" class="btn"
+              title="Make these the default weights for new figures">save as default</button>
+    </div>
+    </details>
+    </section>
+
+    <section class="ed-section" data-ed-section="selection-styling">
+    <h2>Selection styling</h2>
+    <p style="font-size:11px; color: var(--muted); margin: 0 0 6px 0;"
+       data-ed-control="dev-prose">
+      Properties applied to the currently-highlighted parts.</p>
+    <!-- Presets: the one-click-applied style row, visible in project
+         mode.  Each button packages stroke + width + fill + alpha so
+         every IFU figure across a project uses a small consistent
+         vocabulary. -->
+    <div id="preset-row" data-ed-control="presets"
+         style="display:none;
+                flex-wrap: wrap;
+                gap: 6px;
+                margin: 0 0 8px 0;"></div>
+    <div id="preset-actions" data-ed-control="presets"
+         style="display:none;
+                gap: 6px;
+                margin: 0 0 12px 0;">
+      <button id="btn-preset-remove" class="btn"
+              title="Clear style on the currently-selected parts">remove style</button>
+      <button id="btn-preset-clear" class="btn"
+              title="Clear styles on every part for this figure">clear all</button>
+    </div>
+    <!-- Legacy free-form controls.  Wrapped in data-ed-control="advanced-styling"
+         so the whole block hides in project mode.  Kept for file://
+         fallback + power users. -->
+    <div id="style-panel" data-ed-control="advanced-styling" style="font-size: 12px;">
+      <label style="display:flex; align-items:center; gap:6px; margin:4px 0;">
+        Stroke
+        <input type="color" id="sty-stroke" value="#00836a" style="width:30px;">
+      </label>
+      <label style="display:flex; align-items:center; gap:6px; margin:4px 0;">
+        Width
+        <input type="range" id="sty-width" min="0.5" max="15" step="0.5"
+               value="3" style="flex:1;">
+        <span id="sty-width-val">3.0</span>
+      </label>
+      <label style="display:flex; align-items:center; gap:6px; margin:4px 0;">
+        Opacity
+        <input type="range" id="sty-opacity" min="0.1" max="1" step="0.05"
+               value="1" style="flex:1;">
+        <span id="sty-opacity-val">1.0</span>
+      </label>
+      <label style="display:flex; align-items:center; gap:6px; margin:4px 0;">
+        Dash
+        <select id="sty-dash" style="flex:1; padding:2px;">
+          <option value="">solid</option>
+          <option value="3 2">dashed</option>
+          <option value="1 1.5">dotted</option>
+        </select>
+      </label>
+      <label style="display:flex; align-items:center; gap:6px; margin:8px 0 4px 0;">
+        Fill
+        <input type="color" id="sty-fill" value="#cce6e0" style="width:30px;">
+        <label style="font-size:11px; display:flex; align-items:center; gap:3px;">
+          <input type="checkbox" id="sty-fill-on" style="margin:0;"> shade
+        </label>
+      </label>
+      <label style="display:flex; align-items:center; gap:6px; margin:4px 0;">
+        Fill α
+        <input type="range" id="sty-fill-opacity" min="0.05" max="1" step="0.05"
+               value="0.3" style="flex:1;">
+        <span id="sty-fill-opacity-val">0.30</span>
+      </label>
+      <label data-ed-control="group-mode"
+             style="display:flex; align-items:center; gap:6px; margin:6px 0; font-size:11px;">
+        <input type="checkbox" id="sty-group-mode" checked style="margin:0;">
+        outline as group (combined profile for multi-select)
+      </label>
+      <div style="display:flex; gap:4px; margin-top:6px; flex-wrap:wrap;">
+        <button id="btn-apply-style" title="Apply to highlighted parts">apply</button>
+        <button id="btn-reset-style" title="Clear style for highlighted parts">reset</button>
+        <button id="btn-reset-all-style" title="Clear all style overrides for this source">reset all</button>
+      </div>
+      <div data-ed-control="dev-buttons"
+           style="display:flex; gap:4px; margin-top:8px; flex-wrap:wrap;">
+        <button id="btn-expand-parent" title="Add all siblings under the same Onshape Assembly to the selection">+ Onshape group</button>
+        <button id="btn-cycle-deeper" title="In 3D mode, next click at the same pixel goes one layer deeper">depth-click ↻</button>
+      </div>
+    </div>
+    <!-- Applied list lives OUTSIDE #style-panel so it stays visible
+         in project mode (where the rest of the panel is hidden). -->
+    <h3 style="margin: 6px 0 4px 0; font-size: 10px; color: var(--c-text-muted);
+                text-transform: uppercase; letter-spacing: 0.5px;
+                font-weight: 600;">
+      Applied to parts
+    </h3>
+    <ol id="applied-styles-list"
+        style="list-style: none; padding: 0; margin: 0; font-size: 11px;
+                max-height: 220px; overflow-y: auto;"></ol>
+    </section>
+
+    <section class="ed-section" data-ed-section="callouts">
+    <h2>Callouts</h2>
+    <p style="font-size: 11px; color: var(--muted);"
+       data-ed-control="dev-prose">
+      Click <b>+ callout</b>, then on the canvas drag from the arrow tip to the
+      label position. Enter the label text when prompted.</p>
+    <div id="callout-count" style="font-size: 12px; color: var(--muted);">
+      0 callouts on this view
+    </div>
+    </section>
+
+    <section class="ed-section" data-ed-section="pipeline">
+    <h2>Pipeline</h2>
+    <p style="font-size: 11px; color: var(--muted); line-height: 1.5;">
+      Output is true vector SVG generated by analytical hidden-line removal
+      (OCCT <code>HLRBRep</code>) per solid. Composer-equivalent pipeline:
+      no rasterisation, infinite zoom, edges classified by category.
+    </p>
+    </section>
+  </aside>
+</main>
+
+<!--
+  F.2 mount point for the new app screens.  Empty + hidden by default
+  so the legacy editor (the <header> + <main> above) stays the home
+  page; the router only flips this visible when the URL has a hash
+  matching one of the new routes (#/, #/project/<id>, etc.).
+-->
+<div id="app-root" style="display:none; padding: 24px;
+                           font-family: Arial, sans-serif;"></div>
+
+<script>
+const CATALOGUE = [{"file_id": "siderail", "file_label": "Folding siderail", "parts": [{"idx": 0, "label": "part_000"}, {"idx": 1, "label": "part_001"}, {"idx": 2, "label": "part_002"}, {"idx": 3, "label": "part_003"}, {"idx": 4, "label": "part_004"}, {"idx": 5, "label": "part_005"}, {"idx": 6, "label": "part_006"}, {"idx": 7, "label": "part_007"}, {"idx": 8, "label": "part_008"}, {"idx": 9, "label": "part_009"}, {"idx": 10, "label": "part_010"}, {"idx": 11, "label": "part_011"}, {"idx": 12, "label": "part_012"}, {"idx": 13, "label": "part_013"}, {"idx": 14, "label": "part_014"}, {"idx": 15, "label": "part_015"}, {"idx": 16, "label": "part_016"}, {"idx": 17, "label": "part_017"}, {"idx": 18, "label": "part_018"}, {"idx": 19, "label": "part_019"}, {"idx": 20, "label": "part_020"}, {"idx": 21, "label": "part_021"}, {"idx": 22, "label": "part_022"}, {"idx": 23, "label": "part_023"}, {"idx": 24, "label": "part_024"}, {"idx": 25, "label": "part_025"}, {"idx": 26, "label": "part_026"}, {"idx": 27, "label": "part_027"}, {"idx": 28, "label": "part_028"}, {"idx": 29, "label": "part_029"}, {"idx": 30, "label": "part_030"}, {"idx": 31, "label": "part_031"}, {"idx": 32, "label": "part_032"}, {"idx": 33, "label": "part_033"}, {"idx": 34, "label": "part_034"}, {"idx": 35, "label": "part_035"}, {"idx": 36, "label": "part_036"}, {"idx": 37, "label": "part_037"}, {"idx": 38, "label": "part_038"}, {"idx": 39, "label": "part_039"}, {"idx": 40, "label": "part_040"}, {"idx": 41, "label": "part_041"}, {"idx": 42, "label": "part_042"}, {"idx": 43, "label": "part_043"}, {"idx": 44, "label": "part_044"}, {"idx": 45, "label": "part_045"}, {"idx": 46, "label": "part_046"}, {"idx": 47, "label": "part_047"}, {"idx": 48, "label": "part_048"}, {"idx": 49, "label": "part_049"}, {"idx": 50, "label": "part_050"}, {"idx": 51, "label": "part_051"}, {"idx": 52, "label": "part_052"}, {"idx": 53, "label": "part_053"}, {"idx": 54, "label": "part_054"}, {"idx": 55, "label": "part_055"}, {"idx": 56, "label": "part_056"}, {"idx": 57, "label": "part_057"}, {"idx": 58, "label": "part_058"}, {"idx": 59, "label": "part_059"}, {"idx": 60, "label": "part_060"}, {"idx": 61, "label": "part_061"}, {"idx": 62, "label": "part_062"}, {"idx": 63, "label": "part_063"}, {"idx": 64, "label": "part_064"}, {"idx": 65, "label": "part_065"}, {"idx": 66, "label": "part_066"}, {"idx": 67, "label": "part_067"}, {"idx": 68, "label": "part_068"}, {"idx": 69, "label": "part_069"}, {"idx": 70, "label": "part_070"}, {"idx": 71, "label": "part_071"}, {"idx": 72, "label": "part_072"}, {"idx": 73, "label": "part_073"}, {"idx": 74, "label": "part_074"}, {"idx": 75, "label": "part_075"}, {"idx": 76, "label": "part_076"}, {"idx": 77, "label": "part_077"}, {"idx": 78, "label": "part_078"}, {"idx": 79, "label": "part_079"}, {"idx": 80, "label": "part_080"}, {"idx": 81, "label": "part_081"}, {"idx": 82, "label": "part_082"}, {"idx": 83, "label": "part_083"}, {"idx": 84, "label": "part_084"}, {"idx": 85, "label": "part_085"}, {"idx": 86, "label": "part_086"}, {"idx": 87, "label": "part_087"}, {"idx": 88, "label": "part_088"}, {"idx": 89, "label": "part_089"}, {"idx": 90, "label": "part_090"}, {"idx": 91, "label": "part_091"}, {"idx": 92, "label": "part_092"}, {"idx": 93, "label": "part_093"}, {"idx": 94, "label": "part_094"}, {"idx": 95, "label": "part_095"}, {"idx": 96, "label": "part_096"}, {"idx": 97, "label": "part_097"}, {"idx": 98, "label": "part_098"}, {"idx": 99, "label": "part_099"}, {"idx": 100, "label": "part_100"}, {"idx": 101, "label": "part_101"}, {"idx": 102, "label": "part_102"}, {"idx": 103, "label": "part_103"}, {"idx": 104, "label": "part_104"}, {"idx": 105, "label": "part_105"}, {"idx": 106, "label": "part_106"}, {"idx": 107, "label": "part_107"}, {"idx": 108, "label": "part_108"}, {"idx": 109, "label": "part_109"}, {"idx": 110, "label": "part_110"}, {"idx": 111, "label": "part_111"}, {"idx": 112, "label": "part_112"}, {"idx": 113, "label": "part_113"}, {"idx": 114, "label": "part_114"}, {"idx": 115, "label": "part_115"}, {"idx": 116, "label": "part_116"}, {"idx": 117, "label": "part_117"}, {"idx": 118, "label": "part_118"}, {"idx": 119, "label": "part_119"}, {"idx": 120, "label": "part_120"}, {"idx": 121, "label": "part_121"}, {"idx": 122, "label": "part_122"}, {"idx": 123, "label": "part_123"}, {"idx": 124, "label": "part_124"}, {"idx": 125, "label": "part_125"}, {"idx": 126, "label": "part_126"}, {"idx": 127, "label": "part_127"}, {"idx": 128, "label": "part_128"}, {"idx": 129, "label": "part_129"}, {"idx": 130, "label": "part_130"}, {"idx": 131, "label": "part_131"}, {"idx": 132, "label": "part_132"}, {"idx": 133, "label": "part_133"}, {"idx": 134, "label": "part_134"}, {"idx": 135, "label": "part_135"}, {"idx": 136, "label": "part_136"}, {"idx": 137, "label": "part_137"}], "views": [{"view_id": "iso", "label": "Iso 3/4 (front-right-above)", "view_dir": [-0.5, -1.0, 0.7]}, {"view_id": "front", "label": "Front elevation", "view_dir": [0.0, -1.0, 0.25]}, {"view_id": "side", "label": "Side elevation", "view_dir": [-1.0, 0.0, 0.25]}]}, {"file_id": "presto", "file_label": "Presto bed (top assembly)", "parts": [{"idx": 0, "label": "part_000"}, {"idx": 1, "label": "part_001"}, {"idx": 2, "label": "part_002"}, {"idx": 3, "label": "part_003"}, {"idx": 4, "label": "part_004"}, {"idx": 5, "label": "part_005"}, {"idx": 6, "label": "part_006"}, {"idx": 7, "label": "part_007"}, {"idx": 8, "label": "part_008"}, {"idx": 9, "label": "part_009"}, {"idx": 10, "label": "part_010"}, {"idx": 11, "label": "part_011"}, {"idx": 12, "label": "part_012"}, {"idx": 13, "label": "part_013"}, {"idx": 14, "label": "part_014"}, {"idx": 15, "label": "part_015"}, {"idx": 16, "label": "part_016"}, {"idx": 17, "label": "part_017"}, {"idx": 18, "label": "part_018"}, {"idx": 19, "label": "part_019"}, {"idx": 20, "label": "part_020"}, {"idx": 21, "label": "part_021"}, {"idx": 22, "label": "part_022"}, {"idx": 23, "label": "part_023"}, {"idx": 24, "label": "part_024"}, {"idx": 25, "label": "part_025"}, {"idx": 26, "label": "part_026"}, {"idx": 27, "label": "part_027"}, {"idx": 28, "label": "part_028"}, {"idx": 29, "label": "part_029"}, {"idx": 30, "label": "part_030"}, {"idx": 31, "label": "part_031"}, {"idx": 32, "label": "part_032"}, {"idx": 33, "label": "part_033"}, {"idx": 34, "label": "part_034"}, {"idx": 35, "label": "part_035"}, {"idx": 36, "label": "part_036"}, {"idx": 37, "label": "part_037"}, {"idx": 38, "label": "part_038"}, {"idx": 39, "label": "part_039"}, {"idx": 40, "label": "part_040"}, {"idx": 41, "label": "part_041"}, {"idx": 42, "label": "part_042"}, {"idx": 43, "label": "part_043"}, {"idx": 44, "label": "part_044"}, {"idx": 45, "label": "part_045"}, {"idx": 46, "label": "part_046"}, {"idx": 47, "label": "part_047"}, {"idx": 48, "label": "part_048"}, {"idx": 49, "label": "part_049"}, {"idx": 50, "label": "part_050"}, {"idx": 51, "label": "part_051"}, {"idx": 52, "label": "part_052"}, {"idx": 53, "label": "part_053"}, {"idx": 54, "label": "part_054"}, {"idx": 55, "label": "part_055"}, {"idx": 56, "label": "part_056"}, {"idx": 57, "label": "part_057"}, {"idx": 58, "label": "part_058"}, {"idx": 59, "label": "part_059"}, {"idx": 60, "label": "part_060"}, {"idx": 61, "label": "part_061"}, {"idx": 62, "label": "part_062"}, {"idx": 63, "label": "part_063"}, {"idx": 64, "label": "part_064"}, {"idx": 65, "label": "part_065"}, {"idx": 66, "label": "part_066"}, {"idx": 67, "label": "part_067"}, {"idx": 68, "label": "part_068"}, {"idx": 69, "label": "part_069"}, {"idx": 70, "label": "part_070"}, {"idx": 71, "label": "part_071"}, {"idx": 72, "label": "part_072"}, {"idx": 73, "label": "part_073"}, {"idx": 74, "label": "part_074"}, {"idx": 75, "label": "part_075"}, {"idx": 76, "label": "part_076"}, {"idx": 77, "label": "part_077"}, {"idx": 78, "label": "part_078"}, {"idx": 79, "label": "part_079"}, {"idx": 80, "label": "part_080"}, {"idx": 81, "label": "part_081"}, {"idx": 82, "label": "part_082"}, {"idx": 83, "label": "part_083"}, {"idx": 84, "label": "part_084"}, {"idx": 85, "label": "part_085"}, {"idx": 86, "label": "part_086"}, {"idx": 87, "label": "part_087"}, {"idx": 88, "label": "part_088"}, {"idx": 89, "label": "part_089"}, {"idx": 90, "label": "part_090"}, {"idx": 91, "label": "part_091"}, {"idx": 92, "label": "part_092"}, {"idx": 93, "label": "part_093"}, {"idx": 94, "label": "part_094"}, {"idx": 95, "label": "part_095"}, {"idx": 96, "label": "part_096"}, {"idx": 97, "label": "part_097"}, {"idx": 98, "label": "part_098"}, {"idx": 99, "label": "part_099"}, {"idx": 100, "label": "part_100"}, {"idx": 101, "label": "part_101"}, {"idx": 102, "label": "part_102"}, {"idx": 103, "label": "part_103"}, {"idx": 104, "label": "part_104"}, {"idx": 105, "label": "part_105"}, {"idx": 106, "label": "part_106"}, {"idx": 107, "label": "part_107"}, {"idx": 108, "label": "part_108"}, {"idx": 109, "label": "part_109"}, {"idx": 110, "label": "part_110"}, {"idx": 111, "label": "part_111"}, {"idx": 112, "label": "part_112"}, {"idx": 113, "label": "part_113"}, {"idx": 114, "label": "part_114"}, {"idx": 115, "label": "part_115"}, {"idx": 116, "label": "part_116"}, {"idx": 117, "label": "part_117"}, {"idx": 118, "label": "part_118"}, {"idx": 119, "label": "part_119"}, {"idx": 120, "label": "part_120"}, {"idx": 121, "label": "part_121"}, {"idx": 122, "label": "part_122"}, {"idx": 123, "label": "part_123"}, {"idx": 124, "label": "part_124"}, {"idx": 125, "label": "part_125"}, {"idx": 126, "label": "part_126"}, {"idx": 127, "label": "part_127"}, {"idx": 128, "label": "part_128"}, {"idx": 129, "label": "part_129"}, {"idx": 130, "label": "part_130"}, {"idx": 131, "label": "part_131"}, {"idx": 132, "label": "part_132"}, {"idx": 133, "label": "part_133"}, {"idx": 134, "label": "part_134"}, {"idx": 135, "label": "part_135"}, {"idx": 136, "label": "part_136"}, {"idx": 137, "label": "part_137"}, {"idx": 138, "label": "part_138"}, {"idx": 139, "label": "part_139"}, {"idx": 140, "label": "part_140"}, {"idx": 141, "label": "part_141"}, {"idx": 142, "label": "part_142"}, {"idx": 143, "label": "part_143"}, {"idx": 144, "label": "part_144"}, {"idx": 145, "label": "part_145"}, {"idx": 146, "label": "part_146"}, {"idx": 148, "label": "part_148"}, {"idx": 149, "label": "part_149"}, {"idx": 150, "label": "part_150"}, {"idx": 151, "label": "part_151"}, {"idx": 152, "label": "part_152"}, {"idx": 153, "label": "part_153"}, {"idx": 154, "label": "part_154"}, {"idx": 155, "label": "part_155"}, {"idx": 156, "label": "part_156"}, {"idx": 157, "label": "part_157"}, {"idx": 158, "label": "part_158"}, {"idx": 159, "label": "part_159"}, {"idx": 160, "label": "part_160"}, {"idx": 161, "label": "part_161"}, {"idx": 163, "label": "part_163"}, {"idx": 164, "label": "part_164"}, {"idx": 165, "label": "part_165"}, {"idx": 166, "label": "part_166"}, {"idx": 167, "label": "part_167"}, {"idx": 168, "label": "part_168"}, {"idx": 169, "label": "part_169"}, {"idx": 170, "label": "part_170"}, {"idx": 171, "label": "part_171"}, {"idx": 172, "label": "part_172"}, {"idx": 173, "label": "part_173"}, {"idx": 174, "label": "part_174"}, {"idx": 175, "label": "part_175"}, {"idx": 176, "label": "part_176"}, {"idx": 177, "label": "part_177"}, {"idx": 178, "label": "part_178"}, {"idx": 179, "label": "part_179"}, {"idx": 180, "label": "part_180"}, {"idx": 181, "label": "part_181"}, {"idx": 182, "label": "part_182"}, {"idx": 183, "label": "part_183"}, {"idx": 184, "label": "part_184"}, {"idx": 185, "label": "part_185"}, {"idx": 186, "label": "part_186"}, {"idx": 187, "label": "part_187"}, {"idx": 188, "label": "part_188"}, {"idx": 189, "label": "part_189"}, {"idx": 190, "label": "part_190"}, {"idx": 191, "label": "part_191"}, {"idx": 192, "label": "part_192"}, {"idx": 193, "label": "part_193"}, {"idx": 194, "label": "part_194"}, {"idx": 195, "label": "part_195"}, {"idx": 196, "label": "part_196"}, {"idx": 197, "label": "part_197"}, {"idx": 198, "label": "part_198"}, {"idx": 199, "label": "part_199"}, {"idx": 200, "label": "part_200"}, {"idx": 201, "label": "part_201"}, {"idx": 202, "label": "part_202"}, {"idx": 203, "label": "part_203"}, {"idx": 204, "label": "part_204"}, {"idx": 205, "label": "part_205"}, {"idx": 206, "label": "part_206"}, {"idx": 207, "label": "part_207"}, {"idx": 208, "label": "part_208"}, {"idx": 209, "label": "part_209"}, {"idx": 210, "label": "part_210"}, {"idx": 211, "label": "part_211"}, {"idx": 212, "label": "part_212"}, {"idx": 213, "label": "part_213"}, {"idx": 214, "label": "part_214"}, {"idx": 215, "label": "part_215"}, {"idx": 216, "label": "part_216"}, {"idx": 217, "label": "part_217"}, {"idx": 218, "label": "part_218"}, {"idx": 219, "label": "part_219"}, {"idx": 221, "label": "part_221"}, {"idx": 222, "label": "part_222"}, {"idx": 223, "label": "part_223"}, {"idx": 224, "label": "part_224"}, {"idx": 225, "label": "part_225"}, {"idx": 226, "label": "part_226"}, {"idx": 227, "label": "part_227"}, {"idx": 228, "label": "part_228"}, {"idx": 229, "label": "part_229"}, {"idx": 230, "label": "part_230"}, {"idx": 231, "label": "part_231"}, {"idx": 232, "label": "part_232"}, {"idx": 233, "label": "part_233"}, {"idx": 234, "label": "part_234"}, {"idx": 235, "label": "part_235"}, {"idx": 236, "label": "part_236"}, {"idx": 237, "label": "part_237"}, {"idx": 238, "label": "part_238"}, {"idx": 239, "label": "part_239"}, {"idx": 240, "label": "part_240"}, {"idx": 241, "label": "part_241"}, {"idx": 242, "label": "part_242"}, {"idx": 243, "label": "part_243"}, {"idx": 244, "label": "part_244"}, {"idx": 245, "label": "part_245"}, {"idx": 246, "label": "part_246"}, {"idx": 247, "label": "part_247"}, {"idx": 248, "label": "part_248"}, {"idx": 249, "label": "part_249"}, {"idx": 250, "label": "part_250"}, {"idx": 251, "label": "part_251"}, {"idx": 252, "label": "part_252"}, {"idx": 253, "label": "part_253"}, {"idx": 254, "label": "part_254"}, {"idx": 255, "label": "part_255"}, {"idx": 256, "label": "part_256"}, {"idx": 257, "label": "part_257"}, {"idx": 258, "label": "part_258"}, {"idx": 259, "label": "part_259"}, {"idx": 260, "label": "part_260"}, {"idx": 261, "label": "part_261"}, {"idx": 262, "label": "part_262"}, {"idx": 263, "label": "part_263"}, {"idx": 264, "label": "part_264"}, {"idx": 265, "label": "part_265"}, {"idx": 266, "label": "part_266"}, {"idx": 267, "label": "part_267"}, {"idx": 268, "label": "part_268"}, {"idx": 269, "label": "part_269"}, {"idx": 270, "label": "part_270"}, {"idx": 271, "label": "part_271"}, {"idx": 272, "label": "part_272"}, {"idx": 273, "label": "part_273"}, {"idx": 274, "label": "part_274"}, {"idx": 275, "label": "part_275"}, {"idx": 276, "label": "part_276"}, {"idx": 277, "label": "part_277"}, {"idx": 278, "label": "part_278"}, {"idx": 280, "label": "part_280"}, {"idx": 281, "label": "part_281"}, {"idx": 282, "label": "part_282"}, {"idx": 283, "label": "part_283"}, {"idx": 284, "label": "part_284"}, {"idx": 285, "label": "part_285"}, {"idx": 286, "label": "part_286"}, {"idx": 287, "label": "part_287"}, {"idx": 288, "label": "part_288"}, {"idx": 289, "label": "part_289"}, {"idx": 290, "label": "part_290"}, {"idx": 291, "label": "part_291"}, {"idx": 292, "label": "part_292"}, {"idx": 293, "label": "part_293"}, {"idx": 294, "label": "part_294"}, {"idx": 295, "label": "part_295"}, {"idx": 296, "label": "part_296"}, {"idx": 297, "label": "part_297"}, {"idx": 298, "label": "part_298"}, {"idx": 299, "label": "part_299"}, {"idx": 300, "label": "part_300"}, {"idx": 301, "label": "part_301"}, {"idx": 302, "label": "part_302"}, {"idx": 303, "label": "part_303"}, {"idx": 304, "label": "part_304"}, {"idx": 305, "label": "part_305"}, {"idx": 307, "label": "part_307"}, {"idx": 308, "label": "part_308"}, {"idx": 309, "label": "part_309"}, {"idx": 310, "label": "part_310"}, {"idx": 311, "label": "part_311"}, {"idx": 312, "label": "part_312"}, {"idx": 313, "label": "part_313"}, {"idx": 314, "label": "part_314"}, {"idx": 315, "label": "part_315"}, {"idx": 316, "label": "part_316"}, {"idx": 317, "label": "part_317"}, {"idx": 318, "label": "part_318"}, {"idx": 319, "label": "part_319"}, {"idx": 320, "label": "part_320"}, {"idx": 321, "label": "part_321"}, {"idx": 322, "label": "part_322"}, {"idx": 323, "label": "part_323"}, {"idx": 324, "label": "part_324"}, {"idx": 325, "label": "part_325"}, {"idx": 326, "label": "part_326"}, {"idx": 327, "label": "part_327"}, {"idx": 328, "label": "part_328"}, {"idx": 329, "label": "part_329"}, {"idx": 330, "label": "part_330"}, {"idx": 331, "label": "part_331"}, {"idx": 332, "label": "part_332"}, {"idx": 333, "label": "part_333"}, {"idx": 334, "label": "part_334"}, {"idx": 335, "label": "part_335"}, {"idx": 336, "label": "part_336"}, {"idx": 337, "label": "part_337"}, {"idx": 338, "label": "part_338"}, {"idx": 339, "label": "part_339"}, {"idx": 340, "label": "part_340"}, {"idx": 341, "label": "part_341"}, {"idx": 342, "label": "part_342"}, {"idx": 343, "label": "part_343"}, {"idx": 344, "label": "part_344"}, {"idx": 345, "label": "part_345"}, {"idx": 346, "label": "part_346"}, {"idx": 347, "label": "part_347"}, {"idx": 348, "label": "part_348"}, {"idx": 349, "label": "part_349"}, {"idx": 350, "label": "part_350"}, {"idx": 351, "label": "part_351"}, {"idx": 352, "label": "part_352"}, {"idx": 353, "label": "part_353"}, {"idx": 354, "label": "part_354"}, {"idx": 355, "label": "part_355"}, {"idx": 356, "label": "part_356"}, {"idx": 357, "label": "part_357"}, {"idx": 358, "label": "part_358"}, {"idx": 359, "label": "part_359"}, {"idx": 360, "label": "part_360"}, {"idx": 361, "label": "part_361"}, {"idx": 362, "label": "part_362"}, {"idx": 363, "label": "part_363"}, {"idx": 364, "label": "part_364"}, {"idx": 365, "label": "part_365"}, {"idx": 366, "label": "part_366"}, {"idx": 367, "label": "part_367"}, {"idx": 368, "label": "part_368"}, {"idx": 369, "label": "part_369"}, {"idx": 370, "label": "part_370"}, {"idx": 371, "label": "part_371"}, {"idx": 372, "label": "part_372"}, {"idx": 373, "label": "part_373"}, {"idx": 374, "label": "part_374"}, {"idx": 375, "label": "part_375"}, {"idx": 376, "label": "part_376"}, {"idx": 377, "label": "part_377"}, {"idx": 378, "label": "part_378"}, {"idx": 379, "label": "part_379"}, {"idx": 380, "label": "part_380"}, {"idx": 381, "label": "part_381"}, {"idx": 382, "label": "part_382"}, {"idx": 383, "label": "part_383"}, {"idx": 384, "label": "part_384"}, {"idx": 385, "label": "part_385"}, {"idx": 386, "label": "part_386"}, {"idx": 387, "label": "part_387"}, {"idx": 388, "label": "part_388"}, {"idx": 389, "label": "part_389"}, {"idx": 390, "label": "part_390"}, {"idx": 391, "label": "part_391"}, {"idx": 392, "label": "part_392"}, {"idx": 393, "label": "part_393"}, {"idx": 394, "label": "part_394"}, {"idx": 395, "label": "part_395"}, {"idx": 396, "label": "part_396"}, {"idx": 397, "label": "part_397"}, {"idx": 398, "label": "part_398"}, {"idx": 399, "label": "part_399"}, {"idx": 400, "label": "part_400"}, {"idx": 401, "label": "part_401"}, {"idx": 402, "label": "part_402"}, {"idx": 403, "label": "part_403"}, {"idx": 404, "label": "part_404"}, {"idx": 405, "label": "part_405"}, {"idx": 406, "label": "part_406"}, {"idx": 407, "label": "part_407"}, {"idx": 408, "label": "part_408"}, {"idx": 409, "label": "part_409"}, {"idx": 410, "label": "part_410"}, {"idx": 411, "label": "part_411"}, {"idx": 412, "label": "part_412"}, {"idx": 413, "label": "part_413"}, {"idx": 414, "label": "part_414"}, {"idx": 415, "label": "part_415"}, {"idx": 416, "label": "part_416"}, {"idx": 417, "label": "part_417"}, {"idx": 418, "label": "part_418"}, {"idx": 419, "label": "part_419"}, {"idx": 420, "label": "part_420"}, {"idx": 421, "label": "part_421"}, {"idx": 422, "label": "part_422"}, {"idx": 423, "label": "part_423"}, {"idx": 424, "label": "part_424"}, {"idx": 425, "label": "part_425"}, {"idx": 426, "label": "part_426"}, {"idx": 427, "label": "part_427"}, {"idx": 428, "label": "part_428"}, {"idx": 429, "label": "part_429"}, {"idx": 430, "label": "part_430"}, {"idx": 431, "label": "part_431"}, {"idx": 432, "label": "part_432"}, {"idx": 433, "label": "part_433"}, {"idx": 434, "label": "part_434"}, {"idx": 435, "label": "part_435"}, {"idx": 436, "label": "part_436"}, {"idx": 437, "label": "part_437"}, {"idx": 438, "label": "part_438"}, {"idx": 439, "label": "part_439"}, {"idx": 440, "label": "part_440"}, {"idx": 441, "label": "part_441"}, {"idx": 442, "label": "part_442"}, {"idx": 443, "label": "part_443"}, {"idx": 444, "label": "part_444"}, {"idx": 445, "label": "part_445"}, {"idx": 446, "label": "part_446"}, {"idx": 447, "label": "part_447"}, {"idx": 448, "label": "part_448"}, {"idx": 449, "label": "part_449"}, {"idx": 450, "label": "part_450"}, {"idx": 451, "label": "part_451"}, {"idx": 452, "label": "part_452"}, {"idx": 453, "label": "part_453"}, {"idx": 454, "label": "part_454"}, {"idx": 455, "label": "part_455"}, {"idx": 456, "label": "part_456"}, {"idx": 457, "label": "part_457"}, {"idx": 458, "label": "part_458"}, {"idx": 459, "label": "part_459"}, {"idx": 460, "label": "part_460"}, {"idx": 461, "label": "part_461"}, {"idx": 462, "label": "part_462"}, {"idx": 463, "label": "part_463"}, {"idx": 464, "label": "part_464"}, {"idx": 465, "label": "part_465"}, {"idx": 466, "label": "part_466"}, {"idx": 467, "label": "part_467"}, {"idx": 468, "label": "part_468"}, {"idx": 469, "label": "part_469"}, {"idx": 470, "label": "part_470"}, {"idx": 471, "label": "part_471"}, {"idx": 472, "label": "part_472"}, {"idx": 473, "label": "part_473"}, {"idx": 474, "label": "part_474"}, {"idx": 475, "label": "part_475"}, {"idx": 476, "label": "part_476"}, {"idx": 477, "label": "part_477"}, {"idx": 478, "label": "part_478"}, {"idx": 479, "label": "part_479"}, {"idx": 480, "label": "part_480"}, {"idx": 481, "label": "part_481"}, {"idx": 482, "label": "part_482"}, {"idx": 483, "label": "part_483"}, {"idx": 484, "label": "part_484"}, {"idx": 485, "label": "part_485"}, {"idx": 486, "label": "part_486"}, {"idx": 487, "label": "part_487"}, {"idx": 488, "label": "part_488"}, {"idx": 489, "label": "part_489"}, {"idx": 490, "label": "part_490"}, {"idx": 491, "label": "part_491"}, {"idx": 492, "label": "part_492"}, {"idx": 493, "label": "part_493"}, {"idx": 494, "label": "part_494"}, {"idx": 495, "label": "part_495"}, {"idx": 496, "label": "part_496"}, {"idx": 497, "label": "part_497"}, {"idx": 498, "label": "part_498"}, {"idx": 499, "label": "part_499"}, {"idx": 500, "label": "part_500"}, {"idx": 501, "label": "part_501"}, {"idx": 502, "label": "part_502"}, {"idx": 503, "label": "part_503"}, {"idx": 504, "label": "part_504"}, {"idx": 505, "label": "part_505"}, {"idx": 506, "label": "part_506"}, {"idx": 507, "label": "part_507"}, {"idx": 508, "label": "part_508"}, {"idx": 509, "label": "part_509"}, {"idx": 510, "label": "part_510"}, {"idx": 511, "label": "part_511"}, {"idx": 512, "label": "part_512"}, {"idx": 513, "label": "part_513"}, {"idx": 514, "label": "part_514"}, {"idx": 515, "label": "part_515"}, {"idx": 516, "label": "part_516"}, {"idx": 517, "label": "part_517"}, {"idx": 518, "label": "part_518"}, {"idx": 519, "label": "part_519"}, {"idx": 520, "label": "part_520"}, {"idx": 521, "label": "part_521"}, {"idx": 522, "label": "part_522"}, {"idx": 523, "label": "part_523"}, {"idx": 524, "label": "part_524"}, {"idx": 525, "label": "part_525"}, {"idx": 526, "label": "part_526"}, {"idx": 527, "label": "part_527"}, {"idx": 528, "label": "part_528"}, {"idx": 529, "label": "part_529"}, {"idx": 530, "label": "part_530"}, {"idx": 531, "label": "part_531"}, {"idx": 532, "label": "part_532"}, {"idx": 533, "label": "part_533"}, {"idx": 534, "label": "part_534"}, {"idx": 535, "label": "part_535"}, {"idx": 536, "label": "part_536"}, {"idx": 537, "label": "part_537"}, {"idx": 538, "label": "part_538"}, {"idx": 539, "label": "part_539"}, {"idx": 541, "label": "part_541"}, {"idx": 542, "label": "part_542"}, {"idx": 543, "label": "part_543"}, {"idx": 544, "label": "part_544"}, {"idx": 545, "label": "part_545"}, {"idx": 546, "label": "part_546"}, {"idx": 547, "label": "part_547"}, {"idx": 548, "label": "part_548"}, {"idx": 549, "label": "part_549"}, {"idx": 550, "label": "part_550"}, {"idx": 551, "label": "part_551"}, {"idx": 552, "label": "part_552"}, {"idx": 553, "label": "part_553"}, {"idx": 554, "label": "part_554"}, {"idx": 555, "label": "part_555"}, {"idx": 556, "label": "part_556"}, {"idx": 557, "label": "part_557"}, {"idx": 558, "label": "part_558"}, {"idx": 559, "label": "part_559"}, {"idx": 560, "label": "part_560"}, {"idx": 561, "label": "part_561"}, {"idx": 562, "label": "part_562"}, {"idx": 563, "label": "part_563"}, {"idx": 564, "label": "part_564"}, {"idx": 565, "label": "part_565"}, {"idx": 566, "label": "part_566"}, {"idx": 567, "label": "part_567"}, {"idx": 568, "label": "part_568"}, {"idx": 569, "label": "part_569"}, {"idx": 570, "label": "part_570"}, {"idx": 571, "label": "part_571"}, {"idx": 572, "label": "part_572"}, {"idx": 573, "label": "part_573"}, {"idx": 574, "label": "part_574"}, {"idx": 575, "label": "part_575"}, {"idx": 576, "label": "part_576"}, {"idx": 577, "label": "part_577"}, {"idx": 578, "label": "part_578"}, {"idx": 579, "label": "part_579"}, {"idx": 580, "label": "part_580"}, {"idx": 581, "label": "part_581"}, {"idx": 582, "label": "part_582"}, {"idx": 583, "label": "part_583"}, {"idx": 584, "label": "part_584"}, {"idx": 585, "label": "part_585"}, {"idx": 586, "label": "part_586"}, {"idx": 587, "label": "part_587"}, {"idx": 588, "label": "part_588"}, {"idx": 589, "label": "part_589"}, {"idx": 590, "label": "part_590"}, {"idx": 591, "label": "part_591"}, {"idx": 592, "label": "part_592"}, {"idx": 593, "label": "part_593"}, {"idx": 594, "label": "part_594"}, {"idx": 595, "label": "part_595"}, {"idx": 596, "label": "part_596"}, {"idx": 597, "label": "part_597"}, {"idx": 598, "label": "part_598"}, {"idx": 599, "label": "part_599"}, {"idx": 600, "label": "part_600"}, {"idx": 601, "label": "part_601"}, {"idx": 602, "label": "part_602"}, {"idx": 603, "label": "part_603"}, {"idx": 604, "label": "part_604"}, {"idx": 605, "label": "part_605"}, {"idx": 606, "label": "part_606"}, {"idx": 607, "label": "part_607"}, {"idx": 608, "label": "part_608"}, {"idx": 609, "label": "part_609"}, {"idx": 610, "label": "part_610"}, {"idx": 611, "label": "part_611"}, {"idx": 612, "label": "part_612"}, {"idx": 613, "label": "part_613"}, {"idx": 614, "label": "part_614"}, {"idx": 615, "label": "part_615"}, {"idx": 616, "label": "part_616"}, {"idx": 617, "label": "part_617"}, {"idx": 618, "label": "part_618"}, {"idx": 619, "label": "part_619"}, {"idx": 620, "label": "part_620"}, {"idx": 621, "label": "part_621"}, {"idx": 622, "label": "part_622"}, {"idx": 623, "label": "part_623"}, {"idx": 624, "label": "part_624"}, {"idx": 625, "label": "part_625"}, {"idx": 626, "label": "part_626"}, {"idx": 627, "label": "part_627"}, {"idx": 628, "label": "part_628"}, {"idx": 629, "label": "part_629"}, {"idx": 630, "label": "part_630"}, {"idx": 631, "label": "part_631"}, {"idx": 632, "label": "part_632"}, {"idx": 633, "label": "part_633"}, {"idx": 634, "label": "part_634"}, {"idx": 635, "label": "part_635"}, {"idx": 636, "label": "part_636"}, {"idx": 637, "label": "part_637"}, {"idx": 638, "label": "part_638"}, {"idx": 639, "label": "part_639"}, {"idx": 640, "label": "part_640"}, {"idx": 641, "label": "part_641"}, {"idx": 642, "label": "part_642"}, {"idx": 643, "label": "part_643"}, {"idx": 644, "label": "part_644"}, {"idx": 645, "label": "part_645"}, {"idx": 646, "label": "part_646"}, {"idx": 647, "label": "part_647"}, {"idx": 648, "label": "part_648"}, {"idx": 649, "label": "part_649"}, {"idx": 650, "label": "part_650"}, {"idx": 651, "label": "part_651"}, {"idx": 652, "label": "part_652"}, {"idx": 653, "label": "part_653"}, {"idx": 654, "label": "part_654"}, {"idx": 655, "label": "part_655"}, {"idx": 656, "label": "part_656"}, {"idx": 657, "label": "part_657"}, {"idx": 658, "label": "part_658"}, {"idx": 659, "label": "part_659"}, {"idx": 660, "label": "part_660"}, {"idx": 661, "label": "part_661"}, {"idx": 662, "label": "part_662"}, {"idx": 663, "label": "part_663"}, {"idx": 664, "label": "part_664"}, {"idx": 665, "label": "part_665"}, {"idx": 666, "label": "part_666"}, {"idx": 667, "label": "part_667"}, {"idx": 668, "label": "part_668"}, {"idx": 669, "label": "part_669"}, {"idx": 670, "label": "part_670"}, {"idx": 671, "label": "part_671"}, {"idx": 672, "label": "part_672"}, {"idx": 673, "label": "part_673"}, {"idx": 674, "label": "part_674"}, {"idx": 675, "label": "part_675"}, {"idx": 676, "label": "part_676"}, {"idx": 677, "label": "part_677"}, {"idx": 678, "label": "part_678"}, {"idx": 679, "label": "part_679"}, {"idx": 680, "label": "part_680"}, {"idx": 681, "label": "part_681"}, {"idx": 682, "label": "part_682"}, {"idx": 683, "label": "part_683"}, {"idx": 684, "label": "part_684"}, {"idx": 685, "label": "part_685"}, {"idx": 686, "label": "part_686"}, {"idx": 687, "label": "part_687"}, {"idx": 688, "label": "part_688"}, {"idx": 689, "label": "part_689"}, {"idx": 690, "label": "part_690"}, {"idx": 691, "label": "part_691"}, {"idx": 692, "label": "part_692"}, {"idx": 693, "label": "part_693"}, {"idx": 694, "label": "part_694"}, {"idx": 695, "label": "part_695"}, {"idx": 696, "label": "part_696"}, {"idx": 697, "label": "part_697"}, {"idx": 698, "label": "part_698"}, {"idx": 699, "label": "part_699"}, {"idx": 700, "label": "part_700"}, {"idx": 701, "label": "part_701"}, {"idx": 702, "label": "part_702"}, {"idx": 703, "label": "part_703"}, {"idx": 704, "label": "part_704"}, {"idx": 705, "label": "part_705"}], "views": [{"view_id": "iso", "label": "Iso 3/4 (front-right-above)", "view_dir": [-0.5, -1.0, 0.7]}, {"view_id": "front", "label": "Front elevation", "view_dir": [0.0, -1.0, 0.25]}, {"view_id": "side", "label": "Side elevation", "view_dir": [-1.0, 0.0, 0.25]}]}, {"file_id": "contesa", "file_label": "Contesa V2 / FL8 (top assembly)", "parts": [{"idx": 0, "label": "part_000"}, {"idx": 2, "label": "part_002"}, {"idx": 3, "label": "part_003"}, {"idx": 4, "label": "part_004"}, {"idx": 7, "label": "part_007"}, {"idx": 15, "label": "part_015"}, {"idx": 21, "label": "part_021"}, {"idx": 22, "label": "part_022"}, {"idx": 25, "label": "part_025"}, {"idx": 26, "label": "part_026"}, {"idx": 30, "label": "part_030"}, {"idx": 31, "label": "part_031"}, {"idx": 32, "label": "part_032"}, {"idx": 33, "label": "part_033"}, {"idx": 34, "label": "part_034"}, {"idx": 35, "label": "part_035"}, {"idx": 36, "label": "part_036"}, {"idx": 37, "label": "part_037"}, {"idx": 44, "label": "part_044"}, {"idx": 45, "label": "part_045"}, {"idx": 46, "label": "part_046"}, {"idx": 47, "label": "part_047"}, {"idx": 50, "label": "part_050"}, {"idx": 51, "label": "part_051"}, {"idx": 53, "label": "part_053"}, {"idx": 56, "label": "part_056"}, {"idx": 57, "label": "part_057"}, {"idx": 58, "label": "part_058"}, {"idx": 59, "label": "part_059"}, {"idx": 60, "label": "part_060"}, {"idx": 61, "label": "part_061"}, {"idx": 62, "label": "part_062"}, {"idx": 65, "label": "part_065"}, {"idx": 66, "label": "part_066"}, {"idx": 68, "label": "part_068"}, {"idx": 69, "label": "part_069"}, {"idx": 70, "label": "part_070"}, {"idx": 71, "label": "part_071"}, {"idx": 72, "label": "part_072"}, {"idx": 76, "label": "part_076"}, {"idx": 77, "label": "part_077"}, {"idx": 78, "label": "part_078"}, {"idx": 79, "label": "part_079"}, {"idx": 80, "label": "part_080"}, {"idx": 81, "label": "part_081"}, {"idx": 83, "label": "part_083"}, {"idx": 84, "label": "part_084"}, {"idx": 86, "label": "part_086"}, {"idx": 87, "label": "part_087"}, {"idx": 90, "label": "part_090"}, {"idx": 91, "label": "part_091"}, {"idx": 97, "label": "part_097"}, {"idx": 98, "label": "part_098"}, {"idx": 101, "label": "part_101"}, {"idx": 102, "label": "part_102"}, {"idx": 105, "label": "part_105"}, {"idx": 106, "label": "part_106"}, {"idx": 107, "label": "part_107"}, {"idx": 108, "label": "part_108"}, {"idx": 113, "label": "part_113"}, {"idx": 114, "label": "part_114"}, {"idx": 115, "label": "part_115"}, {"idx": 122, "label": "part_122"}, {"idx": 124, "label": "part_124"}, {"idx": 125, "label": "part_125"}, {"idx": 127, "label": "part_127"}, {"idx": 129, "label": "part_129"}, {"idx": 130, "label": "part_130"}, {"idx": 132, "label": "part_132"}, {"idx": 133, "label": "part_133"}, {"idx": 134, "label": "part_134"}, {"idx": 136, "label": "part_136"}, {"idx": 137, "label": "part_137"}, {"idx": 138, "label": "part_138"}, {"idx": 142, "label": "part_142"}, {"idx": 143, "label": "part_143"}, {"idx": 144, "label": "part_144"}, {"idx": 146, "label": "part_146"}, {"idx": 150, "label": "part_150"}, {"idx": 151, "label": "part_151"}, {"idx": 156, "label": "part_156"}, {"idx": 157, "label": "part_157"}, {"idx": 158, "label": "part_158"}, {"idx": 159, "label": "part_159"}, {"idx": 160, "label": "part_160"}, {"idx": 162, "label": "part_162"}, {"idx": 164, "label": "part_164"}, {"idx": 166, "label": "part_166"}, {"idx": 169, "label": "part_169"}, {"idx": 170, "label": "part_170"}, {"idx": 174, "label": "part_174"}, {"idx": 175, "label": "part_175"}, {"idx": 176, "label": "part_176"}, {"idx": 180, "label": "part_180"}, {"idx": 181, "label": "part_181"}, {"idx": 182, "label": "part_182"}, {"idx": 183, "label": "part_183"}, {"idx": 184, "label": "part_184"}, {"idx": 186, "label": "part_186"}, {"idx": 187, "label": "part_187"}, {"idx": 188, "label": "part_188"}, {"idx": 189, "label": "part_189"}, {"idx": 194, "label": "part_194"}, {"idx": 195, "label": "part_195"}, {"idx": 196, "label": "part_196"}, {"idx": 197, "label": "part_197"}, {"idx": 200, "label": "part_200"}, {"idx": 201, "label": "part_201"}, {"idx": 202, "label": "part_202"}, {"idx": 203, "label": "part_203"}, {"idx": 209, "label": "part_209"}, {"idx": 212, "label": "part_212"}, {"idx": 213, "label": "part_213"}, {"idx": 215, "label": "part_215"}, {"idx": 219, "label": "part_219"}, {"idx": 222, "label": "part_222"}, {"idx": 223, "label": "part_223"}, {"idx": 224, "label": "part_224"}, {"idx": 228, "label": "part_228"}, {"idx": 231, "label": "part_231"}, {"idx": 235, "label": "part_235"}, {"idx": 236, "label": "part_236"}, {"idx": 237, "label": "part_237"}, {"idx": 238, "label": "part_238"}, {"idx": 239, "label": "part_239"}, {"idx": 240, "label": "part_240"}, {"idx": 241, "label": "part_241"}, {"idx": 242, "label": "part_242"}, {"idx": 244, "label": "part_244"}, {"idx": 248, "label": "part_248"}, {"idx": 249, "label": "part_249"}, {"idx": 250, "label": "part_250"}, {"idx": 252, "label": "part_252"}, {"idx": 253, "label": "part_253"}, {"idx": 255, "label": "part_255"}, {"idx": 256, "label": "part_256"}, {"idx": 257, "label": "part_257"}, {"idx": 258, "label": "part_258"}, {"idx": 259, "label": "part_259"}, {"idx": 261, "label": "part_261"}, {"idx": 262, "label": "part_262"}, {"idx": 263, "label": "part_263"}, {"idx": 264, "label": "part_264"}, {"idx": 271, "label": "part_271"}, {"idx": 272, "label": "part_272"}, {"idx": 273, "label": "part_273"}, {"idx": 276, "label": "part_276"}, {"idx": 282, "label": "part_282"}, {"idx": 285, "label": "part_285"}, {"idx": 286, "label": "part_286"}, {"idx": 288, "label": "part_288"}, {"idx": 290, "label": "part_290"}, {"idx": 295, "label": "part_295"}, {"idx": 296, "label": "part_296"}, {"idx": 297, "label": "part_297"}, {"idx": 300, "label": "part_300"}, {"idx": 302, "label": "part_302"}, {"idx": 303, "label": "part_303"}, {"idx": 305, "label": "part_305"}, {"idx": 306, "label": "part_306"}, {"idx": 310, "label": "part_310"}, {"idx": 315, "label": "part_315"}, {"idx": 317, "label": "part_317"}, {"idx": 318, "label": "part_318"}, {"idx": 319, "label": "part_319"}, {"idx": 320, "label": "part_320"}, {"idx": 321, "label": "part_321"}, {"idx": 323, "label": "part_323"}, {"idx": 325, "label": "part_325"}, {"idx": 326, "label": "part_326"}, {"idx": 327, "label": "part_327"}, {"idx": 328, "label": "part_328"}, {"idx": 329, "label": "part_329"}, {"idx": 330, "label": "part_330"}, {"idx": 331, "label": "part_331"}, {"idx": 332, "label": "part_332"}, {"idx": 335, "label": "part_335"}, {"idx": 337, "label": "part_337"}, {"idx": 338, "label": "part_338"}, {"idx": 339, "label": "part_339"}, {"idx": 340, "label": "part_340"}, {"idx": 341, "label": "part_341"}, {"idx": 342, "label": "part_342"}, {"idx": 343, "label": "part_343"}, {"idx": 344, "label": "part_344"}, {"idx": 345, "label": "part_345"}, {"idx": 346, "label": "part_346"}, {"idx": 347, "label": "part_347"}, {"idx": 348, "label": "part_348"}, {"idx": 349, "label": "part_349"}, {"idx": 350, "label": "part_350"}, {"idx": 351, "label": "part_351"}, {"idx": 352, "label": "part_352"}, {"idx": 353, "label": "part_353"}, {"idx": 354, "label": "part_354"}, {"idx": 357, "label": "part_357"}, {"idx": 361, "label": "part_361"}, {"idx": 362, "label": "part_362"}, {"idx": 363, "label": "part_363"}, {"idx": 364, "label": "part_364"}, {"idx": 365, "label": "part_365"}, {"idx": 366, "label": "part_366"}, {"idx": 367, "label": "part_367"}, {"idx": 372, "label": "part_372"}, {"idx": 373, "label": "part_373"}, {"idx": 374, "label": "part_374"}, {"idx": 378, "label": "part_378"}, {"idx": 385, "label": "part_385"}, {"idx": 390, "label": "part_390"}, {"idx": 392, "label": "part_392"}, {"idx": 393, "label": "part_393"}, {"idx": 408, "label": "part_408"}, {"idx": 409, "label": "part_409"}, {"idx": 410, "label": "part_410"}, {"idx": 411, "label": "part_411"}, {"idx": 412, "label": "part_412"}, {"idx": 413, "label": "part_413"}, {"idx": 415, "label": "part_415"}, {"idx": 416, "label": "part_416"}, {"idx": 417, "label": "part_417"}, {"idx": 418, "label": "part_418"}, {"idx": 419, "label": "part_419"}, {"idx": 420, "label": "part_420"}, {"idx": 421, "label": "part_421"}, {"idx": 422, "label": "part_422"}, {"idx": 424, "label": "part_424"}, {"idx": 426, "label": "part_426"}, {"idx": 427, "label": "part_427"}, {"idx": 428, "label": "part_428"}, {"idx": 429, "label": "part_429"}, {"idx": 430, "label": "part_430"}, {"idx": 431, "label": "part_431"}, {"idx": 432, "label": "part_432"}, {"idx": 435, "label": "part_435"}, {"idx": 438, "label": "part_438"}, {"idx": 439, "label": "part_439"}, {"idx": 440, "label": "part_440"}, {"idx": 441, "label": "part_441"}, {"idx": 442, "label": "part_442"}, {"idx": 443, "label": "part_443"}, {"idx": 444, "label": "part_444"}, {"idx": 445, "label": "part_445"}, {"idx": 446, "label": "part_446"}, {"idx": 447, "label": "part_447"}, {"idx": 448, "label": "part_448"}, {"idx": 449, "label": "part_449"}, {"idx": 450, "label": "part_450"}, {"idx": 451, "label": "part_451"}, {"idx": 452, "label": "part_452"}, {"idx": 453, "label": "part_453"}, {"idx": 454, "label": "part_454"}, {"idx": 455, "label": "part_455"}, {"idx": 456, "label": "part_456"}, {"idx": 462, "label": "part_462"}, {"idx": 471, "label": "part_471"}, {"idx": 474, "label": "part_474"}, {"idx": 477, "label": "part_477"}, {"idx": 478, "label": "part_478"}, {"idx": 479, "label": "part_479"}, {"idx": 481, "label": "part_481"}, {"idx": 482, "label": "part_482"}, {"idx": 484, "label": "part_484"}, {"idx": 485, "label": "part_485"}, {"idx": 486, "label": "part_486"}, {"idx": 487, "label": "part_487"}, {"idx": 490, "label": "part_490"}, {"idx": 494, "label": "part_494"}, {"idx": 495, "label": "part_495"}, {"idx": 496, "label": "part_496"}, {"idx": 498, "label": "part_498"}, {"idx": 499, "label": "part_499"}, {"idx": 500, "label": "part_500"}, {"idx": 501, "label": "part_501"}, {"idx": 502, "label": "part_502"}, {"idx": 503, "label": "part_503"}, {"idx": 504, "label": "part_504"}, {"idx": 505, "label": "part_505"}, {"idx": 506, "label": "part_506"}, {"idx": 507, "label": "part_507"}, {"idx": 508, "label": "part_508"}, {"idx": 509, "label": "part_509"}, {"idx": 510, "label": "part_510"}, {"idx": 511, "label": "part_511"}, {"idx": 512, "label": "part_512"}, {"idx": 513, "label": "part_513"}, {"idx": 514, "label": "part_514"}, {"idx": 515, "label": "part_515"}, {"idx": 519, "label": "part_519"}, {"idx": 523, "label": "part_523"}, {"idx": 525, "label": "part_525"}, {"idx": 527, "label": "part_527"}, {"idx": 528, "label": "part_528"}, {"idx": 529, "label": "part_529"}, {"idx": 531, "label": "part_531"}, {"idx": 532, "label": "part_532"}, {"idx": 534, "label": "part_534"}, {"idx": 535, "label": "part_535"}, {"idx": 536, "label": "part_536"}, {"idx": 537, "label": "part_537"}, {"idx": 539, "label": "part_539"}, {"idx": 543, "label": "part_543"}, {"idx": 544, "label": "part_544"}, {"idx": 545, "label": "part_545"}, {"idx": 546, "label": "part_546"}, {"idx": 547, "label": "part_547"}, {"idx": 548, "label": "part_548"}, {"idx": 549, "label": "part_549"}, {"idx": 550, "label": "part_550"}, {"idx": 551, "label": "part_551"}, {"idx": 552, "label": "part_552"}, {"idx": 553, "label": "part_553"}, {"idx": 554, "label": "part_554"}, {"idx": 557, "label": "part_557"}, {"idx": 559, "label": "part_559"}, {"idx": 560, "label": "part_560"}, {"idx": 561, "label": "part_561"}, {"idx": 562, "label": "part_562"}, {"idx": 563, "label": "part_563"}, {"idx": 564, "label": "part_564"}, {"idx": 566, "label": "part_566"}, {"idx": 567, "label": "part_567"}, {"idx": 568, "label": "part_568"}, {"idx": 569, "label": "part_569"}, {"idx": 570, "label": "part_570"}, {"idx": 571, "label": "part_571"}, {"idx": 572, "label": "part_572"}, {"idx": 573, "label": "part_573"}, {"idx": 574, "label": "part_574"}, {"idx": 575, "label": "part_575"}, {"idx": 576, "label": "part_576"}, {"idx": 577, "label": "part_577"}, {"idx": 579, "label": "part_579"}, {"idx": 580, "label": "part_580"}, {"idx": 581, "label": "part_581"}, {"idx": 583, "label": "part_583"}, {"idx": 584, "label": "part_584"}, {"idx": 586, "label": "part_586"}, {"idx": 587, "label": "part_587"}, {"idx": 588, "label": "part_588"}, {"idx": 589, "label": "part_589"}, {"idx": 590, "label": "part_590"}, {"idx": 591, "label": "part_591"}, {"idx": 592, "label": "part_592"}, {"idx": 593, "label": "part_593"}, {"idx": 594, "label": "part_594"}, {"idx": 595, "label": "part_595"}, {"idx": 596, "label": "part_596"}, {"idx": 598, "label": "part_598"}, {"idx": 599, "label": "part_599"}, {"idx": 600, "label": "part_600"}, {"idx": 601, "label": "part_601"}, {"idx": 602, "label": "part_602"}, {"idx": 603, "label": "part_603"}, {"idx": 605, "label": "part_605"}, {"idx": 606, "label": "part_606"}, {"idx": 607, "label": "part_607"}, {"idx": 608, "label": "part_608"}, {"idx": 609, "label": "part_609"}, {"idx": 610, "label": "part_610"}, {"idx": 611, "label": "part_611"}, {"idx": 612, "label": "part_612"}, {"idx": 613, "label": "part_613"}, {"idx": 614, "label": "part_614"}, {"idx": 615, "label": "part_615"}, {"idx": 628, "label": "part_628"}, {"idx": 629, "label": "part_629"}, {"idx": 630, "label": "part_630"}, {"idx": 631, "label": "part_631"}, {"idx": 632, "label": "part_632"}, {"idx": 633, "label": "part_633"}, {"idx": 634, "label": "part_634"}, {"idx": 635, "label": "part_635"}, {"idx": 636, "label": "part_636"}, {"idx": 637, "label": "part_637"}, {"idx": 638, "label": "part_638"}, {"idx": 639, "label": "part_639"}, {"idx": 640, "label": "part_640"}, {"idx": 641, "label": "part_641"}, {"idx": 642, "label": "part_642"}, {"idx": 643, "label": "part_643"}, {"idx": 645, "label": "part_645"}, {"idx": 646, "label": "part_646"}, {"idx": 647, "label": "part_647"}, {"idx": 648, "label": "part_648"}, {"idx": 649, "label": "part_649"}, {"idx": 650, "label": "part_650"}, {"idx": 651, "label": "part_651"}, {"idx": 652, "label": "part_652"}, {"idx": 653, "label": "part_653"}, {"idx": 654, "label": "part_654"}, {"idx": 655, "label": "part_655"}, {"idx": 656, "label": "part_656"}, {"idx": 657, "label": "part_657"}, {"idx": 658, "label": "part_658"}, {"idx": 661, "label": "part_661"}, {"idx": 662, "label": "part_662"}, {"idx": 664, "label": "part_664"}, {"idx": 665, "label": "part_665"}, {"idx": 667, "label": "part_667"}, {"idx": 670, "label": "part_670"}, {"idx": 672, "label": "part_672"}, {"idx": 675, "label": "part_675"}, {"idx": 677, "label": "part_677"}, {"idx": 678, "label": "part_678"}, {"idx": 679, "label": "part_679"}, {"idx": 680, "label": "part_680"}, {"idx": 682, "label": "part_682"}, {"idx": 688, "label": "part_688"}, {"idx": 692, "label": "part_692"}, {"idx": 693, "label": "part_693"}, {"idx": 694, "label": "part_694"}, {"idx": 695, "label": "part_695"}, {"idx": 703, "label": "part_703"}, {"idx": 708, "label": "part_708"}, {"idx": 709, "label": "part_709"}, {"idx": 710, "label": "part_710"}, {"idx": 712, "label": "part_712"}, {"idx": 716, "label": "part_716"}, {"idx": 718, "label": "part_718"}, {"idx": 720, "label": "part_720"}, {"idx": 721, "label": "part_721"}, {"idx": 722, "label": "part_722"}, {"idx": 724, "label": "part_724"}, {"idx": 726, "label": "part_726"}, {"idx": 727, "label": "part_727"}, {"idx": 728, "label": "part_728"}, {"idx": 729, "label": "part_729"}, {"idx": 730, "label": "part_730"}, {"idx": 731, "label": "part_731"}, {"idx": 732, "label": "part_732"}, {"idx": 733, "label": "part_733"}, {"idx": 735, "label": "part_735"}, {"idx": 737, "label": "part_737"}, {"idx": 740, "label": "part_740"}, {"idx": 748, "label": "part_748"}, {"idx": 750, "label": "part_750"}, {"idx": 759, "label": "part_759"}, {"idx": 760, "label": "part_760"}, {"idx": 762, "label": "part_762"}, {"idx": 764, "label": "part_764"}, {"idx": 765, "label": "part_765"}, {"idx": 767, "label": "part_767"}, {"idx": 769, "label": "part_769"}, {"idx": 770, "label": "part_770"}], "views": [{"view_id": "iso", "label": "Iso 3/4 (front-right-above)", "view_dir": [-0.5, -1.0, 0.7]}]}];
+const GLB_B64 = {};
+const ONSHAPE_TREES = {};
+</script>
+<script src="/static/js/viewer.classic.js"></script>
+<script type="module" src="/static/js/viewer.module.js"></script>
+</script>
+</body>
+</html>

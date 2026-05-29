@@ -20,13 +20,14 @@ render / raster / Onshape paths.
 | `/api/healthz` | GET | `{ok, sources}` — server up + loaded sources |
 | `/api/debug/log` | GET | recent structured events, `?since=<seq>` for deltas |
 | `/api/sources` | GET | merged static + dynamic source list |
+| `/api/sources/<sid>` | DELETE | remove a dynamic source (STEP file + caches + registry); 400 for static demos |
 | `/api/sources/<sid>/configuration` | GET | Onshape configuration parameters |
 | `/api/sources/<sid>/reconfigure` | POST | re-translate at a different config |
 | `/api/sources/<sid>/versions` | GET | cached Onshape Versions list |
 | `/api/sources/<sid>/versions/refresh` | POST | hit Onshape, refresh cache |
 | `/api/onshape/probe` | POST | check URL → return doc / element info, no download |
 | `/api/onshape/import` | POST | start background STEP-translation job |
-| `/api/onshape/import/<job_id>` | GET | poll a job |
+| `/api/onshape/import/<job_id>` | GET / DELETE | poll a job / cancel an in-flight one |
 | `/api/settings` | GET / PUT / PATCH | app-level settings |
 | `/api/settings/reset` | POST | revert to defaults |
 | `/api/projects` | GET / POST | list, create |
@@ -34,7 +35,7 @@ render / raster / Onshape paths.
 | `/api/projects/<pid>/figures` | GET | figures belonging to a project |
 | `/api/projects/<pid>/figures/<fid>` | POST / DELETE | attach / detach |
 | `/api/projects/<pid>/views` | GET | views in a project (with figure_count) |
-| `/api/views` | POST | create new view |
+| `/api/views` | GET / POST | bulk list (optional `?group_by_project=1`) / create new view |
 | `/api/views/<vid>` | GET / PUT / DELETE | read, edit, delete (`?cascade=1`) |
 | `/api/views/<vid>/figures` | GET | resolved figures under this view |
 | `/api/views/<vid>/figures/<fid>` | POST / DELETE | attach / detach |
@@ -51,6 +52,7 @@ render / raster / Onshape paths.
 | `/api/part_footprints` | POST | rasterised closed-loop outlines |
 | `/api/part_silhouettes` | POST | per-part isolated HLR silhouettes |
 | `/api/glb/<sid>` | GET | on-the-fly GLB export from a STEP shape |
+| `/api/baked_svg/<sid>/<vid>` | GET | one of the pre-baked static-source SVGs (lazy-loaded by the viewer) |
 
 Below: the endpoints that aren't standard CRUD have their request /
 response shape documented in detail.

@@ -1,0 +1,22 @@
+# Keep the image small + don't ship local dev state / data.
+.venv/
+venv/
+__pycache__/
+*.pyc
+out/                    # local data + build artifacts; server uses /data
+debug_captures/
+tests/
+tests/debug_shots/
+tests/audit/
+node_modules/
+*.bak
+*.phase0bak
+build_viewer.py.phase0bak
+.git/
+.gitignore
+*.md
+migrate_phase0_extract.py
+backfill_thumbnails.py
+# Local demo STEPs aren't on the server (sources are imported via Onshape).
+*.STEP
+*.step

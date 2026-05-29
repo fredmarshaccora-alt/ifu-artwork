@@ -24,11 +24,23 @@ baked (e.g. Contesa: iso only).
 size manageable.
 """
 from __future__ import annotations
+import os
 from pathlib import Path
 from typing import Iterable, Sequence
 
 HERE = Path(__file__).resolve().parent.parent   # project root
-OUT = HERE / "out"
+
+# Data root for ALL persisted state (figures, views, projects, sources,
+# imported STEPs, thumbnails, debug captures, baked SVGs).  Override with
+# IFU_DATA_DIR so a deployed instance can point it at a persistent disk
+# (e.g. Render's mounted volume at /data) while local dev keeps using
+# ./out.  Everything downstream derives from OUT, so this one switch
+# moves all server state onto durable storage.
+OUT = Path(os.environ.get("IFU_DATA_DIR") or (HERE / "out"))
+try:
+    OUT.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
 
 
 SOURCES: Sequence[tuple] = [

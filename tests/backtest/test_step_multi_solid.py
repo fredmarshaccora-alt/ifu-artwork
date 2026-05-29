@@ -64,3 +64,34 @@ def test_load_step_as_compound_rejects_empty_step(tmp_path):
     out.write_text("not a valid STEP file", encoding="utf-8")
     with pytest.raises(Exception):
         _load_step_as_compound(out)
+
+
+def test_load_step_as_compound_rejects_truncated_step(tmp_path):
+    """A truncated STEP (network blip mid-download) should fail loudly
+    rather than being registered as a usable source."""
+    from serve import _load_step_as_compound
+    out = tmp_path / "tiny.step"
+    out.write_bytes(b"")  # 0 bytes -- the worst case
+    with pytest.raises(RuntimeError, match="too small"):
+        _load_step_as_compound(out)
+
+
+def test_load_step_as_compound_rejects_zero_solid_step(tmp_path):
+    """A valid STEP wrapping an empty assembly (no solids inside)
+    must fail rather than register a broken source.  This is the
+    Onshape-empty-partstudio shape."""
+    import cadquery as cq
+    from serve import _load_step_as_compound
+
+    asm = cq.Assembly()  # no parts added
+    out = tmp_path / "empty.step"
+    try:
+        asm.save(str(out), "STEP")
+    except Exception:
+        pytest.skip("cadquery refused to write an empty assembly STEP")
+
+    if not out.exists() or out.stat().st_size < 200:
+        pytest.skip("empty-assembly STEP wasn't written large enough to test")
+
+    with pytest.raises(RuntimeError):
+        _load_step_as_compound(out)

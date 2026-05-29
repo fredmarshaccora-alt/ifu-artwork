@@ -1,0 +1,10 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "buildCommand": "mkdir -p public/static && cp out/viewer.html public/index.html && cp -r static/. public/static/",
+  "outputDirectory": "public",
+  "installCommand": "true",
+  "rewrites": [
+    { "source": "/", "destination": "/index.html" }
+  ]
+}

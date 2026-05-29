@@ -24,6 +24,7 @@ the 2D pane.  No clipboard dance, no Python rerun.
 """
 from __future__ import annotations
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -38,6 +39,7 @@ from t5_hlr_vector import (
     run_hlr_per_solid, write_svg_parts, rotate_shape,
     run_part_silhouettes, run_group_silhouette,
     compute_visible_footprints, run_hlr_in_region,
+    split_solids,
 )
 from ifu import (figures_store, projects_store, revisions_store,
                   settings_store, sources_store, onshape_fetch,
@@ -53,13 +55,58 @@ from collections import deque
 # responsive even while a Presto raster runs for 2 minutes.
 _HLR_LOCK = threading.Lock()
 
+# Serialises lazy source imports so two concurrent requests for the same
+# not-yet-loaded source don't both import the STEP.  Held only inside
+# _ensure_source_loaded (never nested with _HLR_LOCK), so no deadlock.
+_LOAD_LOCK = threading.Lock()
+
+# Track who holds _HLR_LOCK so we can diagnose hangs without strace.
+# Updated under the lock; readers may see stale values but that's fine
+# for diagnostic purposes.
+_HLR_LOCK_HOLDER = {"endpoint": None, "since": None, "thread": None}
+
 
 def _occt_serialised(fn):
-    """Decorator: take _HLR_LOCK around an endpoint that touches OCCT."""
+    """Decorator: take _HLR_LOCK around an endpoint that touches OCCT.
+
+    Logs lock-acquire and release so the debug overlay can show which
+    endpoint is currently inside OCCT.  If a render hangs in OCCT C++
+    land (Python can't preempt it), the log shows exactly which one
+    grabbed the lock and never gave it back.
+    """
     @functools.wraps(fn)
     def _wrapper(*args, **kwargs):
-        with _HLR_LOCK:
-            return fn(*args, **kwargs)
+        ep = fn.__name__
+        t_wait0 = time.time()
+        # Try to acquire with a quick non-block check so we can log
+        # if anything is blocking us.
+        if not _HLR_LOCK.acquire(blocking=False):
+            holder = dict(_HLR_LOCK_HOLDER)
+            _log_event(
+                level="warn", op="occt.wait",
+                endpoint=ep,
+                blocking=holder.get("endpoint") or "?",
+                held_for_sec=round(
+                    time.time() - (holder.get("since") or time.time()), 1),
+            )
+            _HLR_LOCK.acquire()
+        try:
+            _HLR_LOCK_HOLDER.update(
+                endpoint=ep, since=time.time(),
+                thread=threading.current_thread().name)
+            t_wait = time.time() - t_wait0
+            _log_event(level="info", op="occt.enter", endpoint=ep,
+                        wait_sec=round(t_wait, 2))
+            t0 = time.time()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                _log_event(level="ok", op="occt.exit", endpoint=ep,
+                            held_sec=round(time.time() - t0, 2))
+        finally:
+            _HLR_LOCK_HOLDER.update(endpoint=None, since=None,
+                                     thread=None)
+            _HLR_LOCK.release()
     return _wrapper
 
 
@@ -72,6 +119,57 @@ _LOG_BUFFER: "deque[dict]" = deque(maxlen=500)
 _LOG_LOCK = threading.Lock()
 _LOG_SEQ = [0]
 
+# On-disk mirror of the structured log so events survive a server
+# restart.  Rotate at _LOG_DISK_MAX_BYTES; keep one .1 backup; drop the
+# rest.  No external logger -- single-user tool, append-only is fine.
+_LOG_DISK_PATH = Path(__file__).parent / "out" / "debug.log"
+_LOG_DISK_PREV = Path(__file__).parent / "out" / "debug.log.1"
+_LOG_DISK_MAX_BYTES = 5 * 1024 * 1024  # 5 MB before rotation
+
+# ---- Interaction-capture store (closed-loop debugging) ----------------
+# When the user hits "capture" in the editor, the client POSTs the live
+# SVG snapshot + tracker entries + current selection here.  We write each
+# capture to debug_captures/ so a headless harness can render it, crop a
+# zoomed screenshot around the clicked parts, and analyse exactly what
+# the silhouette layer drew.  This is how we look at PIXELS, not DOM
+# counts, when debugging "I clicked one part and a bunch lit up".
+_CAPTURE_DIR = Path(__file__).parent / "debug_captures"
+_CAPTURE_SEQ = [0]
+_CAPTURE_LOCK = threading.Lock()
+
+
+def _log_disk_append(evt: dict) -> None:
+    """Append one event as a JSON line to debug.log.  Rotates to
+    debug.log.1 (single previous-generation file) once the current log
+    exceeds 5 MB.  Failures are swallowed -- the in-memory ring buffer
+    is the source of truth; disk is convenience."""
+    try:
+        import json as _json
+        _LOG_DISK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        # Rotate before append so the line lands in the fresh file.
+        try:
+            sz = _LOG_DISK_PATH.stat().st_size
+        except OSError:
+            sz = 0
+        if sz >= _LOG_DISK_MAX_BYTES:
+            try:
+                if _LOG_DISK_PREV.exists():
+                    _LOG_DISK_PREV.unlink()
+                _LOG_DISK_PATH.rename(_LOG_DISK_PREV)
+            except OSError:
+                # If rename failed (Windows file lock?) just truncate
+                # rather than letting the log grow unbounded.
+                try:
+                    _LOG_DISK_PATH.write_text("", encoding="utf-8")
+                except OSError:
+                    pass
+        with open(_LOG_DISK_PATH, "a", encoding="utf-8") as fh:
+            fh.write(_json.dumps(evt, default=str))
+            fh.write("\n")
+    except Exception:
+        # Logging must never break the server.
+        pass
+
 
 def _log_event(**fields) -> None:
     """Push one structured event onto the rolling buffer + stdout."""
@@ -81,6 +179,8 @@ def _log_event(**fields) -> None:
                "t": time.strftime("%H:%M:%S", time.gmtime()),
                **fields}
         _LOG_BUFFER.append(evt)
+    # Mirror to disk (best-effort, never raises)
+    _log_disk_append(evt)
     # Mirror to stdout so a running terminal shows it too
     parts = [f"{k}={v}" for k, v in fields.items()
              if k not in ("level",)]
@@ -124,15 +224,29 @@ def _log_start():
 
 @app.after_request
 def _cors_and_no_cache(resp):
-    # Allow viewer.html loaded from file:// (or any other origin) to call
-    # /api/*.  Single-user local tool -- no need to be picky about origins.
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    # CORS.  Local dev keeps the permissive "*" (viewer.html from file://
+    # or same-origin).  A split deploy (front-end on Vercel, this API on
+    # Render) sets IFU_ALLOWED_ORIGIN to the Vercel origin so the browser
+    # permits cross-origin calls.  Methods MUST include PUT + DELETE --
+    # the editor autosaves figures with PUT and deletes with DELETE, and
+    # cross-origin preflight would otherwise reject them.
+    resp.headers["Access-Control-Allow-Origin"] = \
+        os.environ.get("IFU_ALLOWED_ORIGIN", "*")
+    resp.headers["Access-Control-Allow-Methods"] = \
+        "GET, POST, PUT, PATCH, DELETE, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    resp.headers["Vary"] = "Origin"
     # Always serve a fresh viewer.html so a rebuild while the server is
-    # running is picked up on the next reload.
+    # running is picked up on the next reload.  Full no-cache combo so
+    # Chrome's memory cache also revalidates (the index() handler sets
+    # the same values, but they get overwritten when after_request runs
+    # last -- keep both in sync).
     if request.path in ("/", "/viewer.html"):
-        resp.headers["Cache-Control"] = "no-store"
+        resp.headers["Cache-Control"] = (
+            "no-store, no-cache, must-revalidate"
+        )
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
 
     # Log the response (skip the noisy ones)
     p = request.path
@@ -147,16 +261,39 @@ def _cors_and_no_cache(resp):
     return resp
 
 
+@app.route("/api/debug/client_log", methods=["POST"])
+def debug_client_log():
+    """Receive structured browser-side errors so we can debug without
+    F12.  Body: {level, op, msg, source, line, ...}.  Anything the
+    client posts lands in the same rolling log as server events so
+    `/api/debug/log` returns them together."""
+    body = request.get_json(silent=True) or {}
+    fields = {"level": body.get("level") or "err",
+              "op":    body.get("op")    or "client",
+              "src":   "browser"}
+    for k, v in body.items():
+        if k in ("level", "op"):
+            continue
+        if v is None:
+            continue
+        fields[k] = v
+    _log_event(**fields)
+    return jsonify({"ok": True})
+
+
 @app.route("/api/debug/log", methods=["GET"])
 def debug_log():
     """Return the recent server log buffer.  Query ``?since=<seq>`` to
     only fetch entries newer than the given sequence number (cheap
-    polling for the editor's debug overlay)."""
+    polling for the editor's debug overlay).  Query ``?disk=1`` to
+    include the on-disk tail (events from before the last restart)
+    parsed back into the same shape."""
     since = 0
     try:
         since = int(request.args.get("since") or 0)
     except (TypeError, ValueError):
         pass
+    want_disk = request.args.get("disk") in ("1", "true", "yes")
     with _LOG_LOCK:
         if since:
             out = [e for e in _LOG_BUFFER if e["seq"] > since]
@@ -164,7 +301,135 @@ def debug_log():
             # Default: tail the last ~80 entries
             out = list(_LOG_BUFFER)[-80:]
         latest_seq = _LOG_SEQ[0]
-    return jsonify({"events": out, "latest_seq": latest_seq})
+
+    disk_tail: list = []
+    if want_disk:
+        # Read up to the last 1 MB of the rotated log so we don't
+        # answer slowly for users who ask for ?disk=1.  json-line
+        # parse; skip lines that don't parse rather than 500.
+        import json as _json
+        try:
+            sz = _LOG_DISK_PATH.stat().st_size
+            with open(_LOG_DISK_PATH, "rb") as fh:
+                if sz > 1024 * 1024:
+                    fh.seek(-1024 * 1024, 2)
+                    fh.readline()  # discard partial first line
+                data = fh.read().decode("utf-8", errors="replace")
+            for ln in data.splitlines():
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    disk_tail.append(_json.loads(ln))
+                except _json.JSONDecodeError:
+                    continue
+        except OSError:
+            pass
+
+    payload = {"events": out, "latest_seq": latest_seq}
+    if want_disk:
+        payload["disk_tail"] = disk_tail
+        payload["disk_path"] = str(_LOG_DISK_PATH)
+    return jsonify(payload)
+
+
+def _next_capture_seq() -> int:
+    """Monotonic capture id.  Seeds from existing files on first call so
+    ids keep climbing across restarts (don't clobber prior captures)."""
+    with _CAPTURE_LOCK:
+        if _CAPTURE_SEQ[0] == 0:
+            mx = 0
+            try:
+                for p in _CAPTURE_DIR.glob("cap_*.json"):
+                    try:
+                        mx = max(mx, int(p.stem.split("_")[1]))
+                    except (IndexError, ValueError):
+                        pass
+            except OSError:
+                pass
+            _CAPTURE_SEQ[0] = mx
+        _CAPTURE_SEQ[0] += 1
+        return _CAPTURE_SEQ[0]
+
+
+@app.route("/api/debug/capture", methods=["POST"])
+def debug_capture():
+    """Persist a live interaction snapshot for closed-loop debugging.
+
+    Body: {svg, tracker, selection, clicks, note, viewport, fid, vid,
+           styles}.  ``svg`` is the live ``.svg-pane svg`` outerHTML
+           (includes the layer-silhouette overlay exactly as drawn).
+    Writes debug_captures/cap_<seq>.svg + cap_<seq>.json and returns the
+    seq + paths so the harness can pick it up."""
+    import json as _json
+    body = request.get_json(silent=True) or {}
+    seq = _next_capture_seq()
+    _CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+
+    svg = body.get("svg") or ""
+    svg_path = _CAPTURE_DIR / f"cap_{seq:04d}.svg"
+    json_path = _CAPTURE_DIR / f"cap_{seq:04d}.json"
+
+    meta = {
+        "seq":       seq,
+        "t":         time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
+        "note":      body.get("note") or "",
+        "fid":       body.get("fid"),
+        "vid":       body.get("vid"),
+        "selection": body.get("selection") or [],
+        "clicks":    body.get("clicks") or [],
+        "tracker":   body.get("tracker") or [],
+        "viewport":  body.get("viewport") or {},
+        "styles":    body.get("styles") or {},
+        "meshes3d":  body.get("meshes3d"),
+        "svg_bytes": len(svg),
+        "svg_file":  svg_path.name,
+    }
+    try:
+        svg_path.write_text(svg, encoding="utf-8")
+        json_path.write_text(_json.dumps(meta, indent=2, default=str),
+                             encoding="utf-8")
+    except OSError as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    _log_event(level="ok", op="debug.capture", seq=seq,
+               sel=len(meta["selection"]), svg_kb=len(svg) // 1024,
+               note=meta["note"][:60])
+    return jsonify({"ok": True, "seq": seq,
+                    "svg_path": str(svg_path),
+                    "json_path": str(json_path)})
+
+
+@app.route("/api/debug/captures", methods=["GET"])
+def debug_captures_list():
+    """List stored captures (newest first), summary only."""
+    import json as _json
+    out = []
+    try:
+        for p in sorted(_CAPTURE_DIR.glob("cap_*.json"), reverse=True):
+            try:
+                m = _json.loads(p.read_text(encoding="utf-8"))
+                out.append({k: m.get(k) for k in
+                            ("seq", "t", "note", "fid", "vid",
+                             "selection", "svg_bytes", "svg_file")})
+            except (OSError, _json.JSONDecodeError):
+                continue
+    except OSError:
+        pass
+    return jsonify({"captures": out, "dir": str(_CAPTURE_DIR)})
+
+
+@app.route("/api/debug/captures/<int:seq>", methods=["GET"])
+def debug_capture_get(seq):
+    """Return one capture's full metadata (not the SVG body)."""
+    import json as _json
+    p = _CAPTURE_DIR / f"cap_{seq:04d}.json"
+    if not p.exists():
+        return jsonify({"ok": False, "error": "not found"}), 404
+    try:
+        return jsonify(_json.loads(p.read_text(encoding="utf-8")))
+    except (OSError, _json.JSONDecodeError) as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/api/<path:_p>", methods=["OPTIONS"])
@@ -177,22 +442,106 @@ _SHAPES: dict[str, tuple] = {}
 # Render cache: maps (file_id, rounded view_dir, rounded focal, up_axis)
 # to the SVG bytes for that exact render.  Exact HLR is the killer cost
 # (~80s for Presto), so memoising lets the user revisit an angle for free.
-_RENDER_CACHE: dict[tuple, bytes] = {}
+#
+# LRU semantics via OrderedDict: every read move_to_end()'s the key, so
+# eviction targets the genuinely-coldest entry rather than the oldest
+# *inserted* one.  Matters when the user toggles between a couple of
+# camera angles -- old FIFO would evict the popular one first.
+from collections import OrderedDict
+
+_RENDER_CACHE: "OrderedDict[tuple, bytes]" = OrderedDict()
 _RENDER_CACHE_MAX = 20    # rough cap on memory
+
+
+def _cache_get(cache: "OrderedDict", key):
+    """Read + mark recently-used for LRU eviction."""
+    val = cache.get(key)
+    if val is not None:
+        cache.move_to_end(key)
+    return val
+
+
+def _cache_put(cache: "OrderedDict", key, value, max_size: int) -> None:
+    """Insert + evict the least-recently-used entries until the cache
+    is back within ``max_size``."""
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > max_size:
+        # popitem(last=False) drops the oldest *touched* entry == LRU.
+        cache.popitem(last=False)
+
+
+# View-direction quantisation tolerance.  OrbitControls + mouse-pixel
+# quantisation leaves view_dir floats drifting by a few 1e-4 between
+# frames; rounding to 3 decimal places (~0.057deg) was tight enough that
+# tiny drift crossed the cache-key boundary and we missed the cache on
+# what the user perceived as "the same angle".  Bumped to 2 decimal
+# places (~0.57deg) -- still finer than human-perceptible camera
+# changes, but absorbs the drift.
+_VD_PRECISION = 2
+_FOCAL_PRECISION = 1
+
+
+def _view_keys(view_dir, focal):
+    """Single source of truth for the per-view cache keys used by
+    _RENDER_CACHE, _SIL_CACHE, _FOOT_CACHE, _FOOT_RASTER_*.  Returns
+    ``(vd_key, focal_key)`` as tuples of rounded floats.
+
+    Centralising this means a precision change (see _VD_PRECISION)
+    flows everywhere consistently.
+    """
+    vd_key = tuple(round(x, _VD_PRECISION) for x in view_dir)
+    focal_key = tuple(round(x, _FOCAL_PRECISION) for x in focal)
+    return vd_key, focal_key
 
 # Per-part silhouette cache: (file_id, vd_key, focal_key, up_axis_key, idx)
 # -> list of polylines in (u,v).  Each entry is one PolyAlgo on a single
 # solid (cheap-ish: ~0.1-2s depending on part complexity), but if the
 # user keeps the same angle and re-selects, the cache means instant.
-_SIL_CACHE: dict[tuple, list] = {}
+_SIL_CACHE: "OrderedDict[tuple, list]" = OrderedDict()
 _SIL_CACHE_MAX = 2000
 
 # Visible-footprint cache: (file_id, vd_key, focal_key, up_axis_key, idx)
 # -> list of closed polylines tracing the part's visible 2D footprint.
 # Cost is dominated by the single rasterize pass (all parts at once);
 # results are returned per requested idx so caching is per-idx-per-view.
-_FOOT_CACHE: dict[tuple, list] = {}
+_FOOT_CACHE: "OrderedDict[tuple, list]" = OrderedDict()
 _FOOT_CACHE_MAX = 2000
+
+# Raster handle cache: maps view_key -> (id_buf, px_per_mm, u_min, v_min).
+# Lets /api/part_footprints serve assembly + group silhouettes on demand
+# WITHOUT re-running the meshing + tri projection (the slow part).
+# Memory cost is the id_buf (~9 MB for a 3000x3000 raster, ~2 MB at
+# 1500x1500); cap is small.
+_RASTER_HANDLE_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
+_RASTER_HANDLE_CACHE_MAX = 8
+
+# Per-view assembly silhouette cache: view_key -> [polylines].  Cheap
+# to compute once we have the raster handle; cached so the UI doesn't
+# pay the contour trace per request.
+_ASSEMBLY_SILHOUETTE_CACHE: "OrderedDict[tuple, list]" = OrderedDict()
+_ASSEMBLY_SILHOUETTE_CACHE_MAX = 32
+
+# GLB cache: maps (source_id, config_str) -> (b64, summary_dict).
+# Reconfigure replaces _SHAPES[source_id] with the new geometry but
+# the previous config's GLB bytes stay valid as bytes; flipping back
+# to a config the user has touched in this session is instant rather
+# than paying another ~5 s mesh + export.
+_GLB_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
+_GLB_CACHE_MAX = 16  # small -- each entry is ~50-200 KB
+
+# Latest configuration string applied to a source, indexed by source_id.
+# Reconfigure updates this; /api/glb keys its lookup by it so renaming
+# / reconfiguring picks the right cached blob (or recomputes if absent).
+_SOURCE_CONFIG: dict[str, str] = {}
+
+# Per-config shape cache: (source_id, config_str) -> (shape, hlr_kw).
+# Lets reconfigure flip back to a previously-translated configuration
+# without re-running the ~12-30 s Onshape translation + STEP load.
+# Capped to bound memory (each entry holds a TopoDS_Compound which can
+# be tens of MB for a big assembly).
+_CFG_SHAPES: "OrderedDict[tuple, tuple]" = OrderedDict()
+_CFG_SHAPES_MAX = 8
 # Rasterize-once tracker: bool keyed by (file_id, vd_key, focal_key,
 # up_axis_key) so we don't redo the assembly raster within the same view
 # when extra parts are requested.
@@ -220,7 +569,12 @@ def _kick_footprint_raster(file_id: str, shape, view_dir,
         _FOOT_RASTER_INFLIGHT[view_key] = True
 
     def _run():
-        from t5_hlr_vector import compute_visible_footprints, split_solids
+        from t5_hlr_vector import (
+            _extract_projected_triangles,
+            _rasterise_visible_footprints,
+            compute_assembly_silhouette_from_raster,
+            split_solids,
+        )
         t0 = time.time()
         # The cache-warming raster runs at a deliberately coarser
         # mesh_defl + lower resolution than the default
@@ -234,31 +588,64 @@ def _kick_footprint_raster(file_id: str, shape, view_dir,
         _log_event(level="info", op="footprint.prefetch.start",
                     source_id=file_id, view=str(vd_key),
                     mesh_defl=round(coarse_defl, 2))
-        # OCCT calls aren't thread-safe; share _HLR_LOCK with /api/render.
-        with _HLR_LOCK:
-            try:
-                all_indices = list(range(len(list(split_solids(shape)))))
-                full = compute_visible_footprints(
-                    shape, all_indices, view_dir, focal=focal,
-                    mesh_defl=coarse_defl,
-                    resolution=1500)
-                for idx, polys in (full or {}).items():
-                    ck = view_key + (idx,)
-                    if len(_FOOT_CACHE) >= _FOOT_CACHE_MAX:
-                        _FOOT_CACHE.pop(next(iter(_FOOT_CACHE)))
-                    _FOOT_CACHE[ck] = polys
-                _FOOT_RASTER_DONE[view_key] = True
-                _log_event(level="ok", op="footprint.prefetch.done",
-                            source_id=file_id,
-                            seconds=round(time.time() - t0, 2),
-                            parts=len(all_indices))
-            except Exception as exc:
-                _log_event(level="err", op="footprint.prefetch",
-                            source_id=file_id,
-                            error=f"{type(exc).__name__}: {exc}")
-            finally:
-                with _FOOT_INFLIGHT_LOCK:
-                    _FOOT_RASTER_INFLIGHT.pop(view_key, None)
+        try:
+            # Phase 1 (OCCT-bound): mesh + project triangles.  Hold the
+            # HLR lock only for this phase -- ~5-15 s for a 138-part
+            # assembly -- so /api/render isn't blocked for the full
+            # raster duration.
+            t_extract0 = time.time()
+            with _HLR_LOCK:
+                all_indices = list(
+                    range(len(list(split_solids(shape)))))
+                tri_data = _extract_projected_triangles(
+                    shape, view_dir, focal, coarse_defl)
+            t_extract = time.time() - t_extract0
+
+            # Phase 2 (pure numpy / cv2): rasterise + contour-trace.
+            # No OCCT calls -> the lock is released, so an interactive
+            # /api/render request landing now runs in parallel.
+            t_raster0 = time.time()
+            full = _rasterise_visible_footprints(
+                tri_data, all_indices, resolution=1500)
+            t_raster = time.time() - t_raster0
+
+            # Pull the raster handle BEFORE writing into _FOOT_CACHE
+            # (we strip it off so /api/part_footprints sees a clean
+            # {idx: polylines} shape).
+            raster_handle = full.pop(("__id_buf__",), None)
+            if raster_handle is not None:
+                _cache_put(_RASTER_HANDLE_CACHE, view_key, raster_handle,
+                            _RASTER_HANDLE_CACHE_MAX)
+                # Compute + cache the assembly silhouette so the
+                # client can fetch it instantly without a contour
+                # re-trace.
+                try:
+                    asm = compute_assembly_silhouette_from_raster(
+                        raster_handle)
+                    _cache_put(_ASSEMBLY_SILHOUETTE_CACHE, view_key, asm,
+                                _ASSEMBLY_SILHOUETTE_CACHE_MAX)
+                except Exception as exc:
+                    _log_event(level="warn", op="footprint.assembly",
+                                source_id=file_id,
+                                error=f"{type(exc).__name__}: {exc}")
+
+            for idx, polys in (full or {}).items():
+                ck = view_key + (idx,)
+                _cache_put(_FOOT_CACHE, ck, polys, _FOOT_CACHE_MAX)
+            _FOOT_RASTER_DONE[view_key] = True
+            _log_event(level="ok", op="footprint.prefetch.done",
+                        source_id=file_id,
+                        seconds=round(time.time() - t0, 2),
+                        extract_sec=round(t_extract, 2),
+                        raster_sec=round(t_raster, 2),
+                        parts=len(all_indices))
+        except Exception as exc:
+            _log_event(level="err", op="footprint.prefetch",
+                        source_id=file_id,
+                        error=f"{type(exc).__name__}: {exc}")
+        finally:
+            with _FOOT_INFLIGHT_LOCK:
+                _FOOT_RASTER_INFLIGHT.pop(view_key, None)
 
     t = threading.Thread(target=_run, daemon=True,
                           name=f"footprint-prefetch-{file_id}")
@@ -281,22 +668,51 @@ def _load_step_as_compound(step_path: Path):
 
     To handle both shapes uniformly we always build a compound here.
     """
+    # Reject obviously broken files BEFORE letting cadquery raise an
+    # opaque OCP exception 30 s later.  Truncated downloads from Onshape
+    # have produced 0-byte / 100-byte STEPs that read as valid but
+    # contain no solids -- catch them early.
+    try:
+        size = step_path.stat().st_size
+    except OSError as exc:
+        raise RuntimeError(f"STEP {step_path} unreadable: {exc}") from exc
+    if size < 200:
+        # A minimal STEP header alone is ~150 bytes; anything below that
+        # cannot possibly carry geometry.
+        raise RuntimeError(
+            f"STEP {step_path} is too small ({size} bytes) -- "
+            f"likely a truncated download"
+        )
+
     imp = cq.importers.importStep(str(step_path))
     vals = imp.vals()
     if not vals:
         raise RuntimeError(f"STEP {step_path} contained no shapes")
     if len(vals) == 1:
-        return vals[0].wrapped
-    # Multi-solid file: assemble all of them under a single compound
-    # so downstream code (split_solids, HLR, GLB) sees everything.
-    from OCP.TopoDS import TopoDS_Compound
-    from OCP.BRep import BRep_Builder
-    comp = TopoDS_Compound()
-    bb = BRep_Builder()
-    bb.MakeCompound(comp)
-    for v in vals:
-        bb.Add(comp, v.wrapped)
-    return comp
+        shape = vals[0].wrapped
+    else:
+        # Multi-solid file: assemble all of them under a single compound
+        # so downstream code (split_solids, HLR, GLB) sees everything.
+        from OCP.TopoDS import TopoDS_Compound
+        from OCP.BRep import BRep_Builder
+        comp = TopoDS_Compound()
+        bb = BRep_Builder()
+        bb.MakeCompound(comp)
+        for v in vals:
+            bb.Add(comp, v.wrapped)
+        shape = comp
+
+    # Final guard: walk the compound and confirm at least one solid
+    # survived.  Some Onshape exports of empty part-studios produce a
+    # syntactically valid STEP whose top level is an empty compound;
+    # callers will silently return 0 polylines unless we fail here.
+    solids = split_solids(shape)
+    if not solids:
+        raise RuntimeError(
+            f"STEP {step_path} parsed but contained 0 solids -- "
+            f"empty part studio or corrupt export?"
+        )
+    return shape
 
 
 def _load_source_into_memory(*, file_id: str, step_path: Path,
@@ -324,20 +740,58 @@ def _load_source_into_memory(*, file_id: str, step_path: Path,
         return False
 
 
+def _ensure_source_loaded(file_id: str) -> bool:
+    """Lazily import a source's shape into _SHAPES on first use.  Returns
+    True once the shape is available.
+
+    Replaces the old boot-time preload: startup is now instant and the
+    server only pays a STEP-import cost for sources actually opened
+    (essential for a multi-user service -- you can't preload everyone's
+    models, and most requests hit an already-cached source).
+
+    THREAD-SAFETY: this performs OCCT work (STEP import + rotate), so it
+    must run with the OCCT serialised.  All callers invoke it either
+    inside an @_occt_serialised endpoint body or inside a `with
+    _HLR_LOCK` block, so OCCT is never touched from two threads at once.
+    """
+    if file_id in _SHAPES:
+        return True
+    with _LOAD_LOCK:
+        if file_id in _SHAPES:        # another thread loaded it meanwhile
+            return True
+        # Static (config) source?
+        for entry in SOURCES:
+            if entry[0] == file_id:
+                fid, label, sp, hlr_kw, pre_rotate = entry[:5]
+                return _load_source_into_memory(
+                    file_id=fid, step_path=sp, hlr_kw=hlr_kw,
+                    pre_rotate=pre_rotate)
+        # Dynamic (Onshape-imported) source?
+        try:
+            for s in sources_store.list_dynamic():
+                if s.get("id") == file_id:
+                    pre_rot = s.get("pre_rotation")
+                    return _load_source_into_memory(
+                        file_id=s["id"], step_path=Path(s["step_path"]),
+                        hlr_kw=s.get("hlr_kwargs") or {},
+                        pre_rotate=pre_rot if pre_rot else None)
+        except Exception as exc:
+            print(f"  _ensure_source_loaded({file_id}) dynamic lookup: {exc}")
+        return False
+
+
 def boot():
-    print("Loading sources into memory (one-time cost) ...")
-    for entry in SOURCES:
-        file_id, label, sp, hlr_kw, pre_rotate = entry[:5]
-        _load_source_into_memory(file_id=file_id, step_path=sp,
-                                  hlr_kw=hlr_kw, pre_rotate=pre_rotate)
-    # Dynamic sources persisted to out/sources/dynamic.json
-    for s in sources_store.list_dynamic():
-        pre_rot = s.get("pre_rotation")
-        _load_source_into_memory(
-            file_id=s["id"], step_path=Path(s["step_path"]),
-            hlr_kw=s.get("hlr_kwargs") or {},
-            pre_rotate=pre_rot if pre_rot else None)
-    print(f"Cached {len(_SHAPES)} source(s).")
+    # Sources are NO LONGER preloaded -- they import lazily on first use
+    # (see _ensure_source_loaded).  Startup is instant; the import cost is
+    # paid per-source, once, when someone first opens it.
+    n_static = len(SOURCES)
+    n_dyn = 0
+    try:
+        n_dyn = len(sources_store.list_dynamic())
+    except Exception:
+        pass
+    print(f"Sources load on demand: {n_static} static + {n_dyn} dynamic "
+          f"known (none preloaded).")
     # Migrate any existing figures that don't have a View yet -- the
     # operation is idempotent, so this is safe on every boot.  Pre-Phase-3
     # figures spawn a 1:1 View with their stored camera.
@@ -351,9 +805,82 @@ def boot():
     print()
 
 
+@app.route("/api/baked_svg/<file_id>/<view_id>")
+def baked_svg(file_id, view_id):
+    """Serve a single baked SVG.  Previously these were inlined into
+    viewer.html (3 sources x 3 views = ~26 MB).  Lazy-loading via this
+    endpoint drops the bundled HTML to ~500 KB; the browser can cache
+    each baked SVG independently and revalidate by mtime.
+
+    File names follow the ``<file_id>__<view_id>.svg`` convention set
+    by svg_bake.generate_svgs.  Path components are sanitised before
+    construction to prevent traversal -- only [A-Za-z0-9_-] survives.
+    """
+    import re
+    safe_fid = re.sub(r"[^A-Za-z0-9_-]+", "_", file_id)
+    safe_vid = re.sub(r"[^A-Za-z0-9_-]+", "_", view_id)
+    if not safe_fid or not safe_vid:
+        return jsonify({"error": "bad ids"}), 400
+    path = OUT / f"{safe_fid}__{safe_vid}.svg"
+    if not path.exists() or not path.is_file():
+        return jsonify({"error": "not found",
+                        "wanted": str(path.name)}), 404
+    resp = send_file(path, mimetype="image/svg+xml",
+                      conditional=True)
+    # Allow the browser to cache the SVG; the mtime-based ETag
+    # send_file emits will invalidate on rebuild.
+    resp.headers["Cache-Control"] = "public, max-age=3600, must-revalidate"
+    return resp
+
+
+@app.route("/favicon.ico")
+def favicon():
+    """1x1 transparent PNG so the browser stops 404-ing for the favicon
+    on every page load.  Tiny inline blob; no need for a static file."""
+    import base64
+    blob = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAS"
+        "cMnwAAAABJRU5ErkJggg==")
+    resp = Response(blob, mimetype="image/png")
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+
 @app.route("/")
 def index():
-    return send_file(OUT / "viewer.html")
+    """Serve the bundled viewer.  After a rebuild Chrome's memory cache
+    used to hold the old 26 MB parsed result even though our after-
+    request set Cache-Control: no-store -- the user kept seeing stale
+    JS until they hard-reloaded.  Belt-and-braces:
+
+      Cache-Control: no-store, no-cache, must-revalidate
+      Pragma: no-cache
+      Expires: 0
+      ETag: <build_id>
+
+    The ETag is the on-disk mtime so a rebuild also invalidates 304s.
+    Combined with no-store, refresh always re-fetches.
+    """
+    # API-only deploy (front-end served elsewhere, e.g. Vercel): there is
+    # no viewer.html on this host.  Return a small status page instead of
+    # a 500 so health checks / curious humans hitting the root get a sane
+    # response.  The UI lives at the front-end origin.
+    viewer = OUT / "viewer.html"
+    if not viewer.exists():
+        return Response(
+            "IFU compute API. The web UI is served separately; this host "
+            "serves /api/*. Health: /api/healthz",
+            mimetype="text/plain")
+    resp = send_file(viewer, conditional=False)
+    try:
+        mtime = (OUT / "viewer.html").stat().st_mtime_ns
+        resp.set_etag(f"build-{mtime}")
+    except OSError:
+        pass
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 
 @app.route("/api/healthz")
@@ -375,7 +902,7 @@ def render():
     focal = body.get("focal")
     up_axis = body.get("up_axis")    # {"axis": [x,y,z], "angle": deg} or None
 
-    if file_id not in _SHAPES:
+    if not _ensure_source_loaded(file_id):
         _log_event(level="err", op="render", source_id=file_id,
                     reason="source not loaded",
                     known=",".join(_SHAPES.keys()))
@@ -425,10 +952,9 @@ def render():
             return jsonify({"error": f"bad up_axis: {exc}"}), 400
 
     # Cache check: identical (source, view, focal, up_axis) -> instant.
-    vd_key = tuple(round(x, 3) for x in view_dir)
-    focal_key = tuple(round(x, 1) for x in focal)
+    vd_key, focal_key = _view_keys(view_dir, focal)
     cache_key = (file_id, vd_key, focal_key, up_axis_key)
-    cached = _RENDER_CACHE.get(cache_key)
+    cached = _cache_get(_RENDER_CACHE, cache_key)
     if cached is not None:
         print(f"  /api/render {file_id:<10s} dir={vd_key}{extra_rot_str}  "
               f"CACHE HIT  {len(cached)//1024}KB")
@@ -483,9 +1009,33 @@ def render():
     t_mir = 0.0
 
     t_svg0 = time.time()
-    out_path = OUT / f"_live_{file_id}.svg"
-    write_svg_parts(parts, out_path, precision=1)
-    svg = out_path.read_text(encoding="utf-8")
+    # Persist the scratch SVG only when the request opts in via
+    # ?save=1 (or IFU_PERSIST_LIVE_SVG=1) -- otherwise write to a
+    # temp file and unlink after reading.  Used to leave one
+    # _live_<sid>.svg per source on disk forever, which became
+    # ~3 MB per source after a long session.
+    persist_disk = (
+        request.args.get("save") in ("1", "true", "yes")
+        or os.environ.get("IFU_PERSIST_LIVE_SVG") in ("1", "true", "yes")
+    )
+    if persist_disk:
+        out_path = OUT / f"_live_{file_id}.svg"
+        write_svg_parts(parts, out_path, precision=1)
+        svg = out_path.read_text(encoding="utf-8")
+    else:
+        import tempfile
+        with tempfile.NamedTemporaryFile(
+                "w", suffix=".svg", delete=False, dir=str(OUT),
+                encoding="utf-8") as _tmp:
+            tmp_path = Path(_tmp.name)
+        try:
+            write_svg_parts(parts, tmp_path, precision=1)
+            svg = tmp_path.read_text(encoding="utf-8")
+        finally:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
     t_svg = time.time() - t_svg0
     elapsed = t_hlr + t_mir + t_svg
     breakdown = f"hlr={t_hlr:.1f}s mirror={t_mir:.1f}s svg-write={t_svg:.1f}s"
@@ -496,11 +1046,9 @@ def render():
                 source_id=file_id, total_sec=round(elapsed, 2),
                 hlr_sec=round(t_hlr, 2), svg_sec=round(t_svg, 2),
                 svg_kb=len(svg)//1024, polylines=n_polys)
-    # Insert into render cache (evict oldest if over cap)
+    # Insert into render cache (LRU eviction)
     svg_bytes = svg.encode("utf-8")
-    if len(_RENDER_CACHE) >= _RENDER_CACHE_MAX:
-        _RENDER_CACHE.pop(next(iter(_RENDER_CACHE)))
-    _RENDER_CACHE[cache_key] = svg_bytes
+    _cache_put(_RENDER_CACHE, cache_key, svg_bytes, _RENDER_CACHE_MAX)
 
     # Background: kick off the visible-footprint raster for this view
     # so by the time the user has finished scanning the SVG and clicks
@@ -637,6 +1185,20 @@ def onshape_import_start():
     return jsonify(job), 202
 
 
+@app.route("/api/onshape/import/<job_id>", methods=["DELETE"])
+def onshape_import_cancel(job_id):
+    """Request cancellation of an in-flight import job.  The worker
+    checks its cancel flag at each progress checkpoint and bails out
+    with status='cancelled'.  Returns the (possibly-updated) job dict,
+    or 404 if the job id is unknown."""
+    job = onshape_fetch.cancel_import(job_id)
+    if job is None:
+        return jsonify({"error": "job not found"}), 404
+    _log_event(level="info", op="onshape.import.cancel", job_id=job_id,
+                status=job.get("status"))
+    return jsonify(job)
+
+
 @app.route("/api/onshape/import/<job_id>", methods=["GET"])
 def onshape_import_status(job_id):
     """Poll an in-flight import.  Returns the job dict, or 404 if no
@@ -680,11 +1242,23 @@ def glb_for_source(source_id):
     by /api/render with the source's hlr_kwargs mesh_defl, base64-encode
     it, and return ``{b64, parts, tris, kb}``.
     """
-    if source_id not in _SHAPES:
+    if not _ensure_source_loaded(source_id):
         return jsonify({"error": f"unknown or unloaded source: {source_id!r}",
                          "known": list(_SHAPES.keys())}), 404
     shape, hlr_kw = _SHAPES[source_id]
     mesh_defl = (hlr_kw or {}).get("mesh_defl", 1.5)
+
+    cache_key = (source_id, _SOURCE_CONFIG.get(source_id, ""))
+    cached = _cache_get(_GLB_CACHE, cache_key)
+    if cached is not None:
+        b64, summary = cached
+        return jsonify({
+            "source_id": source_id,
+            "b64": b64,
+            "from_cache": True,
+            **(summary or {}),
+        })
+
     try:
         from ifu.glb import export_glb_b64
         b64, summary = export_glb_b64(shape, mesh_defl)
@@ -693,6 +1267,7 @@ def glb_for_source(source_id):
             f"GLB export failed: {type(exc).__name__}: {exc}"}), 500
     if not b64:
         return jsonify({"error": "no meshable solids"}), 422
+    _cache_put(_GLB_CACHE, cache_key, (b64, summary), _GLB_CACHE_MAX)
     return jsonify({
         "source_id": source_id,
         "b64": b64,
@@ -729,6 +1304,33 @@ def source_reconfigure(source_id):
     cfg_str = onshape_fetch.encode_configuration(cfg_values)
     _log_event(level="info", op="reconfigure.start",
                 source_id=source_id, cfg=cfg_str or "(default)")
+
+    # Fast path: have we already translated + loaded this exact
+    # (source_id, config_str) combination in this server session?  If
+    # so, swap the in-memory shape WITHOUT another Onshape round trip.
+    cfg_key = (source_id, cfg_str)
+    cached_shape = _cache_get(_CFG_SHAPES, cfg_key)
+    if cached_shape is not None:
+        _SHAPES[source_id] = cached_shape
+        _SOURCE_CONFIG[source_id] = cfg_str
+        # Evict per-source caches keyed by current view, EXCEPT _GLB_CACHE
+        # which is keyed by (source_id, config_str) and stays warm.
+        for cache in (_RENDER_CACHE, _SIL_CACHE, _FOOT_CACHE,
+                       _FOOT_RASTER_DONE,
+                       _RASTER_HANDLE_CACHE,
+                       _ASSEMBLY_SILHOUETTE_CACHE):
+            for key in list(cache.keys()):
+                if isinstance(key, tuple) and key and key[0] == source_id:
+                    del cache[key]
+        _log_event(level="ok", op="reconfigure.cache_hit",
+                    source_id=source_id, cfg=cfg_str or "(default)")
+        return jsonify({
+            "ok": True,
+            "source_id": source_id,
+            "configuration": cfg_values,
+            "step_path": src.get("step_path"),
+            "from_cache": True,
+        })
 
     # Need element type for the translation endpoint family.  Probe it.
     try:
@@ -775,12 +1377,25 @@ def source_reconfigure(source_id):
             "step_path": str(dest),
         }), 500
 
-    # Evict caches keyed by this source so the next render recomputes
+    # Cache the freshly-translated shape against (source_id, config_str)
+    # so future flips back to this configuration skip the translation.
+    _cache_put(_CFG_SHAPES, cfg_key, _SHAPES[source_id], _CFG_SHAPES_MAX)
+
+    # Evict caches keyed by this source so the next render recomputes.
+    # NB: the GLB cache is keyed by (source_id, config_str) so we
+    # deliberately KEEP its entries -- flipping back to a prior
+    # configuration in this session must hit the cached blob, not
+    # re-mesh + export.
     for cache in (_RENDER_CACHE, _SIL_CACHE, _FOOT_CACHE,
-                   _FOOT_RASTER_DONE):
+                   _FOOT_RASTER_DONE,
+                   _RASTER_HANDLE_CACHE,
+                   _ASSEMBLY_SILHOUETTE_CACHE):
         for key in list(cache.keys()):
             if isinstance(key, tuple) and key and key[0] == source_id:
                 del cache[key]
+    # Mark the source's current configuration so the next /api/glb
+    # call cache-hits on this config rather than the previous one.
+    _SOURCE_CONFIG[source_id] = cfg_str
 
     # Update the dynamic-source record so the configuration persists
     # across a server restart.
@@ -802,6 +1417,54 @@ def source_reconfigure(source_id):
         "step_path": str(dest),
         **(result or {}),
     })
+
+
+@app.route("/api/sources/<source_id>", methods=["DELETE"])
+def source_delete(source_id):
+    """Delete a dynamic (Onshape-imported) source.  Static demo sources
+    (from ifu.config.SOURCES) cannot be deleted -- returns 400.  Also
+    removes the STEP file from disk, evicts every cache keyed by the
+    source, and drops the in-memory shape.
+
+    Use case: Settings -> Imported sources -> Delete button.
+    """
+    src = sources_store.find(source_id)
+    if src is None:
+        return jsonify({"error": "unknown source"}), 404
+    if (src.get("origin") or "static") != "dynamic":
+        return jsonify({
+            "error": "only dynamic (Onshape-imported) sources can be "
+                     "deleted; static demo sources are part of the build"
+        }), 400
+
+    # Drop the on-disk STEP (best-effort).
+    try:
+        step_path = src.get("step_path")
+        if step_path:
+            p = Path(step_path)
+            if p.exists() and p.is_file():
+                p.unlink()
+    except OSError as exc:
+        _log_event(level="warn", op="source.delete.unlink",
+                    source_id=source_id,
+                    error=f"{type(exc).__name__}: {exc}")
+
+    # Evict every cache keyed by this source.
+    for cache in (_RENDER_CACHE, _SIL_CACHE, _FOOT_CACHE,
+                   _FOOT_RASTER_DONE, _GLB_CACHE, _CFG_SHAPES,
+                   _RASTER_HANDLE_CACHE, _ASSEMBLY_SILHOUETTE_CACHE):
+        for key in list(cache.keys()):
+            if isinstance(key, tuple) and key and key[0] == source_id:
+                del cache[key]
+
+    _SHAPES.pop(source_id, None)
+    _SOURCE_CONFIG.pop(source_id, None)
+
+    removed = sources_store.unregister(source_id)
+    _log_event(level="ok", op="source.delete",
+                source_id=source_id, removed=removed)
+    return jsonify({"ok": True, "source_id": source_id,
+                    "removed": removed})
 
 
 @app.route("/api/sources/<source_id>/configuration", methods=["GET"])
@@ -1100,6 +1763,32 @@ def views_list_in_project(proj_id):
     return jsonify({"project_id": proj_id, "views": views})
 
 
+@app.route("/api/views", methods=["GET"])
+def views_list_all():
+    """Bulk endpoint: every view, optionally grouped by project_id.
+
+    HomeScreen previously called ``/api/projects/<pid>/views`` once per
+    project; with 50 projects + 200 views that meant 50 disk-walks of
+    the same 200 view files (~1.4 s on Windows).  This endpoint does
+    one disk walk and groups in-memory, so the home page hot path
+    drops from O(N x M) JSON reads to O(M).
+
+    Query ``?group_by_project=1`` returns
+    ``{by_project: {<pid>: [view, ...]}}``; otherwise ``{views: [...]}``.
+    """
+    group = request.args.get("group_by_project") in ("1", "true", "yes")
+    all_views = views_store.list_all()
+    for v in all_views:
+        v["figure_count"] = len(v.get("figure_ids") or [])
+    if group:
+        by_project: dict[str, list] = {}
+        for v in all_views:
+            by_project.setdefault(v.get("project_id") or "", []).append(v)
+        return jsonify({"by_project": by_project,
+                        "count": len(all_views)})
+    return jsonify({"views": all_views, "count": len(all_views)})
+
+
 @app.route("/api/views", methods=["POST"])
 def views_create():
     body = request.get_json(silent=True) or {}
@@ -1301,8 +1990,8 @@ def render_region():
     sample_defl = float(body.get("sample_defl") or 0.4)
     padding_mm = float(body.get("padding_mm") or 10.0)
 
-    if file_id not in _SHAPES:
-        return jsonify({"error": f"unknown source: {file_id!r}",
+    if not _ensure_source_loaded(file_id):
+        return jsonify({"error": f"unknown or unloaded source: {file_id!r}",
                         "known": list(_SHAPES.keys())}), 400
     if not isinstance(bbox_uv, list) or len(bbox_uv) != 4:
         return jsonify({"error":
@@ -1356,9 +2045,29 @@ def render_region():
             f"region render failed: {type(exc).__name__}: {exc}"}), 500
     t_hlr = time.time() - t0
 
-    out_path = OUT / f"_region_{file_id}.svg"
-    write_svg_parts(parts, out_path, precision=1)
-    svg_bytes = out_path.read_bytes()
+    # Region renders are not persisted by default -- they're a UI helper.
+    # See /api/render's notes on IFU_PERSIST_LIVE_SVG.
+    persist_disk = (
+        request.args.get("save") in ("1", "true", "yes")
+        or os.environ.get("IFU_PERSIST_LIVE_SVG") in ("1", "true", "yes")
+    )
+    if persist_disk:
+        out_path = OUT / f"_region_{file_id}.svg"
+        write_svg_parts(parts, out_path, precision=1)
+        svg_bytes = out_path.read_bytes()
+    else:
+        import tempfile
+        with tempfile.NamedTemporaryFile(
+                "wb", suffix=".svg", delete=False, dir=str(OUT)) as _tmp:
+            tmp_path = Path(_tmp.name)
+        try:
+            write_svg_parts(parts, tmp_path, precision=1)
+            svg_bytes = tmp_path.read_bytes()
+        finally:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
     print(f"  /api/render_region {file_id:<10s} bbox={bbox_uv} "
           f"defl=({mesh_defl},{sample_defl}) parts={len(parts)} "
           f"hlr={t_hlr:.2f}s size={len(svg_bytes)//1024}KB")
@@ -1369,7 +2078,6 @@ def render_region():
 
 
 @app.route("/api/part_footprints", methods=["POST"])
-@_occt_serialised
 def part_footprints():
     """Visible-footprint boundaries per part.
 
@@ -1377,6 +2085,12 @@ def part_footprints():
     outlining the part's actually-visible 2D region in the current view
     (occluder cuts drawn along the occluder's boundary).  Same camera
     grammar as /api/render.
+
+    NB: this endpoint is intentionally NOT @_occt_serialised.  The body
+    holds _HLR_LOCK in a `with` block only for the OCCT-bound extract
+    phase (~5-15 s); the longer numpy/cv2 rasterise runs lock-free.
+    Wrapping in @_occt_serialised would re-acquire the same
+    non-reentrant lock and self-deadlock the calling thread instantly.
 
     Implementation rasterizes the whole assembly into an ID buffer
     once per view, then extracts contours for every part.  All results
@@ -1391,11 +2105,19 @@ def part_footprints():
     focal = body.get("focal")
     up_axis = body.get("up_axis")
 
-    if file_id not in _SHAPES:
-        return jsonify({"error": f"unknown source: {file_id!r}",
+    if not _ensure_source_loaded(file_id):
+        return jsonify({"error": f"unknown or unloaded source: {file_id!r}",
                         "known": list(_SHAPES.keys())}), 400
-    if not isinstance(part_indices, list) or not part_indices:
-        return jsonify({"error": "part_indices must be a non-empty list"}), 400
+    # Empty part_indices is allowed when the caller only wants the
+    # assembly silhouette or per-group union outlines (no per-part
+    # outlines).  Reject only if ALL three are missing.
+    groups_body = body.get("groups") or {}
+    want_assembly_body = bool(body.get("want_assembly"))
+    if not isinstance(part_indices, list):
+        return jsonify({"error": "part_indices must be a list"}), 400
+    if not part_indices and not groups_body and not want_assembly_body:
+        return jsonify({"error":
+            "supply part_indices, groups, or want_assembly"}), 400
     try:
         part_indices = [int(i) for i in part_indices]
     except Exception:
@@ -1433,15 +2155,14 @@ def part_footprints():
         except Exception as exc:
             return jsonify({"error": f"bad up_axis: {exc}"}), 400
 
-    vd_key = tuple(round(x, 3) for x in view_dir)
-    focal_key = tuple(round(x, 1) for x in focal)
+    vd_key, focal_key = _view_keys(view_dir, focal)
     view_key = (file_id, vd_key, focal_key, up_axis_key)
 
     out_polys: dict[int, list] = {}
     misses: list[int] = []
     for idx in part_indices:
         ck = view_key + (idx,)
-        cached = _FOOT_CACHE.get(ck)
+        cached = _cache_get(_FOOT_CACHE, ck)
         if cached is not None:
             out_polys[idx] = cached
         else:
@@ -1455,23 +2176,88 @@ def part_footprints():
         all_indices = list(range(len(_count_solids(shape))))
         t0 = time.time()
         try:
-            full = compute_visible_footprints(
-                shape, all_indices, view_dir, focal=focal,
-                mesh_defl=hlr_kw.get("mesh_defl", 0.8),
+            from t5_hlr_vector import (
+                _extract_projected_triangles,
+                _rasterise_visible_footprints,
+                compute_assembly_silhouette_from_raster,
             )
+            # Phase 1 (OCCT-bound): hold the lock for mesh + project only.
+            with _HLR_LOCK:
+                tri_data = _extract_projected_triangles(
+                    shape, view_dir, focal,
+                    hlr_kw.get("mesh_defl", 0.8))
+            # Phase 2 (numpy/cv2 only): rasterise without the lock so
+            # /api/render can run in parallel.
+            full = _rasterise_visible_footprints(
+                tri_data, all_indices, resolution=3000)
         except Exception as exc:
             import traceback; traceback.print_exc()
             return jsonify({"error":
                 f"footprint failed: {type(exc).__name__}: {exc}"}), 500
         t_raster = time.time() - t0
+        # Cache the raster handle so /api/part_footprints can also
+        # serve assembly + group silhouettes without re-rasterising.
+        raster_handle = full.pop(("__id_buf__",), None)
+        if raster_handle is not None:
+            _cache_put(_RASTER_HANDLE_CACHE, view_key, raster_handle,
+                        _RASTER_HANDLE_CACHE_MAX)
+            try:
+                asm = compute_assembly_silhouette_from_raster(raster_handle)
+                _cache_put(_ASSEMBLY_SILHOUETTE_CACHE, view_key, asm,
+                            _ASSEMBLY_SILHOUETTE_CACHE_MAX)
+            except Exception as exc:
+                _log_event(level="warn", op="footprint.assembly",
+                            error=f"{type(exc).__name__}: {exc}")
         for idx, polys in full.items():
             ck = view_key + (idx,)
-            if len(_FOOT_CACHE) >= _FOOT_CACHE_MAX:
-                _FOOT_CACHE.pop(next(iter(_FOOT_CACHE)))
-            _FOOT_CACHE[ck] = polys
+            _cache_put(_FOOT_CACHE, ck, polys, _FOOT_CACHE_MAX)
         _FOOT_RASTER_DONE[view_key] = True
         for idx in misses:
             out_polys[idx] = full.get(idx, [])
+
+    # Optional: client may ask for the assembly silhouette and/or
+    # per-group union silhouettes alongside the per-part outlines.
+    want_assembly = bool(body.get("want_assembly"))
+    groups = body.get("groups") or {}
+    assembly_polys = None
+    group_polys: dict[str, list] = {}
+    if want_assembly or groups:
+        from t5_hlr_vector import (
+            compute_assembly_silhouette_from_raster,
+            compute_group_silhouettes_from_raster,
+        )
+        if want_assembly:
+            cached_asm = _cache_get(_ASSEMBLY_SILHOUETTE_CACHE, view_key)
+            if cached_asm is not None:
+                assembly_polys = cached_asm
+            else:
+                raster_handle = _cache_get(_RASTER_HANDLE_CACHE, view_key)
+                if raster_handle is not None:
+                    try:
+                        assembly_polys = (
+                            compute_assembly_silhouette_from_raster(
+                                raster_handle))
+                        _cache_put(_ASSEMBLY_SILHOUETTE_CACHE,
+                                    view_key, assembly_polys,
+                                    _ASSEMBLY_SILHOUETTE_CACHE_MAX)
+                    except Exception as exc:
+                        _log_event(level="warn", op="footprint.assembly",
+                                    error=f"{type(exc).__name__}: {exc}")
+        if groups:
+            raster_handle = _cache_get(_RASTER_HANDLE_CACHE, view_key)
+            if raster_handle is not None:
+                try:
+                    # Sanitise: groups must be {str_key: [int_idx, ...]}
+                    clean_groups = {}
+                    for k, idxs in groups.items():
+                        clean_groups[str(k)] = [
+                            int(i) for i in (idxs or [])]
+                    group_polys = (
+                        compute_group_silhouettes_from_raster(
+                            raster_handle, clean_groups))
+                except Exception as exc:
+                    _log_event(level="warn", op="footprint.groups",
+                                error=f"{type(exc).__name__}: {exc}")
 
     raster_inflight = bool(_FOOT_RASTER_INFLIGHT.get(view_key))
     raster_done = bool(_FOOT_RASTER_DONE.get(view_key))
@@ -1486,6 +2272,10 @@ def part_footprints():
             "raster_done": raster_done,
         },
     }
+    if assembly_polys is not None:
+        payload["assembly"] = assembly_polys
+    if group_polys:
+        payload["groups"] = group_polys
     print(f"  /api/part_footprints {file_id:<10s} "
           f"parts={part_indices[:8]}{'...' if len(part_indices)>8 else ''} "
           f"hits={len(part_indices)-len(misses)} misses={len(misses)} "
@@ -1539,8 +2329,8 @@ def part_silhouettes():
     up_axis = body.get("up_axis")
     group_mode = bool(body.get("group"))
 
-    if file_id not in _SHAPES:
-        return jsonify({"error": f"unknown source: {file_id!r}",
+    if not _ensure_source_loaded(file_id):
+        return jsonify({"error": f"unknown or unloaded source: {file_id!r}",
                         "known": list(_SHAPES.keys())}), 400
     if not isinstance(part_indices, list) or not part_indices:
         return jsonify({"error": "part_indices must be a non-empty list"}), 400
@@ -1581,8 +2371,7 @@ def part_silhouettes():
         except Exception as exc:
             return jsonify({"error": f"bad up_axis: {exc}"}), 400
 
-    vd_key = tuple(round(x, 3) for x in view_dir)
-    focal_key = tuple(round(x, 1) for x in focal)
+    vd_key, focal_key = _view_keys(view_dir, focal)
     base_key = (file_id, vd_key, focal_key, up_axis_key)
 
     # Group mode: ONE silhouette around the compound of every selected
@@ -1590,7 +2379,7 @@ def part_silhouettes():
     # compositions don't share results.
     if group_mode:
         gkey = base_key + ("group", tuple(sorted(part_indices)))
-        cached = _SIL_CACHE.get(gkey)
+        cached = _cache_get(_SIL_CACHE, gkey)
         if cached is not None:
             print(f"  /api/part_silhouettes {file_id:<10s} GROUP "
                   f"parts={part_indices} CACHE HIT")
@@ -1611,9 +2400,7 @@ def part_silhouettes():
             return jsonify({"error":
                 f"group silhouette failed: {type(exc).__name__}: {exc}"}), 500
         t_hlr = time.time() - t0
-        if len(_SIL_CACHE) >= _SIL_CACHE_MAX:
-            _SIL_CACHE.pop(next(iter(_SIL_CACHE)))
-        _SIL_CACHE[gkey] = polys
+        _cache_put(_SIL_CACHE, gkey, polys, _SIL_CACHE_MAX)
         print(f"  /api/part_silhouettes {file_id:<10s} GROUP "
               f"parts={part_indices} hlr={t_hlr:.2f}s polys={len(polys)}")
         return jsonify({
@@ -1628,7 +2415,7 @@ def part_silhouettes():
     misses: list[int] = []
     for idx in part_indices:
         ck = base_key + (idx,)
-        cached = _SIL_CACHE.get(ck)
+        cached = _cache_get(_SIL_CACHE, ck)
         if cached is not None:
             out_polys[idx] = cached
         else:
@@ -1649,9 +2436,7 @@ def part_silhouettes():
         t_hlr = time.time() - t0
         for idx, polys in fresh.items():
             ck = base_key + (idx,)
-            if len(_SIL_CACHE) >= _SIL_CACHE_MAX:
-                _SIL_CACHE.pop(next(iter(_SIL_CACHE)))
-            _SIL_CACHE[ck] = polys
+            _cache_put(_SIL_CACHE, ck, polys, _SIL_CACHE_MAX)
             out_polys[idx] = polys
 
     payload = {
@@ -1701,18 +2486,43 @@ def main() -> int:
             save_catalogue(cat)
         build_html(cat)
 
-    boot()
+    # IFU_DEV=1 turns on Werkzeug's reloader so edits to serve.py /
+    # ifu/*.py re-run the server automatically.  The reloader re-imports
+    # the module on each change, which DOES re-run boot() — STEPs reload
+    # (~30 s for siderail, ~3 min for contesa).  In dev that's tolerable
+    # because edits are usually JS via rebuild_html.py (no restart).
+    # In prod we keep auto-reload off; restart is explicit.
+    dev_mode = os.environ.get("IFU_DEV", "").strip() in ("1", "true", "yes", "on")
+
+    # boot() must run in the worker process.  When the reloader spawns
+    # the child, WERKZEUG_RUN_MAIN=true; the parent (watcher) doesn't
+    # need OCCT loaded.  Saves us re-loading STEPs in the watcher.
+    is_reloader_watcher = (
+        dev_mode and os.environ.get("WERKZEUG_RUN_MAIN") != "true"
+    )
+    if not is_reloader_watcher:
+        boot()
+
     url = f"http://{args.host}:{args.port}"
     print(f"Serving on {url}")
     print(f"  - open {url} in a browser")
     print("  - click 'generate 2D' in the 3D toolbar to render the current angle")
-    print("  - Ctrl+C here to stop the server\n")
+    print("  - Ctrl+C here to stop the server")
+    if dev_mode:
+        print("  - IFU_DEV=1: auto-reload on edits to serve.py / ifu/*.py")
+    print()
     # threaded=True: but OCCT-critical endpoints take _HLR_LOCK so we
     # never run two HLR / footprint computations at once.  Cheap
     # endpoints (healthz, figures CRUD, /) bypass the lock and respond
     # instantly even while a render is in flight.  Without this the
     # whole server hangs for the 2+ minutes a Presto raster takes.
-    app.run(host=args.host, port=args.port, threaded=True, debug=False)
+    app.run(
+        host=args.host,
+        port=args.port,
+        threaded=True,
+        debug=dev_mode,
+        use_reloader=dev_mode,
+    )
     return 0
 
 

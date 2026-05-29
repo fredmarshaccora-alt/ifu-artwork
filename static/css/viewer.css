@@ -1,0 +1,574 @@
+  :root {
+    --accora-teal: #00836a;
+    --accora-teal-pale: #cce6e0;
+    --accora-lime: #b8d442;
+    --bg: #f4f4f5;
+    --panel: #ffffff;
+    --line: #d8d8da;
+    --text: #2a2a2c;
+    --muted: #707074;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { display: grid; grid-template-rows: 50px 1fr;
+          font-family: Arial, sans-serif; color: var(--text);
+          background: var(--bg); }
+  header { display: flex; align-items: center; padding: 0 16px; gap: 24px;
+            background: var(--panel); border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 16px; font-weight: bold; margin: 0; color: var(--accora-teal); }
+  header label { font-size: 13px; color: var(--muted); }
+  header select, header button { font-size: 13px; padding: 4px 8px;
+                                   border: 1px solid var(--line); background: white;
+                                   border-radius: 3px; cursor: pointer; }
+  header button.active { background: var(--accora-teal); color: white;
+                          border-color: var(--accora-teal); }
+  /* Segmented layout control: 2D | Split | 3D */
+  .seg-ctl { display: inline-flex; border: 1px solid var(--line);
+              border-radius: 4px; overflow: hidden; }
+  .seg-btn { font-size: 13px; padding: 4px 12px; border: none;
+              background: white; cursor: pointer; color: var(--muted);
+              border-right: 1px solid var(--line); font-weight: 500; }
+  .seg-btn:last-child { border-right: none; }
+  .seg-btn:hover { background: var(--accora-teal-pale); color: var(--text); }
+  .seg-btn.active { background: var(--accora-teal); color: white; }
+  /* 3-layout grid: areas reflow when body switches layout-* class */
+  main { display: grid; grid-template-rows: 1fr;
+           grid-template-columns: 240px 1fr 260px;
+           grid-template-areas: "left center right"; overflow: hidden;
+           transition: grid-template-columns 0.18s ease; }
+  aside.left  { grid-area: left; }
+  aside.right { grid-area: right; }
+  /* 2D-only (default) */
+  /* Project-scoped editor: only the figure list and selection summary
+     are relevant when the user navigated in from a project workspace.
+     Hide the legacy / dev sections so the sidebar stops looking like
+     a developer dashboard. */
+  body.project-scoped-editor [data-ed-section="project"],
+  body.project-scoped-editor [data-ed-section="saved-views"],
+  body.project-scoped-editor [data-ed-section="onshape-tree"],
+  body.project-scoped-editor [data-ed-section="step-order"],
+  body.project-scoped-editor [data-ed-section="pipeline"],
+  body.project-scoped-editor [data-ed-control="file-sel"],
+  body.project-scoped-editor [data-ed-control="view-sel"],
+  body.project-scoped-editor [data-ed-control="mode-pill"],
+  body.project-scoped-editor [data-ed-control="mode-btns"],
+  body.project-scoped-editor [data-ed-control="hi-detail"],
+  body.project-scoped-editor [data-ed-control="dev-readout"],
+  body.project-scoped-editor [data-ed-control="up-axis"],
+  body.project-scoped-editor [data-ed-control="hidden-layers"],
+  body.project-scoped-editor [data-ed-control="group-mode"],
+  body.project-scoped-editor [data-ed-control="dev-buttons"],
+  body.project-scoped-editor [data-ed-control="dev-prose"],
+  body.project-scoped-editor [data-ed-control="advanced-styling"],
+  body.project-scoped-editor [data-ed-control="legacy-figures"] {
+    display: none !important;
+  }
+  /* Show the variant strip in project mode */
+  body.project-scoped-editor #variants-header,
+  body.project-scoped-editor #variants-help {
+    display: block !important;
+  }
+  body.project-scoped-editor #variants-strip {
+    display: flex !important;
+  }
+  /* Variant card: thumbnail + name + selection size */
+  .variant-card {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 8px;
+    border: 1px solid var(--c-line);
+    border-radius: var(--radius-1);
+    background: var(--c-surface);
+    cursor: pointer;
+    transition: background 0.12s, border-color 0.12s;
+  }
+  .variant-card:hover {
+    background: var(--c-accora-pale);
+    border-color: var(--c-accora);
+  }
+  .variant-card.is-active {
+    background: var(--c-accora-pale);
+    border-color: var(--c-accora);
+    box-shadow: inset 0 0 0 1px var(--c-accora);
+  }
+  .variant-card .variant-thumb {
+    flex: 0 0 56px;
+    width: 56px; height: 42px;
+    background: var(--c-surface-1);
+    border: 1px solid var(--c-line);
+    border-radius: 3px;
+    object-fit: contain;
+  }
+  .variant-card .variant-thumb.placeholder {
+    border-style: dashed;
+  }
+  .variant-card .variant-meta { flex: 1; min-width: 0; }
+  .variant-card .variant-name {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--c-text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .variant-card .variant-sub {
+    font-size: 10px; color: var(--c-text-muted);
+  }
+  .variant-card.add {
+    justify-content: center;
+    border-style: dashed;
+    color: var(--c-text-muted);
+    font-weight: 500;
+  }
+  .variant-card.add:hover {
+    color: var(--c-accora-dark);
+  }
+  /* Show the preset row + actions in project mode (flex), keep them
+     hidden in the file:// / legacy path so power users see the old
+     control set. */
+  body.project-scoped-editor [data-ed-control="presets"] {
+    display: flex !important;
+  }
+  /* Preset buttons themselves */
+  .preset-btn {
+    flex: 1 1 calc(50% - 6px);
+    min-width: 86px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    background: var(--c-surface);
+    border: 1px solid var(--c-line);
+    border-radius: var(--radius-1);
+    font-family: var(--font-ui, Inter, sans-serif);
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--c-text);
+    cursor: pointer;
+    transition: background 0.12s, border-color 0.12s, transform 0.06s;
+  }
+  .preset-btn:hover {
+    background: var(--c-accora-pale);
+    border-color: var(--c-accora);
+  }
+  .preset-btn:active { transform: scale(0.98); }
+  .preset-btn.is-active {
+    background: var(--c-accora-pale);
+    border-color: var(--c-accora);
+    color: var(--c-accora-dark);
+    box-shadow: inset 0 0 0 1px var(--c-accora);
+  }
+  .preset-swatch {
+    flex: 0 0 16px;
+    height: 16px;
+    border-radius: 50%;
+    box-shadow: 0 0 0 1px rgba(0,0,0,0.06);
+  }
+  /* Slim header in project mode -- the dev row + the breadcrumb were
+     stacking up to ~80px before; now ~42px total. */
+  body.project-scoped-editor header {
+    padding: 2px 16px;
+    gap: 12px;
+    min-height: 0;
+    background: var(--c-surface);
+    border-bottom: 1px solid var(--c-line);
+    box-shadow: none;
+  }
+  body.project-scoped-editor header h1 {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--c-accora-dark);
+    letter-spacing: 0.2px;
+    line-height: 28px;
+  }
+  /* Tighten the per-button vertical space */
+  body.project-scoped-editor header button,
+  body.project-scoped-editor header .seg-btn {
+    padding-top: 3px;
+    padding-bottom: 3px;
+    line-height: 18px;
+  }
+  /* Breadcrumb is now redundant with the back-to-project pill; hide
+     it in project mode to claw back another row of vertical space. */
+  body.project-scoped-editor #editor-breadcrumb {
+    display: none;
+  }
+  /* Re-skin the legacy buttons in project mode to match the G.0
+     design system (Onshape-style chrome: subtle borders, teal accents
+     on hover, primary-tinted for active, no garish grey). */
+  body.project-scoped-editor header button,
+  body.project-scoped-editor .three-toolbar button {
+    font-family: var(--font-ui, Inter, sans-serif);
+    font-size: 12.5px;
+    font-weight: 500;
+    padding: 5px 10px;
+    border: 1px solid var(--c-line);
+    background: var(--c-surface);
+    color: var(--c-text);
+    border-radius: var(--radius-1);
+    cursor: pointer;
+    transition: background 0.12s, border-color 0.12s, color 0.12s;
+  }
+  body.project-scoped-editor header button:hover,
+  body.project-scoped-editor .three-toolbar button:hover {
+    background: var(--c-accora-pale);
+    border-color: var(--c-accora);
+    color: var(--c-accora-dark);
+  }
+  body.project-scoped-editor header button.active {
+    background: var(--c-accora);
+    border-color: var(--c-accora);
+    color: #fff;
+  }
+  body.project-scoped-editor header button.active:hover {
+    background: var(--c-accora-dark);
+    border-color: var(--c-accora-dark);
+  }
+  body.project-scoped-editor .three-toolbar button.primary {
+    background: var(--c-accora);
+    border-color: var(--c-accora);
+    color: #fff;
+  }
+  body.project-scoped-editor .three-toolbar button.primary:hover {
+    background: var(--c-accora-dark);
+    border-color: var(--c-accora-dark);
+    color: #fff;
+  }
+  body.project-scoped-editor .seg-ctl {
+    border-color: var(--c-line);
+    border-radius: var(--radius-1);
+    overflow: hidden;
+  }
+  body.project-scoped-editor .seg-btn {
+    font-family: var(--font-ui, Inter, sans-serif);
+    font-size: 12.5px;
+    font-weight: 500;
+    background: var(--c-surface);
+    color: var(--c-text-muted);
+    border-right: 1px solid var(--c-line);
+  }
+  body.project-scoped-editor .seg-btn:hover {
+    background: var(--c-accora-pale);
+    color: var(--c-accora-dark);
+  }
+  body.project-scoped-editor .seg-btn.active {
+    background: var(--c-accora);
+    color: #fff;
+  }
+  /* Back-to-project pill: sits right after the logo, primary action
+     to leave the editor.  Visually distinct so it's discoverable. */
+  body.project-scoped-editor .back-to-project {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12.5px;
+    font-weight: 500;
+    padding: 5px 12px;
+    border-radius: 16px;
+    border: 1px solid var(--c-line);
+    background: var(--c-surface);
+    color: var(--c-text-muted);
+    text-decoration: none;
+    transition: background 0.12s, color 0.12s, border-color 0.12s;
+    cursor: pointer;
+  }
+  body.project-scoped-editor .back-to-project:hover {
+    background: var(--c-accora-pale);
+    border-color: var(--c-accora);
+    color: var(--c-accora-dark);
+  }
+  /* The whole legacy crumb strip below the header looks dev-y in
+     project mode; restyle to match the rest of the chrome. */
+  body.project-scoped-editor #editor-breadcrumb {
+    background: var(--c-surface-1);
+    border-bottom: 1px solid var(--c-line);
+    color: var(--c-text-muted);
+    padding: 6px 16px;
+  }
+  body.project-scoped-editor #editor-breadcrumb .current {
+    color: var(--c-text);
+    font-weight: 600;
+  }
+  body.project-scoped-editor #editor-breadcrumb a {
+    color: var(--c-text-muted);
+    text-decoration: none;
+  }
+  body.project-scoped-editor #editor-breadcrumb a:hover {
+    color: var(--c-accora);
+    text-decoration: underline;
+  }
+  body.layout-2d .canvas-wrap { grid-area: center; display: block; }
+  body.layout-2d .webgl-wrap  { display: none; }
+  /* 3D-only */
+  body.layout-3d .webgl-wrap  { grid-area: center; display: block; }
+  body.layout-3d .canvas-wrap { display: none; }
+  /* Split view: a 5-column grid with both panes visible and a
+     draggable splitter between them.  The two centre columns use a
+     CSS custom property so the splitter JS can resize at runtime
+     without churning grid-template-columns string parsing. */
+  body.layout-split main {
+    grid-template-columns: 240px var(--split-2d, 1fr) 6px var(--split-3d, 1fr) 260px;
+    grid-template-areas: "left center2d splitter center3d right";
+  }
+  body.layout-split .canvas-wrap { grid-area: center2d; display: block;
+                                     border-right: 1px solid var(--line); }
+  body.layout-split .webgl-wrap  { grid-area: center3d; display: block; }
+  body.layout-split #pane-splitter {
+    grid-area: splitter;
+    display: block;
+    background: var(--line);
+    cursor: col-resize;
+    user-select: none;
+    position: relative;
+    transition: background 0.12s;
+  }
+  body.layout-split #pane-splitter:hover,
+  body.layout-split #pane-splitter.is-dragging {
+    background: var(--accora-teal);
+  }
+  /* Subtle "grip" hint in the middle of the splitter */
+  body.layout-split #pane-splitter::after {
+    content: '';
+    position: absolute;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    width: 2px; height: 28px;
+    background: var(--muted);
+    border-radius: 1px;
+    opacity: 0.45;
+    pointer-events: none;
+  }
+  body.layout-split #pane-splitter:hover::after,
+  body.layout-split #pane-splitter.is-dragging::after {
+    background: white;
+    opacity: 0.9;
+  }
+  /* When NOT in split layout, hide the splitter entirely */
+  body:not(.layout-split) #pane-splitter { display: none; }
+  /* In any layout the panes themselves are the same */
+  aside.left, aside.right { background: var(--panel);
+                              border-right: 1px solid var(--line);
+                              padding: 12px; overflow-y: auto; font-size: 13px; }
+  aside.right { border-right: none; border-left: 1px solid var(--line); }
+  aside h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em;
+              color: var(--muted); margin: 16px 0 8px 0; font-weight: bold; }
+  aside h2:first-child { margin-top: 0; }
+  .part-list { list-style: none; padding: 0; margin: 0; max-height: 280px;
+                overflow-y: auto; border: 1px solid var(--line); border-radius: 3px; }
+  .part-list li { padding: 4px 8px; cursor: pointer; border-bottom: 1px solid #f0f0f0;
+                   font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+  .part-list li:hover { background: var(--accora-teal-pale); }
+  .part-list li.highlighted { background: var(--accora-teal); color: white; }
+  .ed-disclosure { margin: 6px 0 0 0; }
+  .ed-disclosure > summary {
+    cursor: pointer;
+    font-size: 11px;
+    color: var(--muted);
+    margin: 4px 0;
+    list-style: none;
+    user-select: none;
+  }
+  .ed-disclosure > summary::before {
+    content: '▸';
+    display: inline-block;
+    width: 10px;
+    transition: transform 0.15s;
+  }
+  .ed-disclosure[open] > summary::before { transform: rotate(90deg); }
+  .ed-disclosure > summary:hover { color: var(--text); }
+  .draw-row { display: flex;
+               align-items: center;
+               gap: 8px;
+               margin: 4px 0;
+               font-size: 11px;
+               line-height: 1.2;
+               color: var(--text);
+               white-space: nowrap; }
+  .draw-row > :first-child,
+  .draw-row > .label { flex: 0 0 60px; }
+  .draw-row input[type="range"] { flex: 1 1 auto;
+                                    min-width: 60px; }
+  .draw-row select { flex: 1 1 auto;
+                       font-size: 11px;
+                       padding: 2px 4px; }
+  .draw-row > span { flex: 0 0 auto;
+                       font-variant-numeric: tabular-nums;
+                       color: var(--muted);
+                       text-align: right;
+                       min-width: 36px; }
+  .layer-toggle { display: flex; align-items: center; gap: 6px;
+                   padding: 4px 0; cursor: pointer; }
+  .layer-toggle input { margin: 0; }
+  .swatch { display: inline-block; width: 16px; height: 3px;
+             vertical-align: middle; background: #000; margin-right: 4px; }
+  .swatch.thin { height: 1px; }
+  .swatch.dashed { border-top: 2px dashed #808080; background: none; height: 0; }
+  .mode-pill { display: inline-block; padding: 3px 8px; border-radius: 12px;
+                background: var(--accora-teal-pale); color: var(--accora-teal);
+                font-size: 11px; font-weight: bold; margin-right: 6px; }
+  .canvas-wrap { position: relative; overflow: hidden; background: white; }
+  .webgl-wrap  { position: relative; overflow: hidden;
+                   background: #f3f4f6; }
+  .webgl-wrap canvas { width: 100%; height: 100%; display: block;
+                         cursor: grab; }
+  .webgl-wrap canvas.dragging { cursor: grabbing; }
+  .three-toolbar { position: absolute; top: 10px; left: 50%;
+                     transform: translateX(-50%); background: rgba(255,255,255,0.95);
+                     padding: 6px 12px; border-radius: 14px;
+                     border: 1px solid var(--line); font-size: 12px;
+                     display: flex; gap: 8px; align-items: center;
+                     font-family: ui-monospace, Consolas, monospace;
+                     max-width: calc(100% - 40px); }
+  .three-toolbar .tb-sep { width: 1px; height: 18px; background: var(--line);
+                             margin: 0 2px; }
+  .three-toolbar .tb-label { font-family: Arial, sans-serif; color: var(--muted);
+                               font-size: 12px; }
+  .three-toolbar select { font-size: 12px; padding: 2px 4px;
+                            border: 1px solid var(--line); border-radius: 3px;
+                            background: white; cursor: pointer; }
+  .three-toolbar button { font-family: Arial, sans-serif; font-size: 12px;
+                            padding: 3px 10px; border: 1px solid var(--line);
+                            background: white; border-radius: 3px;
+                            cursor: pointer; }
+  .three-toolbar button:hover { background: var(--accora-teal-pale); }
+  .three-toolbar button.primary { background: var(--accora-teal); color: white;
+                                    border-color: var(--accora-teal);
+                                    font-weight: 600; padding: 4px 14px; }
+  .three-toolbar button.primary:hover { background: #006e58; }
+  .three-toolbar button:disabled { opacity: 0.6; cursor: wait; }
+  .three-toolbar button.primary.unavailable {
+    background: #c0c0c4; border-color: #c0c0c4; color: #fff; cursor: help;
+  }
+  /* Hide 2D-only header controls when in 3D-only layout (Split keeps them) */
+  body.layout-3d #btn-smart,
+  body.layout-3d #btn-detailed,
+  body.layout-3d #btn-hidden,
+  body.layout-3d #mode-pill,
+  body.layout-3d #btn-annotate,
+  body.layout-3d #btn-clear,
+  body.layout-3d #btn-export { display: none; }
+  /* In 3D-only mode the right sidebar (layer toggles, callouts) doesn't
+     apply; reclaim the space for the 3D canvas. */
+  body.layout-3d aside.right { display: none; }
+  body.layout-3d main {
+    grid-template-columns: 240px 1fr;
+    grid-template-areas: "left center";
+  }
+  /* Tree search input */
+  #tree-search { width: 100%; padding: 4px 6px; font-size: 12px;
+                   border: 1px solid var(--line); border-radius: 3px;
+                   font-family: ui-monospace, Consolas, monospace; }
+  #tree-search:focus { outline: none; border-color: var(--accora-teal); }
+  /* Hide tree nodes that don't match the current search */
+  .tree-root li.filtered-out { display: none; }
+  /* Saved views panel */
+  .saved-views-list { list-style: none; padding: 0; margin: 0;
+                        font-size: 12px; max-height: 220px; overflow-y: auto;
+                        border: 1px solid var(--line); border-radius: 3px; }
+  .saved-views-list li { display: flex; align-items: center; gap: 4px;
+                           padding: 4px 6px; border-bottom: 1px solid #f0f0f0;
+                           font-family: ui-monospace, Consolas, monospace; }
+  .saved-views-list li:hover { background: var(--accora-teal-pale); }
+  .saved-views-list .name { flex: 1; cursor: pointer; }
+  .saved-views-list button { font-size: 11px; padding: 2px 6px;
+                               border: 1px solid var(--line); background: white;
+                               border-radius: 3px; cursor: pointer; }
+  /* Selection styling panel */
+  #style-panel button { font-size: 12px; padding: 3px 8px;
+                          border: 1px solid var(--line); background: white;
+                          border-radius: 3px; cursor: pointer; }
+  #style-panel button:hover { background: var(--accora-teal-pale); }
+  #view-name { font-family: ui-monospace, Consolas, monospace; }
+  #btn-save-view { font-size: 12px; padding: 3px 8px;
+                     border: 1px solid var(--line); background: white;
+                     border-radius: 3px; cursor: pointer; }
+  #btn-save-view:hover { background: var(--accora-teal-pale); }
+  /* Onshape tree */
+  .tree-root { list-style: none; padding: 0; margin: 0; font-size: 12px;
+                font-family: ui-monospace, Consolas, monospace; }
+  .tree-root ul { list-style: none; padding-left: 14px; margin: 0;
+                    border-left: 1px solid #eee; }
+  .tree-row { display: flex; align-items: center; gap: 4px;
+                padding: 2px 4px; cursor: pointer; border-radius: 2px; }
+  .tree-row:hover { background: var(--accora-teal-pale); }
+  .tree-row.matched { color: var(--accora-teal); }
+  .tree-row.highlighted { background: var(--accora-teal); color: white; }
+  .tree-row .twisty { display: inline-block; width: 10px;
+                        font-family: monospace; color: var(--muted); }
+  .tree-row .icon { font-size: 10px; color: var(--muted); width: 10px; }
+  .tree-row.is-assembly .icon { color: var(--accora-teal); }
+  .svg-pane { position: absolute; inset: 0; display: none; }
+  .svg-pane.active { display: block; }
+  .svg-pane svg { width: 100%; height: 100%; cursor: grab; }
+  .svg-pane svg.panning { cursor: grabbing; }
+  .svg-pane svg.annotate-mode { cursor: crosshair; }
+  /* Hovering a part: switch to the pointing-hand cursor so it's obvious
+     where the click-target is.  The .layer-hit pads each part out to a
+     3 mm hit area, so the cursor flips well before you reach the thin
+     visible stroke. */
+  .svg-pane svg .part { cursor: pointer; }
+  .svg-pane svg.panning .part { cursor: grabbing; }
+  /* WYSIWYG: render visible strokes at a CONSTANT thickness on screen,
+     matching the exported SVG (which uses non-scaling-stroke).  Two
+     wins: (1) the editor preview shows the real, placement-independent
+     line weights; (2) zooming no longer fattens the lines.  Scoped to
+     visible layers via :not([class*="hit"]) so the padded click-target
+     layers (layer-hit / layer-hit-hull) keep their full hit area. */
+  body.wysiwyg-weights .svg-pane svg g[class*="layer-"]:not([class*="hit"]) path {
+    vector-effect: non-scaling-stroke;
+  }
+  /* layer visibility classes (toggled on <svg>) */
+  svg.hide-smooth_v .layer-smooth_v { display: none; }
+  svg.hide-sharp_v .layer-sharp_v { display: none; }
+  svg.hide-outline_v .layer-outline_v { display: none; }
+  svg.hide-hidden_sharp .layer-hidden_sharp { display: none; }
+  svg.hide-hidden_outline .layer-hidden_outline { display: none; }
+  /* part highlight: NO automatic stroke change.  The silhouette layer
+     (drawn by applySilhouetteFill) is responsible for the bold outer
+     edge using the user's chosen colour/width.  Without this rule,
+     internal features (slits, screw cuts, mount lines) stay at their
+     normal stroke -- otherwise a complex part looks like "loads of
+     bits" all bolded.  We still pull non-highlighted parts back to
+     0.35 opacity so the selected part stands out.
+
+     Previously this was 0.18 which made smooth-tangent edges on
+     dim'd parts essentially invisible (smooth_v is naturally thin
+     and grey, multiplying with 0.18 made it disappear).  0.35 keeps
+     structure readable while still de-emphasising. */
+  svg .part.dim path { opacity: 0.35; }
+  /* Don't dim smooth tangent lines at all -- they're already faint
+     and dimming them kills the part's structural readability when
+     the user selects a single part to inspect. */
+  svg .layer-smooth_v .part.dim path { opacity: 0.55; }
+  /* Part-colour-map debug mode (toggle via 🎨 regions button).
+     Per-part stroke colour is applied to the .part wrapper via inline
+     style by the JS toggle (so the rule scales to any part count
+     without CSS bloat).  In this mode we hide the heavy overlays
+     (smooth, hidden, assembly + persistent silhouette) so the colours
+     read cleanly. */
+  body.show-part-regions .svg-pane svg .layer-smooth_v,
+  body.show-part-regions .svg-pane svg .layer-hidden_outline,
+  body.show-part-regions .svg-pane svg .layer-hidden_sharp,
+  body.show-part-regions .svg-pane svg .layer-assembly_silhouette,
+  body.show-part-regions .svg-pane svg .layer-persistent-silhouette,
+  body.show-part-regions .svg-pane svg .layer-silhouette
+    { display: none !important; }
+  body.show-part-regions .svg-pane svg .part path
+    { opacity: 1 !important; stroke-width: 0.6mm !important; }
+  /* annotations */
+  .annotation-layer { pointer-events: all; }
+  .annotation-layer .arrow { stroke: var(--accora-teal); stroke-width: 0.7;
+                              fill: none; }
+  .annotation-layer .arrowhead { fill: var(--accora-teal); stroke: none; }
+  .annotation-layer text { fill: var(--accora-teal); font-family: Arial;
+                            font-size: 14px; font-weight: bold; }
+  .annotation-layer .anno-group { cursor: pointer; }
+  .annotation-layer .anno-group:hover .arrow { stroke-width: 1.0; }
+  footer { position: absolute; bottom: 8px; left: 50%;
+            transform: translateX(-50%); background: rgba(255,255,255,0.95);
+            padding: 4px 12px; border-radius: 12px; font-size: 11px;
+            color: var(--muted); border: 1px solid var(--line); }
+  .tooltip { position: absolute; background: #2a2a2c; color: white;
+              padding: 4px 8px; border-radius: 3px; font-size: 11px;
+              pointer-events: none; opacity: 0; transition: opacity 0.1s;
+              z-index: 10; }
+  .tooltip.show { opacity: 1; }

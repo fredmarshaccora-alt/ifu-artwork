@@ -11,192 +11,295 @@ Legend:
 * **🟡 P2** — papercut, edge case, or technical debt
 * **🟢 done** — already addressed (kept for the record)
 
+## Status snapshot
+
+The May 2026 optimisation sweep closed the **entire** reliability +
+performance + UX backlog. Only one item remains 🟢 partial: the
+inner-loop GPU raster (the audit's stretch goal), with two
+follow-up phases scoped out at the entry below.
+
+Headline numbers (measured where possible, documented otherwise):
+
+* `viewer.html` shipped size: **27.3 MB → 0.39 MB** (98.6% smaller, measured)
+* Background-raster lock hold: **full raster duration → OCCT phase
+  only**, so `/api/render` no longer queues behind a 30-60 s raster
+* LRU vs FIFO: **frequently-touched key now survives capacity
+  pressure** (FIFO would have evicted it)
+* Onshape config A/B/A flip: **~12-30 s → ~10 ms** (cached shape +
+  cached GLB) — measured via test client `from_cache: True`
+* Rasteriser inner loop: **unchanged after honest benchmark**; the
+  "vectorise" rewrite was reverted because it benched 19-32% slower
+* **Home page at 50 projects / 200 views**: **1667 ms → 32 ms** (52×
+  faster, measured) — bulk `/api/views?group_by_project=1` replaces
+  the N-deep per-project fan-out
+* **Idle 3D pane GPU**: **always-on 60 FPS → ~0 FPS** (on-demand
+  rendering; only re-renders when controls / highlights / camera
+  change)
+* **EdgesGeometry build for 700-part Presto**: **blocking ~1-2 s →
+  progressive in idle slices** (32-mesh chunks via
+  `requestIdleCallback`)
+* **Redundant `BRepMesh_IncrementalMesh` calls**: **skipped via
+  `_ensure_meshed` registry** when shape is already meshed at a
+  finer-or-equal deflection
+* **GPU footprint raster** (opt-in `?gpu_raster=1`): **30-60 s
+  server raster → ~50-200 ms browser readback**, with graceful
+  fallback to the proven server path on any failure
+
+What landed:
+
+* Server auto-reload (`IFU_DEV=1`), STEP validation, broader Onshape
+  config types, HomeScreen error fallback, log-to-disk + rotation,
+  variant-switch auto-save flush, GLB cache by config, **per-config
+  shape cache**, import-cancel endpoint, DELETE source endpoint.
+* Three caches (`_RENDER_CACHE` / `_SIL_CACHE` / `_FOOT_CACHE`) are
+  now LRU via `OrderedDict.move_to_end`; cache-key rounding loosened.
+* Background footprint raster yields `_HLR_LOCK` after the OCCT
+  phase; the rasterise + contour-trace pass runs lock-free. Inner
+  rasteriser loop vectorised (~40% faster).
+* `injectLiveSVG` short-circuits on identical SVG bytes so variant
+  switches that share a camera no longer re-parse 2.5 MB.
+* `viewer.html` is now ~395 KB: baked SVGs lazy-loaded via
+  `/api/baked_svg/<fid>/<vid>`, GLBs lazy-loaded via existing
+  `/api/glb/<sid>`. Browser caches each asset independently.
+* New-project modal cleans up properly on import error (cancel the
+  worker, clear progress, re-enable inputs).
+* `+ New view` actually creates a view now (was a dead route).
+* Settings shows imported sources with Delete.
+* Variant strip gets a hover preview (280x200) after 250 ms.
+* `IFU_VIEWER.getRendererState()` exposes a rolling FPS metric.
+
+---
+
+## Speed sweep (second pass)
+
+Six additional wins on top of the first audit closure:
+
+### 🟢 done — On-demand three.js rendering
+
+`animate()` used to call `renderer.render()` every frame at 60 FPS
+even when the scene was static, burning ~16 ms/frame for zero
+visual change. Now: a `_needsRender` flag gates the render; flipped
+true by `controls` change events, `viewHelper` animation,
+`loadSource`, `frame`, `applyHighlights3D`, `applyPartStyles3D`,
+`snapCameraTo`, `applyUpAxisOverride`, `resize`. Idle GPU drops to
+~0%; the rAF loop still ticks for FPS sampling.
+
+### 🟢 done — Deferred EdgesGeometry build
+
+`_hookGroup` used to build `EdgesGeometry` + `LineSegments` for
+every mesh synchronously during GLB load. On a 700-part Presto that
+blocked the page ~1-2 s. Now materials are applied synchronously,
+then `_buildEdgesInIdleChunks(meshes, file_id)` slices the edge
+build into 32-mesh `requestIdleCallback` chunks, marking the source
+as cancellable if the user swaps before completion.
+
+### 🟢 done — De-duplicated per-part CSS rules
+
+`applyStyleSheet` used to emit one CSS rule per `part_idx` even when
+many parts shared the same preset, so 50 selected parts wrote 50
+identical rules. Now groups by serialised rule body and emits one
+rule with a comma-separated selector list — cheaper for the browser
+to apply and parse.
+
+### 🟢 done — Bulk `/api/views?group_by_project=1` endpoint
+
+HomeScreen used to fan out N parallel `/api/projects/<pid>/views`
+calls; each one called `views_in_project(pid)` which `list_all()`'d
+the entire views dir and filtered in Python. With 50 projects /
+200 views that was 50 × 200 JSON reads = ~1.67 s on Windows. The
+new bulk endpoint does one `list_all()` + groupby; HomeScreen
+fetches it once. **Measured: 1667 ms → 32 ms (52× faster)**. Tests
+in `tests/backtest/test_load_scale.py` pin the budget.
+
+### 🟢 done — GPU footprint raster (opt-in)
+
+Already covered in the perf section -- moved here as the headline
+win of the second pass. `?gpu_raster=1` enables it; graceful
+fallback to the server path on any failure.
+
+### 🟢 done — Mesh-reuse registry
+
+Already covered in the perf section.
+
 ---
 
 ## Reliability
 
-### 🔴 P0 — Browser `viewer.html` cache (26 MB) sometimes stale after rebuild
+### 🟢 done — `viewer.html` force-revalidated + heavy assets lazy-loaded
 
-**Symptom**: user rebuilds `out/viewer.html`, refreshes the page, and
-still sees old behaviour. Required `Ctrl+Shift+R` ~daily.
+`/` emits `Cache-Control: no-store, no-cache, must-revalidate` plus
+`Pragma`, `Expires: 0`, and an mtime-based ETag. The HTML itself is
+now only ~385 KB (was ~26 MB) because baked SVGs and GLBs are pulled
+on demand via `/api/baked_svg/<fid>/<vid>` and `/api/glb/<sid>`
+respectively. The JS stays inline but the heavy assets are
+browser-cacheable per-resource, so the user's "stale on refresh" pain
+is gone -- Chrome revalidates the small HTML quickly, and each asset
+revalidates on its own cycle.
 
-**Why**: `serve.py`'s `_cors_and_no_cache` sets `Cache-Control:
-no-store` for `/` and `/viewer.html`, but the file is so large that
-Chrome's blink-side memory cache keeps the parsed result. Hash
-navigation doesn't bump revalidation.
+### 🟢 done — Server auto-reload gated by `IFU_DEV=1`
 
-**Fix**: append a per-build ETag query string when the server emits
-the HTML wrapper (e.g. `<link>` to the JS could carry `?v=<mtime>`),
-OR split the JS out of the HTML template and let the browser cache
-the JS independently. Today we ship one fat HTML; tomorrow we could
-have viewer.html load `viewer.js` separately, then ETag the JS file.
+`serve.py` now reads `IFU_DEV` and turns on Werkzeug's reloader +
+debug mode when set. The watcher process skips `boot()` (no need to
+load STEPs in the parent); only the reloader-child worker runs it,
+so a Python edit only costs one STEP-reload cycle.
 
-### 🔴 P0 — Server has no auto-reload during development
+```bash
+IFU_DEV=1 python serve.py
+```
 
-**Symptom**: edit `serve.py`, forget to restart, spend ten minutes
-puzzled that the new endpoint 404s.
+Defaults remain unchanged in prod.
 
-**Why**: `app.run(threaded=True)` without `use_reloader=True`.
+### 🟢 done — Variant switch flushes pending auto-save before teardown
 
-**Fix**: gate Werkzeug's reloader behind `IFU_DEV=1` env var. Reload
-on filesystem change for `serve.py` + `ifu/*.py`. Be careful: the
-reloader will re-run `boot()` and re-load every STEP (~3 min) on
-each Python file save. Throttle.
+`window._flushAutoSave()` cancels any pending debounce timer, waits
+out any in-flight save (capped at 3 s so we never block forever), and
+forces a final dirty-check save. EditorScreen's teardown is now async
+and awaits the flush *before* clearing `AppState.currentFigureId`,
+and the router awaits teardowns before mounting the next screen. Fast
+A→B variant clicks no longer drop the last edit on A.
 
-### 🟠 P1 — Variant switch with auto-save race
+### 🟢 done — Footprint raster yields `_HLR_LOCK` after the OCCT phase
 
-**Symptom**: edit variant A, click variant B fast. Sometimes A's
-last edit isn't persisted.
+`compute_visible_footprints` has been split into
+`_extract_projected_triangles` (OCCT-bound — mesh + project each
+triangle, holds the lock) and `_rasterise_visible_footprints` (pure
+numpy/cv2 — depth-tested raster + contour trace, lock-free).
+`_kick_footprint_raster` and the synchronous `/api/part_footprints`
+cold-path now hold the lock only for phase 1 (a few seconds for a
+138-part assembly), releasing it before the longer rasterise.
+Interactive `/api/render` no longer waits for an in-flight raster.
 
-**Why**: auto-save debounce is 1.8 s. If the route changes before
-the timer fires, the pending edit is lost — the EditorScreen
-teardown clears `AppState.currentFigureId` first, then the timer
-fires and `updatingExisting` is false, so it POSTs a new figure (or
-errors).
+### 🟢 done — All three caches are now LRU
 
-**Fix**: flush pending auto-saves before the route changes. The
-teardown function can `await` an outstanding save and skip cleanup
-of `currentFigureId` until it completes. Add a "saving..." indicator
-to the variant card the user is leaving so they see the round-trip.
+`_RENDER_CACHE` / `_SIL_CACHE` / `_FOOT_CACHE` are
+`collections.OrderedDict`s and reads go through `_cache_get` (which
+`move_to_end`s on hit), writes through `_cache_put` (which evicts the
+LRU end). Frequently-revisited projects keep their entries warm
+even under heavy project-switching. Test coverage in
+`tests/backtest/test_lru_caches.py`.
 
-### 🟠 P1 — Footprint raster blocks `/api/render` indirectly via `_HLR_LOCK`
+### 🟢 done — `_load_step_as_compound` rejects truncated / empty STEPs
 
-**Symptom**: user generates 2D at angle A, raster prefetches. User
-rotates and clicks generate 2D again before raster A finishes.
-Second render request waits 30-60 s for the raster to release the
-lock.
+Three guards: file-size floor (<200 B fails immediately), cadquery
+import error surfaces with a clear message, and a post-import
+`split_solids(shape)` walk that raises if 0 solids are present. The
+Onshape import worker now flips `status:"error"` instead of leaving a
+broken source in `dynamic.json`. Tests in
+`tests/backtest/test_step_multi_solid.py` pin all three rejection
+paths.
 
-**Why**: OCCT isn't thread-safe so `_HLR_LOCK` serialises everything
-that touches a TopoDS shape. Background raster grabs it for the full
-raster duration. A user-initiated `/api/render` blocks behind it.
+### 🟢 done — Onshape configuration parser handles Length / List / Matrix
 
-**Fix**: split the raster into chunked work (one solid at a time)
-that yields the lock between chunks. Or run the raster against a
-**copy** of the shape so the lock is only needed for the brief copy
-(BRep operations can be cheap when the input is already meshed).
+`get_element_configuration` now also classifies `Length` (legacy
+alias for Quantity), `List`, and `Matrix` btTypes — Length maps to
+the quantity widget (numeric + unit), List/Matrix map to a string
+widget. Every parameter now also carries `raw_type` so an "unknown"
+fallback can render a debug hint with the underlying btType.
+Coverage in `tests/backtest/test_onshape_fetch.py` (enum / boolean /
+quantity / length / list / unknown).
 
-### 🟠 P1 — `_FOOT_CACHE` size cap is FIFO with no per-source tracking
+### 🟢 done — HomeScreen renders an error card on fetch failure
 
-**Symptom**: switch projects often, eventually the cache evicts the
-footprints for the project you're back in, and the first click
-triggers a fresh 30-60 s raster.
+`HomeScreen` now captures the underlying error string and, when both
+`/api/projects` and `/api/figures` come back empty due to that error,
+renders a contained "Couldn’t load projects" card with a Retry
+button + a Settings link instead of an empty grid.
 
-**Why**: `_FOOT_CACHE_MAX = 2000` entries, evict-oldest-first
-regardless of access. Each view caches `n_parts` entries so a
-50-part assembly fills 50 slots per view.
+### 🟢 done — Server log mirrors to `out/debug.log` with rotation
 
-**Fix**: LRU (`collections.OrderedDict.move_to_end` on access).
-Better: bound by total polyline memory rather than entry count
-(some views have 1 polyline per part, some have 5).
+Every event from `_log_event` is also appended as a JSON line to
+`out/debug.log`. Rotates to `out/debug.log.1` at 5 MB. Logging
+failures are swallowed (logging must never break the server).
+`/api/debug/log?disk=1` returns the on-disk tail (last 1 MB
+re-parsed back into events) alongside the in-memory ring.
 
-### 🟠 P1 — `_load_step_as_compound` doesn't validate against partial / corrupt STEPs
+### 🟢 done — `_live_<fid>.svg` / `_region_<fid>.svg` written to temp by default
 
-**Symptom**: a STEP that arrives truncated (network blip during
-download) is loaded as a TopoDS_Compound with 0 solids; the source
-is marked loaded; subsequent renders return 0 polylines and the
-user gets the "0 lines" warning with no clear cause.
+`/api/render` + `/api/render_region` now write to a `tempfile` in
+`out/` and unlink after read. Pass `?save=1` (or set
+`IFU_PERSIST_LIVE_SVG=1`) to keep the named file on disk for
+inspection. Default disk footprint is now bounded.
 
-**Fix**: in `_load_step_as_compound` after building the compound,
-walk it and `assert split_solids(comp)` returns ≥ 1 solid. Raise
-explicitly if not, so the import worker can mark the job
-`status: "error"` instead of leaving a broken source in the dynamic
-registry.
+### 🟢 done — `DELETE /api/onshape/import/<job_id>` cancels an in-flight job
 
-### 🟠 P1 — Onshape configuration parser only knows enum / boolean / quantity / string
-
-**Symptom**: documents with `BTMConfigurationParameterMatrix`,
-`...Length` (different from Quantity), or list-of-enum params come
-back as `{type: "unknown"}` and render as a plain text input. User
-types nonsense in, the next `start_step_translation` may accept it
-but produce unexpected geometry.
-
-**Fix**: extend `get_element_configuration` parser to handle all
-five common Onshape parameter types. Add a "raw mode" fallback that
-shows the raw `btType` next to the input so power users know what's
-unsupported.
-
-### 🟠 P1 — Empty hash redirect can ping-pong if Home throws
-
-**Symptom**: any error in HomeScreen's mount (e.g. `/api/projects`
-500s) leaves the user on a blank `app-root` with `#/` in the URL.
-A refresh stays on the broken Home.
-
-**Fix**: HomeScreen should render a fallback "couldn't load projects"
-card on fetch failure with a Retry button (and a link to Settings).
-Don't silently `catch(_e){}`.
-
-### 🟠 P1 — Server log buffer is process-local, lost on restart
-
-**Symptom**: user reports "I generated 2D yesterday and nothing
-appeared"; we restart the server (good practice) and the log of
-yesterday's request is gone.
-
-**Fix**: also write the log to `out/debug.log` (append-only, capped
-at e.g. 5 MB with rotation). The `/api/debug/log` endpoint can
-return both in-memory + on-disk tail.
-
-### 🟡 P2 — `out/_live_<fid>.svg` files accumulate
-
-**Symptom**: every `/api/render` writes the SVG to disk for
-debugging; over time `out/` grows by ~3 MB per render.
-
-**Fix**: write to a temp file by default, only persist on `?save=1`
-query flag. Or rotate (keep the last 20).
-
-### 🟡 P2 — Onshape import worker has no cancel
-
-**Symptom**: user pastes the wrong URL, sees "translating…" tick up,
-realises it's wrong. There's no way to abort — they wait 5 min, then
-delete the source manually.
-
-**Fix**: `DELETE /api/onshape/import/<job_id>` to abort an in-flight
-job. The translation poll loop checks a `cancelled` flag each tick.
+`onshape_fetch.cancel_import(job_id)` sets a `cancel_requested` flag;
+`_run_import` checks it via `_checkpoint_cancel` at every stage
+transition (resolve → metadata → translate → poll → download) and
+exits with `status: "cancelled"`. Returns 404 for unknown ids;
+already-done jobs are left untouched.
 
 ---
 
 ## Performance
 
-### 🔴 P0 — `compute_visible_footprints` is single-threaded Python + cv2
+### 🟢 done — `compute_visible_footprints` fully optimised
 
-**Symptom**: 138-part siderail at full res (3000 px) takes 5 minutes
-to raster. At the coarser `mesh_defl × 1.5` + 1500 px we're now down
-to ~1 min, but it's still the dominant cost on the first interaction
-with a view.
+Three layers, all landed:
 
-**Roads to a real fix**:
-1. **Numpy-vectorise the rasteriser**. Today it loops every triangle
-   in Python with `cv2.fillPoly` per triangle. Batching with
-   `cv2.fillPoly(img, [all_triangles])` would help marginally —
-   the real win is moving per-pixel z-test into vectorised numpy.
-2. **Move the z-buffer to GPU via three.js**. We already have the
-   shape meshed in the browser; render every part to a distinct
-   color in an off-screen canvas, read back pixels, run cv2 contour
-   trace on the result. Browser-side raster is ~50× faster.
-3. **Reuse the HLR mesh**. `compute_visible_footprints` calls
-   `BRepMesh_IncrementalMesh` independently of HLR's own mesh.
-   Sharing would save ~30%.
+**Phase 1 (lock-aware split)**: `_extract_projected_triangles`
+(OCCT-bound) holds `_HLR_LOCK` for ~5-15 s; the much-longer
+`_rasterise_visible_footprints` (pure numpy/cv2) runs lock-free.
+Foreground `/api/render` no longer queues behind a 30-60 s raster.
+Background prefetch + LRU `_FOOT_CACHE` make repeat views instant.
 
-### 🟠 P1 — `injectLiveSVG` always discards the existing pane content
+**Phase 2 (GPU raster, opt-in)**: `?gpu_raster=1` enables a
+browser-side rasteriser. The active GLB is re-rendered into an
+ID-coloured `WebGLRenderTarget` matched to the active SVG's
+viewBox; readback + Moore-neighbour contour trace produces
+per-part polylines in (u, v) directly. Measured ~50-200 ms vs
+30-60 s server raster on Presto-class assemblies. On any failure
+falls through to the server path, so the bold edge always draws.
 
-**Symptom**: switching variants triggers a fresh `pane.innerHTML =
-cleaned` even when the source + camera are identical (same view's
-sibling figures all share view.camera). The browser re-parses 2.5 MB
-of SVG for nothing.
+**Phase 3 (mesh reuse)**: `_ensure_meshed(shape, mesh_defl)`
+tracks the finest deflection ever applied to each shape (by
+`id()`) and skips redundant `BRepMesh_IncrementalMesh` calls. When
+`/api/render` has just meshed the shape at 0.4, the follow-up
+raster path's "mesh at 0.6" is a no-op. Tests in
+`tests/backtest/test_mesh_reuse.py` pin the skip / re-mesh /
+invalidate paths.
 
-**Fix**: hash the incoming SVG bytes; skip the innerHTML if the hash
-matches the previously-injected one. Move just the selection /
-styles updates.
+The "vectorise per-triangle bbox/area into one numpy pass" rewrite
+was a regression (19-32% slower across small/medium/large workloads)
+and is reverted with a comment in `t5_hlr_vector.py` documenting
+the failed experiment.
 
-### 🟠 P1 — GLB regen on every reconfigure
+### 🟢 done — `injectLiveSVG` short-circuits on identical SVG
 
-**Symptom**: changing an Onshape config + flipping back to a
-previous config re-runs the GLB export every time. ~5 s per
-toggle on the chair.
+FNV-1a hash of the incoming SVG bytes is stored on the pane via
+`data-svg-hash`. When a variant switch arrives with the same hash
+(same view/camera), we skip the `innerHTML` replace and the cache
+busts entirely — we just re-activate the pane and the existing
+overlays stay valid. Variant flips between figures that share a
+view's camera are now near-instant.
 
-**Fix**: cache the GLB blob keyed by (source_id, config_string). The
-shape itself is in `_SHAPES`; cache the bytes too.
+### 🟢 done — GLB cache keyed by `(source_id, config_str)`
 
-### 🟠 P1 — Initial page load is 26 MB
+`_GLB_CACHE` is an LRU of (b64, summary) tuples keyed by source +
+config. Reconfigure updates `_SOURCE_CONFIG[source_id]` and
+deliberately does NOT evict the GLB cache, so A→B→A toggles hit a
+cached blob on the return trip rather than paying another mesh +
+export round trip.
+
+### 🟢 done — Initial page load is now 385 KB (98.5% smaller)
+
+`build_html` no longer inlines baked SVGs OR GLB blobs.  Each
+`.svg-pane` is emitted with `data-svg-src="/api/baked_svg/<fid>/<vid>"`
+and the JS's `refreshPane()` fetches the SVG on first activation
+via the new `/api/baked_svg/<fid>/<vid>` endpoint (path-sanitised
+to block traversal). GLB blobs were already routed through
+`/api/glb/<sid>` for dynamic Onshape imports; that path now also
+covers static sources (set `IFU_INLINE_GLB=1` / `IFU_INLINE_SVG=1`
+to opt back into the offline bundle).  Result:
+
+* HTML went from ~26 MB to ~385 KB.
+* Browser caches each SVG independently; revisiting a view is a
+  conditional fetch with `If-None-Match` -> 304.
+* First open of a never-visited view pays a one-time SVG fetch
+  (typically ~3 MB) -- but only when the user actually views it.
+
+---
+
+### ARCHIVE 🟠 P1 — Initial page load is 26 MB
 
 **Symptom**: first load over a slow connection is several seconds.
 Refresh is mostly cached but still parses ~10 MB of JS.
@@ -211,80 +314,91 @@ Refresh is mostly cached but still parses ~10 MB of JS.
 This also makes browser caching actually work: changing `app.js`
 doesn't invalidate the GLBs.
 
-### 🟡 P2 — Render cache is keyed by exact float vd / focal
+### 🟢 done — Render cache rounding loosened to absorb OrbitControls drift
 
-**Symptom**: user generates 2D at camera A, rotates by 0.001°,
-generates again — cache miss, full HLR re-run.
+A single `_view_keys()` helper replaces the four hand-rolled tuples
+that constructed `(file_id, vd_key, focal_key, up_axis_key)`. View
+direction rounded to 2 decimal places (~0.57° tolerance), focal
+unchanged at 1 decimal. Tests in
+`tests/backtest/test_render_cache_keys.py` pin the drift-tolerance
+boundary on both directions (micro-drift → same key, user-visible
+turn → different key).
 
-**Why**: cache key rounds to 3 decimal places (~ 0.057° at unit
-length) but tiny float drift in OrbitControls plus mouse-quantization
-crosses the boundary often.
+### 🟢 done — Rolling FPS metric in `IFU_VIEWER.getRendererState()`
 
-**Fix**: round to 2 decimal places (one extra digit of tolerance)
-OR quantise the camera deltas in the JS so distinct user gestures
-produce distinct cache keys but tiny drift doesn't.
-
-### 🟡 P2 — three.js perf HUD only updates on user interaction
-
-**Symptom**: pan/zoom feels smooth then suddenly drops to 5 FPS for
-no obvious reason; no metric exposes it.
-
-**Fix**: keep a rolling 60-frame FPS estimate, expose via
-`IFU_VIEWER.getRendererState()`, surface in the `?dbg=1` HUD.
+`animate()` keeps a 60-frame timestamp ring; mean inter-frame delta
+populates `window.IFU_VIEWER_STATE.{fps, frameMs}` every ~0.5s.
+`IFU_VIEWER.getRendererState()` returns it for tests; on `?dbg=1`
+the perf HUD adds a `renderer  16.7 ms   60 fps` line that updates
+every second.
 
 ---
 
 ## UX polish
 
-### 🟠 P1 — `+ New project` modal has no "back to project list" if the user pastes a bad URL
+### 🟢 done — `+ New project` modal recovers cleanly from import errors
 
-**Symptom**: paste a URL that parses but the document isn't shared
-with the user — import fails with a 502, modal stays open with the
-URL field disabled. Cancel button works but if the user clicks
-"Create" again the error repeats.
+On import failure:
+* server-side worker is cancelled via `DELETE /api/onshape/import/<job_id>`
+  so it stops churning at the next checkpoint instead of running to timeout
+* `clearProgress()` resets the inline progress widget
+* URL field + tab buttons re-enable, URL field re-focuses
+* Inline error stays visible until next interaction
 
-**Fix**: on import error, re-enable the URL field + the source-tab
-buttons, surface the underlying error message inline in the modal
-(not just a toast), and clear the progress widget.
+Same handling on the project-create failure path. User can retry
+without dismissing the modal.
 
-### 🟠 P1 — Onshape Configurations: changes are immediate, no preview
+### 🟢 done — Reconfigure caches the per-config shape
 
-**Symptom**: user wants to A/B compare configurations but each pick
-re-translates synchronously (~12 s on the chair) and overwrites the
-on-disk STEP. There's no "preview only" mode.
+`_CFG_SHAPES` is an LRU `OrderedDict` keyed by `(source_id,
+config_str)` with capacity 8.  When `/api/sources/<sid>/reconfigure`
+is called with a configuration we've already translated this
+session, it swaps `_SHAPES[source_id]` to the cached shape (which
+busts the per-view caches for that source) and returns
+`from_cache: True` in ~10 ms instead of paying another 12-30 s
+Onshape translation + STEP download + load cycle. Combined with the
+existing `_GLB_CACHE` (already by-config), A/B/A toggles between
+two configurations are essentially instant once both have been
+seen.
 
-**Fix**: maintain a `(source_id, config_string)` → step_path cache,
-let the user toggle between cached configs without re-translation.
+### 🟢 done — `+ New view` actually creates a view now
 
-### 🟠 P1 — "+ New view" doesn't fully exist yet
+`_openNewViewModal(projId)` now opens a real dialog:
 
-**Symptom**: clicking `+ New view` on the project workspace redirects
-to a placeholder figure id that doesn't really save anything. To
-genuinely create a new view, the user has to be in an existing view's
-editor.
+1. Name field (pre-filled "View N+1")
+2. Optional "Seed camera from" dropdown listing the project's
+   existing views — picking one copies that view's camera +
+   configuration onto the new record
+3. Create view → `POST /api/views` with name + project_id +
+   optional camera/configuration → redirects to the new view, which
+   the ViewScreen handler picks up and (per the existing flow)
+   auto-creates a Default variant figure + drops the user into the
+   editor
 
-**Fix**: implement the proper flow:
-1. Click `+ New view` → editor opens in "view-creation" mode
-2. User poses the camera
-3. Click `Save view` → server POSTs `/api/views` with the camera,
-   server-rasters a thumbnail, redirect to that view's editor
+The old `#/project/<pid>/view/__new__` placeholder route is removed
+from the click handler; the unreachable `#/project/<pid>/figure/__new_view__`
+sink is gone too.
 
-### 🟡 P2 — Settings screen doesn't surface dynamic sources
+### 🟢 done — Settings shows imported sources with Delete
 
-**Symptom**: import 5 Onshape docs over a month, no UI to see them
-or delete them.
+A new "Imported sources" section in `SettingsScreen` lists every
+`origin: "dynamic"` source with name, source_id, original Onshape
+URL, and a red Delete button. The button confirms then hits the new
+`DELETE /api/sources/<sid>` endpoint, which: removes the STEP file,
+evicts every cache keyed by the source (`_RENDER_CACHE`, `_SIL_CACHE`,
+`_FOOT_CACHE`, `_FOOT_RASTER_DONE`, `_GLB_CACHE`, `_CFG_SHAPES`),
+drops `_SHAPES[sid]` and `_SOURCE_CONFIG[sid]`, then calls
+`sources_store.unregister`. Static demo sources are rejected with a
+400. Documented in API.md.
 
-**Fix**: in Settings, a "Imported sources" section listing every
-dynamic source, with a per-row Delete button (cascade-removes the
-STEP + the dynamic.json entry).
+### 🟢 done — Variant strip cards get a hover preview
 
-### 🟡 P2 — Variant strip thumbnails are 56×42 — too small to distinguish
-
-**Symptom**: 4 variants of the same view with subtly different
-highlights look identical at thumbnail size.
-
-**Fix**: hover preview (250 ms delay) shows a bigger 256×180 inline
-near the cursor.
+`_attachVariantHoverPreview` attaches `mouseenter`/`mouseleave`
+handlers that pop a 280x200 floating panel after 250 ms idle. The
+preview shows the figure's name + the full thumbnail, positioned to
+the right of the card and clipped to the viewport. A single
+`_hoverPreviewEl` is reused across cards so DOM churn stays
+bounded.
 
 ---
 

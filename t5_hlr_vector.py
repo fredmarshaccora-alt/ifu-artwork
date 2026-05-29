@@ -39,6 +39,56 @@ from OCP.BRepAdaptor import BRepAdaptor_Curve
 from OCP.GCPnts import GCPnts_UniformDeflection
 from PIL import Image, ImageDraw
 
+import threading
+
+# OCCT meshes (BRepMesh_IncrementalMesh) live on the TopoDS shape and
+# persist across calls.  Re-running the mesher with a coarser-or-equal
+# deflection is a no-op semantically, but the call still walks every
+# face checking what to update.  Track the finest deflection ever
+# applied to each shape (by id()) and skip when the request is already
+# satisfied.  Saves the dominant cost (~30%) of _extract_projected_triangles
+# when /api/render has just run on this shape at a finer mesh_defl.
+_MESH_DEFL_REGISTRY: dict[int, float] = {}
+_MESH_DEFL_LOCK = threading.Lock()
+
+
+def _ensure_meshed(shape, mesh_defl: float) -> None:
+    """Call BRepMesh_IncrementalMesh on ``shape`` only if it hasn't
+    already been meshed at a finer-or-equal deflection.  Thread-safe.
+
+    NB: a shape's id() is stable for its lifetime in Python, so the
+    registry survives across requests as long as the same TopoDS shape
+    object is in _SHAPES.  Reconfigure rebuilds the shape -> the id
+    changes -> the registry entry is naturally invalidated.  We don't
+    actively GC stale entries -- they're tiny (one float per id) and
+    Python eventually reuses ids of freed objects (we'd update the
+    entry on the next call anyway).
+    """
+    sid = id(shape)
+    with _MESH_DEFL_LOCK:
+        recorded = _MESH_DEFL_REGISTRY.get(sid)
+        if recorded is not None and recorded <= mesh_defl:
+            # We've already meshed this shape at a finer (or equal)
+            # deflection; OCCT would re-walk every face just to find
+            # nothing to do.  Skip.
+            return
+    BRepMesh_IncrementalMesh(shape, mesh_defl, False, 0.5, True)
+    with _MESH_DEFL_LOCK:
+        prior = _MESH_DEFL_REGISTRY.get(sid)
+        if prior is None or mesh_defl < prior:
+            _MESH_DEFL_REGISTRY[sid] = mesh_defl
+
+
+def _invalidate_mesh_cache(shape) -> None:
+    """Forget what deflection ``shape`` has been meshed at.  Call this
+    after any operation that mutates the TopoDS triangulation in place
+    (rotate_shape returns a copy, so it doesn't need this -- but if a
+    future code path edits a shape in place, route it here).
+    """
+    sid = id(shape)
+    with _MESH_DEFL_LOCK:
+        _MESH_DEFL_REGISTRY.pop(sid, None)
+
 
 # Edge category style defaults (IFU print weights, in mm at 1:1 SVG)
 DEFAULT_STYLES = {
@@ -160,7 +210,7 @@ def filter_outliers(polylines, ratio_threshold=3.0, max_passes=4):
 
 
 def _run_poly(shape, proj, mesh_defl, per_solid=False):
-    BRepMesh_IncrementalMesh(shape, mesh_defl, False, 0.5, True)
+    _ensure_meshed(shape, mesh_defl)
     algo = HLRBRep_PolyAlgo()
     if per_solid:
         # Workaround for PolyAlgo's Standard_OutOfRange bug on some multi-part
@@ -251,28 +301,18 @@ def split_solids(shape):
     return solids
 
 
-def compute_visible_footprints(shape, part_indices, view_dir, focal=(0, 0, 0),
-                                mesh_defl=0.4, resolution=3000):
-    """For each selected part, return the boundary polyline(s) of its
-    VISIBLE 2D footprint -- i.e. the closed polygon outlining what the
-    user actually sees of that part on screen, with occluder cuts
-    correctly drawn along the occluder's boundary.
+def _extract_projected_triangles(shape, view_dir, focal, mesh_defl):
+    """OCCT-bound phase of compute_visible_footprints: mesh the shape,
+    project every triangle to ``(u, v, depth)`` and return a flat list.
 
-    Method:
-      1. Mesh the assembly via BRepMesh_IncrementalMesh.
-      2. Project every triangle to (u, v) and compute its mean depth.
-      3. Sort triangles back-to-front (painter's algorithm).
-      4. Rasterize each triangle into an int32 ID buffer using cv2.fillPoly
-         -- pixel value = part_idx of the front-most triangle covering it.
-      5. For each requested part_idx, threshold the buffer to a binary
-         mask and trace closed contours via cv2.findContours.
-      6. Convert pixel coords back to (u, v) and DP-simplify the result.
+    Split out from compute_visible_footprints so callers that hold the
+    OCCT lock can release it after this phase -- the subsequent
+    rasterise + contour-trace is pure numpy/cv2 and runs concurrently
+    with /api/render.
 
-    Returns: dict {idx: [polyline, ...]} where each polyline is a closed
-    list of (u, v) tuples in the same projection space as the baked SVG.
+    Returns ``tri_data`` as a list of
+    ``(idx, u1, v1, d1, u2, v2, d2, u3, v3, d3)`` tuples.
     """
-    import numpy as np
-    import cv2
     from OCP.BRepMesh import BRepMesh_IncrementalMesh
     from OCP.BRep import BRep_Tool
     from OCP.TopAbs import TopAbs_FACE
@@ -281,32 +321,13 @@ def compute_visible_footprints(shape, part_indices, view_dir, focal=(0, 0, 0),
     from OCP.TopoDS import TopoDS
 
     proj, x_axis, y_axis, focal_pt = build_projector(view_dir, focal)
-    # CRITICAL: OCCT's HLRAlgo_Projector.Project(P) returns ROTATION-only
-    # coordinates -- u = P · x_axis, v = P · y_axis, NOT (P - focal) · axes.
-    # The "focal" set on gp_Ax2 controls the camera's view direction
-    # frame, but the projector itself does not subtract focal from
-    # projected points.  If we DO subtract focal here, our footprint
-    # polylines come out offset from HLR's SVG by exactly (focal · x_axis,
-    # focal · y_axis), and the bold outline lands in completely the wrong
-    # place when overlaid.  Project P directly -- skip the (P - focal)
-    # subtraction so footprint (u, v) matches HLR (u, v) exactly.
     ax, ay, az = x_axis
     bx, by, bz = y_axis
-    cx, cy, cz = view_dir   # depth axis (toward camera).  Offset by
-                              # focal cancels in depth ORDERING, so the
-                              # back-to-front sort is unaffected by this.
+    cx, cy, cz = view_dir
 
-    BRepMesh_IncrementalMesh(shape, mesh_defl, False, 0.5, True)
+    _ensure_meshed(shape, mesh_defl)
     solids = split_solids(shape)
-    want = set(part_indices)
-    if not want:
-        return {}
 
-    # ---- 1) gather projected triangles with per-vertex depth ----------
-    # tri_data: list of (idx, u1, v1, d1, u2, v2, d2, u3, v3, d3).
-    # Per-vertex depth lets us do correct z-test via barycentric
-    # interpolation -- mean-depth painter's algorithm fails at the
-    # hinge-end where bracket / pivot / tube eye sit at similar means.
     tri_data = []
     for idx, _label, solid in solids:
         face_exp = TopExp_Explorer(solid, TopAbs_FACE)
@@ -323,7 +344,7 @@ def compute_visible_footprints(shape, part_indices, view_dir, focal=(0, 0, 0),
                 p = tri.Node(i).Transformed(trsf)
                 # NB: project P directly (no focal subtraction) so we
                 # land in OCCT HLR's coordinate frame.  See comment at
-                # top of this function.
+                # top of compute_visible_footprints.
                 px, py, pz = p.X(), p.Y(), p.Z()
                 u = px * ax + py * ay + pz * az
                 v = px * bx + py * by + pz * bz
@@ -337,6 +358,20 @@ def compute_visible_footprints(shape, part_indices, view_dir, focal=(0, 0, 0),
                                   p1[0], p1[1], p1[2],
                                   p2[0], p2[1], p2[2],
                                   p3[0], p3[1], p3[2]))
+    return tri_data
+
+
+def _rasterise_visible_footprints(tri_data, part_indices, resolution=3000):
+    """Pure-numpy/cv2 phase of compute_visible_footprints: take the
+    projected triangles, paint them back-to-front into a depth-tested
+    ID buffer, and trace closed contours per requested part.
+
+    Lock-free: the OCCT shape is no longer touched, so this can run
+    concurrently with /api/render without holding _HLR_LOCK.
+    """
+    import numpy as np
+    import cv2
+
     if not tri_data:
         return {i: [] for i in part_indices}
 
@@ -360,6 +395,14 @@ def compute_visible_footprints(shape, part_indices, view_dir, focal=(0, 0, 0),
     # depth = closer to camera = wins.
     z_buf = np.full((h_px, w_px), -np.inf, dtype=np.float64)
 
+    # NB: I tried "vectorising" this loop by packing tri_data into a
+    # single (N, 10) numpy array and indexing per-iteration.  Bench
+    # showed a 19-32% REGRESSION across small/medium/large workloads:
+    # the numpy-scalar dereferences and array-slice overhead dominated
+    # the saved Python multiplications.  The natural tuple unpack
+    # below is fastest at this scale because each iteration's inner
+    # work (meshgrid + barycentric across the triangle bbox) is what
+    # actually dominates -- the per-iteration setup is in the noise.
     for (idx, u1, v1, d1, u2, v2, d2, u3, v3, d3) in tri_data:
         # Pixel-space vertices
         x1 = (u1 - u_min) * px_per_mm
@@ -406,7 +449,7 @@ def compute_visible_footprints(shape, part_indices, view_dir, focal=(0, 0, 0),
         if not win.any():
             continue
         sub_z[win] = depths[win]
-        id_buf[y_lo:y_hi, x_lo:x_hi][win] = idx + 1
+        id_buf[y_lo:y_hi, x_lo:x_hi][win] = int(idx) + 1
 
     # DEBUG: save the ID buffer as a coloured PNG so we can eyeball
     # what the rasterizer is actually producing.  Each part gets a
@@ -433,53 +476,148 @@ def compute_visible_footprints(shape, part_indices, view_dir, focal=(0, 0, 0),
               f"{len(ids_present)-1} parts rasterized)", flush=True)
 
     # ---- 3) extract closed contours per requested part ---------------
-    # Cleanup kernel: 1-pixel erode then dilate (MORPH_OPEN) removes
-    # single-pixel slivers at part boundaries that pixel-rounding
-    # leaks into neighbours, then a final 1-pixel erode shrinks the
-    # contour so adjacent parts' outlines never overlap.
-    kernel = np.ones((3, 3), np.uint8)
+    # Per-part outlines: erode 1 px so adjacent parts' contours stay
+    # clear of each other.
     out = {}
     for idx in part_indices:
         mask = (id_buf == idx + 1).astype(np.uint8) * 255
-        if not mask.any():
-            out[idx] = []
-            continue
-        # MORPH_OPEN drops stray pixel islands; MORPH_ERODE shrinks the
-        # mask 1 px inward so neighbour outlines stay clear of each
-        # other.  Net effect: ~0.5-1 mm tighter at the boundary.
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        out[idx] = _trace_mask_to_polylines(
+            mask, px_per_mm, u_min, v_min,
+            erode=True)
+    # Attach the id_buf to the returned dict via a private key so the
+    # caller can compute additional union outlines without rebuilding
+    # the raster.  The marker is a tuple to avoid collision with int keys.
+    out[("__id_buf__",)] = (id_buf, px_per_mm, u_min, v_min)
+    return out
+
+
+def _trace_mask_to_polylines(mask, px_per_mm, u_min, v_min,
+                              erode=True, smooth_close=False):
+    """Convert a binary uint8 mask into a list of closed polylines in
+    (u, v) space.  Single-source-of-truth for every contour-trace in
+    the footprint pipeline (per-part, per-group union, assembly).
+
+    erode: 1-px erosion to keep adjacent parts' contours from kissing.
+           Disabled for unions/assemblies because the seam IS where we
+           want the contour.
+    smooth_close: MORPH_CLOSE to bridge 1-pixel gaps between rasterised
+                   parts that should be touching.  Useful for unions to
+                   fuse adjacent parts whose pixel boundaries fall on
+                   slightly-different grid lines.
+    """
+    import numpy as np
+    import cv2
+
+    if not mask.any():
+        return []
+    kernel = np.ones((3, 3), np.uint8)
+    if smooth_close:
+        # Close 1-pixel cracks BEFORE the morph-open / erode.  Adjacent
+        # rasterised parts often leave a single-pixel diagonal gap from
+        # anti-aliasing; the union mask would expose it as a notch in
+        # the merged silhouette unless we bridge it.
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+    # MORPH_OPEN drops stray pixel islands.
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    if erode:
         mask = cv2.erode(mask, kernel, iterations=1)
-        if not mask.any():
-            out[idx] = []
+    if not mask.any():
+        return []
+    # CCOMP gives external boundaries + 1 level of internal holes.
+    contours, _hier = cv2.findContours(
+        mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    MIN_AREA_PX = 9
+    polys = []
+    for cnt in contours:
+        if len(cnt) < 3:
             continue
-        # CCOMP gives external boundaries + 1 level of internal holes,
-        # so a part whose visible region has occluder shadows comes back
-        # with the outer outline PLUS a small closed loop around each
-        # hidden region.  The bold edge can then trace both, showing
-        # "the part is here -- but cut by occluder loops there".
-        contours, _hier = cv2.findContours(
-            mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-        # Drop tiny pixel-island contours that survived the morph open
-        # (= big connected components that genuinely belong to this part
-        # but happen to span < 9 pixels are also dropped -- accept that
-        # trade-off, those are noise we don't want to outline).
-        MIN_AREA_PX = 9
-        polys = []
-        for cnt in contours:
-            if len(cnt) < 3:
-                continue
-            if cv2.contourArea(cnt) < MIN_AREA_PX:
-                continue
-            pl = [(float(px) / px_per_mm + u_min,
-                   float(py) / px_per_mm + v_min)
-                  for [[px, py]] in cnt]
-            pl.append(pl[0])
-            polys.append(pl)
-        # DP simplify so the boundary doesn't carry 100 pts per pixel-step
-        dp_tol = max(0.5, 1.0 / px_per_mm)
-        polys = [_dp_simplify(pl, dp_tol) for pl in polys]
-        polys = [pl for pl in polys if len(pl) >= 3]
-        out[idx] = polys
+        if cv2.contourArea(cnt) < MIN_AREA_PX:
+            continue
+        pl = [(float(px) / px_per_mm + u_min,
+               float(py) / px_per_mm + v_min)
+              for [[px, py]] in cnt]
+        pl.append(pl[0])
+        polys.append(pl)
+    dp_tol = max(0.5, 1.0 / px_per_mm)
+    polys = [_dp_simplify(pl, dp_tol) for pl in polys]
+    polys = [pl for pl in polys if len(pl) >= 3]
+    return polys
+
+
+def compute_assembly_silhouette_from_raster(raster_handle):
+    """Given a raster handle (the id_buf tuple injected into
+    _rasterise_visible_footprints' return value), trace the union of
+    every non-empty pixel as the COMBINED assembly silhouette.
+
+    Use case: replace the per-part outline_v layer with the true outer
+    silhouette of the whole assembly, so adjacent parts no longer show
+    their shared edge as a heavy line.
+    """
+    import numpy as np
+    id_buf, px_per_mm, u_min, v_min = raster_handle
+    mask = (id_buf != 0).astype(np.uint8) * 255
+    return _trace_mask_to_polylines(
+        mask, px_per_mm, u_min, v_min,
+        erode=False, smooth_close=True)
+
+
+def compute_group_silhouettes_from_raster(raster_handle, groups):
+    """Given a raster handle and a dict of {group_key: [part_idx, ...]},
+    return {group_key: [polylines]} for each group's union silhouette.
+
+    Used when N adjacent parts share the same highlight style -- we
+    want one merged closed loop, not N per-part loops with seams.
+    """
+    import numpy as np
+    id_buf, px_per_mm, u_min, v_min = raster_handle
+    out = {}
+    for key, idxs in groups.items():
+        if not idxs:
+            out[key] = []
+            continue
+        # Build the union mask
+        mask = np.zeros_like(id_buf, dtype=np.uint8)
+        for idx in idxs:
+            mask |= (id_buf == idx + 1).astype(np.uint8)
+        mask *= 255
+        out[key] = _trace_mask_to_polylines(
+            mask, px_per_mm, u_min, v_min,
+            erode=False, smooth_close=True)
+    return out
+
+
+def compute_visible_footprints(shape, part_indices, view_dir, focal=(0, 0, 0),
+                                mesh_defl=0.4, resolution=3000):
+    """For each selected part, return the boundary polyline(s) of its
+    VISIBLE 2D footprint -- i.e. the closed polygon outlining what the
+    user actually sees of that part on screen, with occluder cuts
+    correctly drawn along the occluder's boundary.
+
+    Method:
+      1. Mesh the assembly via BRepMesh_IncrementalMesh.
+      2. Project every triangle to (u, v) and compute its mean depth.
+      3. Sort triangles back-to-front (painter's algorithm).
+      4. Rasterize each triangle into an int32 ID buffer using cv2.fillPoly
+         -- pixel value = part_idx of the front-most triangle covering it.
+      5. For each requested part_idx, threshold the buffer to a binary
+         mask and trace closed contours via cv2.findContours.
+      6. Convert pixel coords back to (u, v) and DP-simplify the result.
+
+    Returns: dict {idx: [polyline, ...]} where each polyline is a closed
+    list of (u, v) tuples in the same projection space as the baked SVG.
+
+    Now a thin wrapper over ``_extract_projected_triangles`` (OCCT-bound,
+    needs the HLR lock) + ``_rasterise_visible_footprints`` (pure numpy/
+    cv2, lock-free).  Callers that want to release the OCCT lock between
+    phases can call the two halves directly -- see ``serve._kick_footprint_raster``.
+    """
+    if not part_indices:
+        return {}
+    tri_data = _extract_projected_triangles(shape, view_dir, focal, mesh_defl)
+    out = _rasterise_visible_footprints(tri_data, part_indices, resolution)
+    # Strip the private raster handle so legacy callers see only the
+    # {idx: polylines} shape they expect.
+    out.pop(("__id_buf__",), None)
     return out
 
 
@@ -578,7 +716,7 @@ def run_group_silhouette(shape, part_indices, view_dir, focal=(0, 0, 0),
         for s in chosen:
             builder.Add(compound, s)
     try:
-        BRepMesh_IncrementalMesh(compound, mesh_defl, False, 0.5, True)
+        _ensure_meshed(compound, mesh_defl)
         algo = HLRBRep_PolyAlgo()
         algo.Load(compound)
         algo.Projector(proj)
@@ -619,7 +757,7 @@ def run_part_silhouettes(shape, part_indices, view_dir, focal=(0, 0, 0),
             out[idx] = []
             continue
         try:
-            BRepMesh_IncrementalMesh(solid, mesh_defl, False, 0.5, True)
+            _ensure_meshed(solid, mesh_defl)
             algo = HLRBRep_PolyAlgo()
             algo.Load(solid)
             algo.Projector(proj)
@@ -663,7 +801,7 @@ def _build_full_hlr(shape, solids, proj, mesh_defl):
     """
     # 1) PolyAlgo - compound add
     try:
-        BRepMesh_IncrementalMesh(shape, mesh_defl, False, 0.5, True)
+        _ensure_meshed(shape, mesh_defl)
         algo = HLRBRep_PolyAlgo()
         algo.Load(shape)
         algo.Projector(proj)
@@ -681,7 +819,7 @@ def _build_full_hlr(shape, solids, proj, mesh_defl):
     #    while still feeding ALL solids into the same algo instance so
     #    occlusion between them is computed correctly).
     try:
-        BRepMesh_IncrementalMesh(shape, mesh_defl, False, 0.5, True)
+        _ensure_meshed(shape, mesh_defl)
         algo = HLRBRep_PolyAlgo()
         added = 0
         for _, _, solid in solids:
