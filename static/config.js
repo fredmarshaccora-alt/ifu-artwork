@@ -5,4 +5,4 @@
 //  - Split deploy (UI on Vercel, API on Render): set this to your Render
 //    service URL, e.g. "https://ifu-api.onrender.com" (NO trailing slash).
 //    On Vercel, override this file's content with that value.
-window.IFU_API_BASE = window.IFU_API_BASE || "";
+window.IFU_API_BASE = window.IFU_API_BASE || "https://ifu-api-xmm5.onrender.com";
