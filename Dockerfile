@@ -4,8 +4,11 @@
 # fontconfig) present in the image.
 FROM python:3.12-slim
 
-# Runtime shared libs that the OCCT wheels dlopen at import/render time.
+# Build tools (pycairo/svglib need gcc + cairo headers) + OCCT runtime libs.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        pkg-config \
+        libcairo2-dev \
         libgl1 \
         libglu1-mesa \
         libxrender1 \
