@@ -861,19 +861,19 @@ def index():
     The ETag is the on-disk mtime so a rebuild also invalidates 304s.
     Combined with no-store, refresh always re-fetches.
     """
-    # API-only deploy (front-end served elsewhere, e.g. Vercel): there is
-    # no viewer.html on this host.  Return a small status page instead of
-    # a 500 so health checks / curious humans hitting the root get a sane
-    # response.  The UI lives at the front-end origin.
-    viewer = OUT / "viewer.html"
+    # viewer.html is app code committed to the repo — always lives at
+    # <app_dir>/out/viewer.html.  IFU_DATA_DIR (/data on Render) holds
+    # user data (figures/views/sources), not the built viewer.
+    _app_viewer = HERE / "out" / "viewer.html"
+    viewer = _app_viewer if _app_viewer.exists() else OUT / "viewer.html"
     if not viewer.exists():
         return Response(
-            "IFU compute API. The web UI is served separately; this host "
-            "serves /api/*. Health: /api/healthz",
+            "IFU compute API — viewer.html not found. "
+            "Run build_viewer.py to generate it. Health: /api/healthz",
             mimetype="text/plain")
     resp = send_file(viewer, conditional=False)
     try:
-        mtime = (OUT / "viewer.html").stat().st_mtime_ns
+        mtime = viewer.stat().st_mtime_ns
         resp.set_etag(f"build-{mtime}")
     except OSError:
         pass
