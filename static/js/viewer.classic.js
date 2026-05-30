@@ -4177,7 +4177,11 @@ function attachInteractivity(pane) {
     applyTransform(pane);
   });
   window.addEventListener('mouseup', () => {
+    const wasPanning = panning;
     panning = false; svg.classList.remove('panning');
+    // Panning while zoomed in moves the visible region -> refresh the
+    // high-detail overlay for the new viewport once the drag settles.
+    if (wasPanning) _scheduleAutoSharpen(pane);
   });
 
   // Wheel zoom centred on the cursor.  Work in SVG user space (the same
@@ -4197,6 +4201,7 @@ function attachInteractivity(pane) {
     st.ty = u.y - (u.y - st.ty) * k;
     st.scale = newScale;
     applyTransform(pane);
+    _scheduleAutoSharpen(pane);
   }, { passive: false });
 }
 
@@ -4644,6 +4649,97 @@ $('btn-detail-clear').addEventListener('click', () => {
   $('btn-detail-clear').style.display = 'none';
 });
 
+// ---- Auto-sharpen on zoom (level-of-detail) ------------------------------
+// When the user zooms into the live editor pane past a threshold, re-render
+// just the visible region at finer tessellation (via /api/render_region --
+// same backend path as the manual "sharpen" button) and overlay it as a
+// screen-only <g class="layer-region-detail">.  Zooming back out removes the
+// overlay so the clean base shows again.  The base render, the saved figure,
+// and the IFU export are ALL unaffected -- the overlay is display-only and
+// is stripped on export.  Self-contained (doesn't rely on fileSel/viewSel)
+// so it works inside the editor's live pane.
+let _autoSharpenTimer = null;
+let _autoSharpenInFlight = false;
+let _lastSharpenSig = '';
+const _AUTO_SHARPEN_SCALE = 2.2;   // start sharpening once zoomed >2.2x
+
+function _clearRegionDetail() {
+  const svg = activeSvg();
+  if (svg) svg.querySelector('g.layer-region-detail')?.remove();
+  const clr = document.getElementById('btn-detail-clear');
+  if (clr) clr.style.display = 'none';
+  _lastSharpenSig = '';
+}
+
+async function autoSharpenViewport(pane) {
+  const svg = pane && pane.querySelector('svg');
+  if (!svg || typeof API_BASE !== 'string') return;
+  const fid = window.IFU_VIEWER?.getActiveFileId?.();
+  if (!fid) return;
+  const vb = (svg.getAttribute('viewBox') || '').split(/\s+/).map(parseFloat);
+  if (vb.length !== 4 || vb.some(isNaN)) return;
+  const st = getState(pane.dataset.file, pane.dataset.view);
+  if (!st) return;
+  const sc = st.scale || 1, tx = st.tx || 0, ty = st.ty || 0;
+  // Visible region in viewBox coords, then flip y -> projector (u,v) to
+  // match the scale(1,-1) wrapper (identical math to detailRenderActive).
+  const vw = vb[2] / sc, vh = vb[3] / sc;
+  const vx = vb[0] - tx / sc, vy = vb[1] - ty / sc;
+  const bbox_uv = [vx, -(vy + vh), vx + vw, -vy];
+  const ctx = window.IFU_VIEWER?._getLiveCamCtx?.(fid);
+  if (!ctx || !ctx.eye || !ctx.target) return;   // need a live camera
+  const body = {
+    file_id: fid, bbox_uv,
+    mesh_defl: 0.3, sample_defl: 0.3,
+    eye: ctx.eye, target: ctx.target,
+  };
+  if (ctx.up_axis) body.up_axis = ctx.up_axis;
+  const r = await fetch(API_BASE + '/api/render_region', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) return;
+  const text = await r.text();
+  const incoming = new DOMParser()
+    .parseFromString(text, 'image/svg+xml').documentElement;
+  const scaleG = svg.querySelector('g[transform="scale(1,-1)"]')
+              || svg.querySelector('.view-transform > g')
+              || svg.querySelector(':scope > g');
+  if (!scaleG) return;
+  scaleG.querySelector(':scope > g.layer-region-detail')?.remove();
+  const layer = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+  layer.setAttribute('class', 'layer-region-detail');
+  const inScale = incoming.querySelector('g[transform="scale(1,-1)"]');
+  (inScale ? Array.from(inScale.children) : Array.from(incoming.children))
+    .forEach(ch => layer.appendChild(ch.cloneNode(true)));
+  scaleG.appendChild(layer);
+  const clr = document.getElementById('btn-detail-clear');
+  if (clr) clr.style.display = '';
+}
+
+function _scheduleAutoSharpen(pane) {
+  // Editor live pane only -- that's where users zoom to inspect detail.
+  if (!pane || pane.dataset.view !== '__live__') return;
+  if (document.body.classList.contains('no-auto-sharpen')) return;
+  if (_autoSharpenTimer) clearTimeout(_autoSharpenTimer);
+  _autoSharpenTimer = setTimeout(() => {
+    _autoSharpenTimer = null;
+    const st = getState(pane.dataset.file, pane.dataset.view);
+    if (!st) return;
+    if (st.scale < _AUTO_SHARPEN_SCALE) { _clearRegionDetail(); return; }
+    // Quantise scale+pan so tiny nudges don't re-fire an expensive render.
+    const sig = [Math.round(st.scale * 4),
+                 Math.round(st.tx), Math.round(st.ty)].join(',');
+    if (sig === _lastSharpenSig || _autoSharpenInFlight) return;
+    _autoSharpenInFlight = true;
+    _lastSharpenSig = sig;
+    Promise.resolve(autoSharpenViewport(pane))
+      .catch(() => { _lastSharpenSig = ''; })
+      .finally(() => { _autoSharpenInFlight = false; });
+  }, 450);
+}
+
 $('btn-export').onclick = () => {
   const svg = activeSvg();
   if (!svg) return;
@@ -4662,6 +4758,12 @@ $('btn-export').onclick = () => {
   if (viewG) {
     viewG.removeAttribute('transform');
   }
+
+  // Drop the on-screen zoom-sharpen overlay: it only covers whatever
+  // region was visible while zoomed in, so it must NOT bleed into the
+  // exported full-figure drawing (which would then be fine in one patch
+  // and base elsewhere).  Export is always the clean, consistent base.
+  clone.querySelectorAll('g.layer-region-detail').forEach(g => g.remove());
 
   // Physically drop any <g class="layer-X"> whose visibility
   // checkbox is unchecked.  Otherwise the exported SVG inherits

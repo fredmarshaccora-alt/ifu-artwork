@@ -1066,6 +1066,24 @@ def render():
             "supply either {eye, target} or {view_dir, focal}"}), 400
 
     shape, hlr_kw = _SHAPES[file_id]
+    # --- Quality override (zoom-adaptive LOD) --------------------------
+    # Interactive browsing renders 'draft' (coarser mesh -> faster);
+    # zoom-detail + IFU export render 'fine'.  We scale the source's
+    # natural mesh_defl/sample_defl so every model keeps sensible
+    # proportions.  An explicit mesh_defl/sample_defl in the body wins.
+    hlr_kw = dict(hlr_kw)
+    _QUALITY_MULT = {"draft": 2.0, "normal": 1.0, "fine": 0.5}
+    q = str(body.get("quality") or "").lower()
+    if body.get("mesh_defl"):
+        hlr_kw["mesh_defl"] = max(0.05, float(body["mesh_defl"]))
+    elif q in _QUALITY_MULT:
+        hlr_kw["mesh_defl"] = max(
+            0.05, hlr_kw.get("mesh_defl", 1.5) * _QUALITY_MULT[q])
+    if body.get("sample_defl"):
+        hlr_kw["sample_defl"] = max(0.05, float(body["sample_defl"]))
+    elif q in _QUALITY_MULT:
+        hlr_kw["sample_defl"] = max(
+            0.05, hlr_kw.get("sample_defl", 1.0) * _QUALITY_MULT[q])
     # Apply the 3D viewer's Up: override to a fresh copy so the SVG matches
     # what the user was looking at when they clicked "generate 2D".  The
     # cache stays in its native pre-rotated state for the next request.
@@ -1084,7 +1102,8 @@ def render():
 
     # Cache check: identical (source, view, focal, up_axis) -> instant.
     vd_key, focal_key = _view_keys(view_dir, focal)
-    cache_key = (file_id, vd_key, focal_key, up_axis_key)
+    cache_key = (file_id, vd_key, focal_key, up_axis_key,
+                 round(hlr_kw.get("mesh_defl", 1.5), 3))
     cached = _cache_get(_RENDER_CACHE, cache_key)
     if cached is not None:
         print(f"  /api/render {file_id:<10s} dir={vd_key}{extra_rot_str}  "
