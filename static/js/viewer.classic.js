@@ -4761,7 +4761,7 @@ async function detailRenderActive() {
   // axis is negated.  We compute bbox in PROJECTOR space by taking
   // the SVG's viewBox and the pan/zoom transform of the view-transform group.
   const viewG = svg.querySelector('g.view-transform');
-  const vb = svg.getAttribute('viewBox').split(/\\s+/).map(parseFloat);
+  const vb = svg.getAttribute('viewBox').trim().split(/[\s,]+/).map(parseFloat);
   // viewBox is [x, y, w, h]; flip y to projector u,v
   // For a fresh load (no pan/zoom) the viewport IS the viewBox.
   // When zoomed, viewG has translate(tx,ty) scale(s); we invert that
@@ -7903,7 +7903,7 @@ function _readViewBoxFromActiveSvg() {
   if (!svg) return null;
   const vb = svg.getAttribute('viewBox');
   if (!vb) return null;
-  const parts = vb.split(/\\s+/).map(parseFloat);
+  const parts = vb.trim().split(/[\s,]+/).map(parseFloat);
   if (parts.length !== 4 || parts.some(Number.isNaN)) return null;
   // viewBox = (x0, y0, w, h) where x0 = u_min, y0 = -v_max
   const [x0, y0, w, h] = parts;
