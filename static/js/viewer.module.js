@@ -1028,6 +1028,17 @@ window.IFU_VIEWER.onViewChange(() => {
 // Expose for the classic script's selection + orientation + layout handlers,
 // plus debug/test access to the underlying three.js scene.
 window.IFU_VIEWER.applyHighlights3D = applyHighlights3D;
+
+// Capture the current 3D canvas as a PNG data URL (for the debug screenshot
+// bridge).  preserveDrawingBuffer is on, so a forced render + toDataURL is
+// reliable.  Returns null if the 3D isn't initialised/visible.
+window.IFU_VIEWER.capture3D = function () {
+  try {
+    if (!renderer || !scene || !camera || !is3DVisible()) return null;
+    renderer.render(scene, camera);
+    return renderer.domElement.toDataURL('image/png');
+  } catch (e) { return null; }
+};
 window.IFU_VIEWER._scene = () => scene;
 window.IFU_VIEWER._camera = () => camera;
 window.IFU_VIEWER._renderer = () => renderer;

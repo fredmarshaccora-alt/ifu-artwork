@@ -249,6 +249,11 @@ def _require_auth():
     p = request.path
     if p in _AUTH_PUBLIC_PATHS or p.startswith("/static/"):
         return
+    # Claude pulls debug screenshots via a separate token (no user session).
+    # The handler enforces IFU_DEBUG_TOKEN; let the request past the session
+    # gate so the token check can run.
+    if request.method == "GET" and p.startswith("/api/debug/shot/"):
+        return
     if not p.startswith("/api/"):
         return
     token = _auth_token_from_request()
@@ -508,6 +513,62 @@ def debug_capture_get(seq):
         return jsonify(_json.loads(p.read_text(encoding="utf-8")))
     except (OSError, _json.JSONDecodeError) as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Live screenshot bridge.  The client pushes the current 2D pane + 3D canvas
+# as PNGs; Claude pulls the latest via a token-guarded GET (so it can "see"
+# the running app without driving a slow browser bridge).  POST uses the
+# normal session auth (an authed user is pushing); GET is exempted from the
+# session gate in _require_auth and instead checks IFU_DEBUG_TOKEN.
+# ---------------------------------------------------------------------------
+_SHOT_DIR = OUT / "debug_shots"
+_DEBUG_TOKEN = os.environ.get("IFU_DEBUG_TOKEN", "")
+
+
+@app.route("/api/debug/shot", methods=["POST"])
+def debug_shot_post():
+    """Client pushes a PNG of the current view.  Body JSON:
+    {which: "2d"|"3d"|..., png: "data:image/png;base64,...."}."""
+    import base64 as _b64
+    import re as _re
+    body = request.get_json(silent=True) or {}
+    which = _re.sub(r"[^a-z0-9_-]", "", str(body.get("which") or "view").lower())[:24] or "view"
+    durl = body.get("png") or ""
+    m = _re.match(r"data:image/png;base64,(.+)$", durl, _re.S)
+    if not m:
+        return jsonify(error="png must be a data:image/png;base64 URL"), 400
+    try:
+        raw = _b64.b64decode(m.group(1))
+    except Exception:
+        return jsonify(error="bad base64"), 400
+    if len(raw) > 8 * 1024 * 1024:
+        return jsonify(error="png too large (>8MB)"), 413
+    _SHOT_DIR.mkdir(parents=True, exist_ok=True)
+    (_SHOT_DIR / f"latest_{which}.png").write_bytes(raw)
+    meta = (_SHOT_DIR / f"latest_{which}.txt")
+    note = str(body.get("note") or "")[:200]
+    try:
+        meta.write_text(note, encoding="utf-8")
+    except OSError:
+        pass
+    return jsonify(ok=True, which=which, bytes=len(raw))
+
+
+@app.route("/api/debug/shot/<which>", methods=["GET"])
+def debug_shot_get(which):
+    """Return the latest pushed PNG for `which`.  Token-guarded so Claude can
+    pull it without a user session (?token=IFU_DEBUG_TOKEN)."""
+    import re as _re
+    if not _DEBUG_TOKEN or request.args.get("token") != _DEBUG_TOKEN:
+        return jsonify(error="bad or missing token"), 403
+    which = _re.sub(r"[^a-z0-9_-]", "", str(which).lower())[:24] or "view"
+    p = _SHOT_DIR / f"latest_{which}.png"
+    if not p.exists():
+        return jsonify(error=f"no '{which}' capture yet"), 404
+    resp = send_file(p, mimetype="image/png", max_age=0)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.route("/api/<path:_p>", methods=["OPTIONS"])

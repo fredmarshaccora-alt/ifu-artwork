@@ -602,6 +602,9 @@ HTML_TEMPLATE = r"""<!doctype html>
 <!-- Annotation UI: runs as a module AFTER viewer.module.js so window.IFU_VIEWER
      is fully augmented with the explode/arrows/preset API before wiring. -->
 <script type="module" src="/static/js/viewer.annotate.ui.js"></script>
+<!-- Debug screenshot bridge: pushes current 2D+3D views to /api/debug/shot
+     so they can be pulled server-side. No-op without the API. -->
+<script src="/static/js/debug_capture.js"></script>
 </script>
 </body>
 </html>
