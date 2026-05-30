@@ -8030,64 +8030,63 @@ function _gpuRasterFootprints(fid, vid, partIndices) {
 // order to produce a closed polyline.  Coarse-grained -- emits one
 // polyline per component, optionally simplified with DP later.
 function _traceContoursFromIdMask(ids, w, h, partIdx) {
-  // Build a binary mask in-place
-  const want = partIdx;
-  const seen = new Uint8Array(w * h);
+  // Marching squares on the part's binary mask -> guaranteed CLOSED contours,
+  // including concave / occluded boundaries and holes.  The previous
+  // Moore-neighbour walk could terminate early and leave the perimeter open
+  // (the "incomplete perimeter" where a part went behind an occluder).
+  const inside = (x, y) => (x >= 0 && x < w && y >= 0 && y < h
+                            && ids[y * w + x] === partIdx) ? 1 : 0;
+  const segs = new Map();            // "ax,ay" -> [bx, by]  (directed)
+  const K = (x, y) => x + ',' + y;
+  const add = (ax, ay, bx, by) => segs.set(K(ax, ay), [bx, by]);
+  for (let cy = -1; cy < h; cy++) {
+    for (let cx = -1; cx < w; cx++) {
+      const tl = inside(cx, cy),         tr = inside(cx + 1, cy);
+      const br = inside(cx + 1, cy + 1), bl = inside(cx, cy + 1);
+      const c = (tl << 3) | (tr << 2) | (br << 1) | bl;
+      if (c === 0 || c === 15) continue;
+      const T = [cx + 0.5, cy], R = [cx + 1, cy + 0.5],
+            B = [cx + 0.5, cy + 1], L = [cx, cy + 0.5];
+      switch (c) {                       // filled region kept on the LEFT
+        case 1:  add(B[0], B[1], L[0], L[1]); break;
+        case 2:  add(R[0], R[1], B[0], B[1]); break;
+        case 3:  add(R[0], R[1], L[0], L[1]); break;
+        case 4:  add(T[0], T[1], R[0], R[1]); break;
+        case 5:  add(T[0], T[1], L[0], L[1]); add(B[0], B[1], R[0], R[1]); break;
+        case 6:  add(T[0], T[1], B[0], B[1]); break;
+        case 7:  add(T[0], T[1], L[0], L[1]); break;
+        case 8:  add(L[0], L[1], T[0], T[1]); break;
+        case 9:  add(B[0], B[1], T[0], T[1]); break;
+        case 10: add(L[0], L[1], B[0], B[1]); add(R[0], R[1], T[0], T[1]); break;
+        case 11: add(R[0], R[1], T[0], T[1]); break;
+        case 12: add(L[0], L[1], R[0], R[1]); break;
+        case 13: add(B[0], B[1], R[0], R[1]); break;
+        case 14: add(L[0], L[1], B[0], B[1]); break;
+      }
+    }
+  }
+  // Chain the directed segments into closed loops, then smooth + simplify.
+  // +0.5 keeps the same pixel-centre alignment the old tracer had.
   const polys = [];
-  // Direction tables for Moore-neighbour walking (clockwise from N)
-  const DX = [0, 1, 1, 1, 0, -1, -1, -1];
-  const DY = [1, 1, 0, -1, -1, -1, 0, 1];
-
-  for (let y = 1; y < h - 1; y++) {
-    for (let x = 1; x < w - 1; x++) {
-      const i = y * w + x;
-      if (seen[i] || ids[i] !== want) continue;
-      // Component-seed: only start from the topmost-leftmost pixel
-      // of the component (skip pixels with a same-id neighbour above
-      // or left to avoid re-tracing).
-      const upMatch = (y > 0 && ids[i - w] === want);
-      const leftMatch = (x > 0 && ids[i - 1] === want);
-      if (upMatch || leftMatch) {
-        seen[i] = 1;
-        continue;
-      }
-      // Trace boundary starting here, walking the perimeter.
-      // We start by entering from the west (direction 6 = -x).
-      const polyline = [];
-      let cx = x, cy = y, dir = 6;
-      const start = i;
-      const startDir = dir;
-      let steps = 0;
-      const MAX = w * h;
-      do {
-        polyline.push([cx + 0.5, cy + 0.5]);
-        seen[cy * w + cx] = 1;
-        // Look around starting from (dir + 6) mod 8 (one step CCW of
-        // arrival direction)
-        let found = false;
-        let trydir = (dir + 6) & 7;
-        for (let k = 0; k < 8; k++) {
-          const nx = cx + DX[trydir];
-          const ny = cy + DY[trydir];
-          if (nx >= 0 && nx < w && ny >= 0 && ny < h
-              && ids[ny * w + nx] === want) {
-            cx = nx; cy = ny; dir = trydir; found = true;
-            break;
-          }
-          trydir = (trydir + 1) & 7;
-        }
-        if (!found) break;
-        steps++;
-        if (steps > MAX) break;
-      } while (!(cy * w + cx === start && dir === startDir));
-      if (polyline.length >= 3) {
-        polyline.push(polyline[0]);   // close
-        // Smooth the 1-px raster staircase BEFORE simplifying (same idea
-        // as the server-side smoother) so circles come out round and
-        // straight edges clean, then a light DP to trim points.
-        const sm = _smoothPixelPolyline(polyline, 2);
-        polys.push(_dpSimplifyPixel(sm, 0.6));
-      }
+  const used = new Set();
+  for (const startK of segs.keys()) {
+    if (used.has(startK)) continue;
+    const loop = [];
+    let curK = startK, guard = 0;
+    while (curK && !used.has(curK) && guard++ < segs.size + 5) {
+      used.add(curK);
+      const p = curK.split(',');
+      loop.push([parseFloat(p[0]) + 0.5, parseFloat(p[1]) + 0.5]);
+      const nb = segs.get(curK);
+      if (!nb) break;
+      const nk = K(nb[0], nb[1]);
+      if (nk === startK) break;          // closed
+      curK = nk;
+    }
+    if (loop.length >= 3) {
+      loop.push(loop[0]);                // close the ring
+      const sm = _smoothPixelPolyline(loop, 2);
+      polys.push(_dpSimplifyPixel(sm, 0.6));
     }
   }
   return polys;
