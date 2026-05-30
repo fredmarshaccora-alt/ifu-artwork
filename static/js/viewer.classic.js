@@ -7698,6 +7698,7 @@ async function fetchSelectedFootprints() {
   // assumptions miss), returns null and falls through to the server
   // path so the bold edge still draws -- just more slowly.
   if (_GPU_RASTER_ON) {
+    _gpuLog({ reason: 'attempt', n: missing.length });
     try {
       const t0 = performance.now();
       const polys = _gpuRasterFootprints(fid, vid, missing);
@@ -7909,12 +7910,24 @@ function _decodePartIdFromRgb(r, g, b) {
   return v ? v - 1 : -1;
 }
 
+function _gpuLog(o) {
+  try {
+    fetch((window.API_BASE || '') + '/api/debug/client_log', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(Object.assign({ level: 'info', op: 'gpu_raster' }, o)),
+    });
+  } catch (e) { /* no-op */ }
+}
+
 function _gpuRasterFootprints(fid, vid, partIndices) {
   // Returns null on any failure -> caller falls back to server path.
   if (!_GPU_RASTER_ON) return null;
-  if (!renderer || !active) return null;
+  if (!renderer || !active) {
+    _gpuLog({ reason: 'no-3d', hasRenderer: !!renderer, hasActive: !!active });
+    return null;
+  }
   const bounds = _readViewBoxFromActiveSvg();
-  if (!bounds) return null;
+  if (!bounds) { _gpuLog({ reason: 'no-viewbox' }); return null; }
   const vidx = new Set(partIndices);
   if (!vidx.size) return {};
 
@@ -7924,7 +7937,10 @@ function _gpuRasterFootprints(fid, vid, partIndices) {
   let viewDir = ve?.view_dir;
   // For live SVGs the catalogue carries the latest direction set by
   // injectLiveSVG; the existing flow already keeps it current.
-  if (!viewDir || viewDir.length !== 3) return null;
+  if (!viewDir || viewDir.length !== 3) {
+    _gpuLog({ reason: 'no-viewdir', vid: String(vid) });
+    return null;
+  }
 
   // Resolve the FOCAL point the SVG was HLR-rendered with: live views use
   // the camera target, static views use the world origin.  The (u,v) origin
@@ -8042,6 +8058,7 @@ function _gpuRasterFootprints(fid, vid, partIndices) {
     );
     result[idx] = uvPolys;
   }
+  _gpuLog({ reason: 'ok', parts: partIndices.length, res: RES });
   return result;
 }
 
