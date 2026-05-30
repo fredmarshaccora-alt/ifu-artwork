@@ -508,11 +508,14 @@ def _rasterise_visible_footprints(tri_data, part_indices, resolution=3000):
         mask = (sub == idx + 1).astype(np.uint8) * 255
         # Offset u_min/v_min by the sub-region origin so traced pixel
         # coords map back to absolute (u, v).
+        # erode=False: the bold highlight perimeter must sit ON the part's
+        # true edge (== the base HLR line).  The old 1-px erosion pulled it
+        # inward so the base line peeked out alongside it.
         out[idx] = _trace_mask_to_polylines(
             mask, px_per_mm,
             u_min + x0 / px_per_mm,
             v_min + y0 / px_per_mm,
-            erode=True)
+            erode=False)
     # Attach the id_buf to the returned dict via a private key so the
     # caller can compute additional union outlines without rebuilding
     # the raster.  The marker is a tuple to avoid collision with int keys.
@@ -562,8 +565,14 @@ def _trace_mask_to_polylines(mask, px_per_mm, u_min, v_min,
             continue
         if cv2.contourArea(cnt) < MIN_AREA_PX:
             continue
-        pl = [(float(px) / px_per_mm + u_min,
-               float(py) / px_per_mm + v_min)
+        # +0.5: the rasteriser samples each pixel at its CENTRE
+        # (meshgrid `arange + 0.5`), so a contour vertex at pixel index
+        # `px` corresponds to true position (px + 0.5) / px_per_mm.
+        # Without this the whole footprint is shifted half a pixel toward
+        # the (u_min, v_min) corner -- visible as the bold highlight
+        # perimeter sitting just off the base line.
+        pl = [((float(px) + 0.5) / px_per_mm + u_min,
+               (float(py) + 0.5) / px_per_mm + v_min)
               for [[px, py]] in cnt]
         pl.append(pl[0])
         polys.append(pl)
