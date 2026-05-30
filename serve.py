@@ -2299,6 +2299,31 @@ def part_footprints():
         else:
             misses.append(idx)
 
+    # If a background prefetch (kicked by /api/render) is already
+    # rasterising THIS view, wait for it rather than starting a second,
+    # higher-resolution raster in parallel.  That duplication -- two
+    # rasters of the same assembly racing for the CPU -- was the main
+    # cause of slow first-click footprints.
+    if misses and not _FOOT_RASTER_DONE.get(view_key):
+        with _FOOT_INFLIGHT_LOCK:
+            inflight = _FOOT_RASTER_INFLIGHT.get(view_key)
+        if inflight:
+            _log_event(level="info", op="footprint.wait_prefetch",
+                        source_id=file_id)
+            deadline = time.time() + 120
+            while (time.time() < deadline
+                   and not _FOOT_RASTER_DONE.get(view_key)):
+                time.sleep(0.2)
+            # Re-read the cache the prefetch should now have populated.
+            still: list[int] = []
+            for idx in part_indices:
+                cached = _cache_get(_FOOT_CACHE, view_key + (idx,))
+                if cached is not None:
+                    out_polys[idx] = cached
+                else:
+                    still.append(idx)
+            misses = still
+
     t_raster = 0.0
     if misses and not _FOOT_RASTER_DONE.get(view_key):
         # First request in this view: rasterize the WHOLE assembly so

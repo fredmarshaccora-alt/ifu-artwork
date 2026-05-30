@@ -394,6 +394,10 @@ def _rasterise_visible_footprints(tri_data, part_indices, resolution=3000):
     # to -inf so the FIRST triangle paints unconditionally.  Higher
     # depth = closer to camera = wins.
     z_buf = np.full((h_px, w_px), -np.inf, dtype=np.float64)
+    # Per-part painted-pixel bbox (in pixel space) so the contour pass
+    # below only scans each part's own region instead of the whole frame
+    # once per part.  {idx: [x_lo, y_lo, x_hi, y_hi]}.
+    part_bbox: dict = {}
 
     # NB: I tried "vectorising" this loop by packing tri_data into a
     # single (N, 10) numpy array and indexing per-iteration.  Bench
@@ -450,6 +454,15 @@ def _rasterise_visible_footprints(tri_data, part_indices, resolution=3000):
             continue
         sub_z[win] = depths[win]
         id_buf[y_lo:y_hi, x_lo:x_hi][win] = int(idx) + 1
+        # Grow this part's painted-pixel bbox (winning region only).
+        bb = part_bbox.get(int(idx))
+        if bb is None:
+            part_bbox[int(idx)] = [x_lo, y_lo, x_hi, y_hi]
+        else:
+            if x_lo < bb[0]: bb[0] = x_lo
+            if y_lo < bb[1]: bb[1] = y_lo
+            if x_hi > bb[2]: bb[2] = x_hi
+            if y_hi > bb[3]: bb[3] = y_hi
 
     # DEBUG: save the ID buffer as a coloured PNG so we can eyeball
     # what the rasterizer is actually producing.  Each part gets a
@@ -480,9 +493,25 @@ def _rasterise_visible_footprints(tri_data, part_indices, resolution=3000):
     # clear of each other.
     out = {}
     for idx in part_indices:
-        mask = (id_buf == idx + 1).astype(np.uint8) * 255
+        bb = part_bbox.get(int(idx))
+        if bb is None:
+            out[idx] = []
+            continue
+        # Only scan this part's own region (+2 px pad so the erosion /
+        # contour at the edge isn't clipped).  Far cheaper than a
+        # full-frame `id_buf == idx` for every one of N parts.
+        x0 = max(bb[0] - 2, 0)
+        y0 = max(bb[1] - 2, 0)
+        x1 = min(bb[2] + 2, w_px)
+        y1 = min(bb[3] + 2, h_px)
+        sub = id_buf[y0:y1, x0:x1]
+        mask = (sub == idx + 1).astype(np.uint8) * 255
+        # Offset u_min/v_min by the sub-region origin so traced pixel
+        # coords map back to absolute (u, v).
         out[idx] = _trace_mask_to_polylines(
-            mask, px_per_mm, u_min, v_min,
+            mask, px_per_mm,
+            u_min + x0 / px_per_mm,
+            v_min + y0 / px_per_mm,
             erode=True)
     # Attach the id_buf to the returned dict via a private key so the
     # caller can compute additional union outlines without rebuilding
