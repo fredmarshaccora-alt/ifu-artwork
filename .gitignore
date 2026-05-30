@@ -40,3 +40,5 @@ debug_compare/
 # Ad-hoc dev test scripts (legitimate tests will live under tests/)
 _diag_*.py
 _test_*.py
+
+.vercel

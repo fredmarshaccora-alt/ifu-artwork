@@ -7507,6 +7507,11 @@ function _getAssemblySilhouette(fid, vid) {
 // Track which views we've already fetched the assembly raster for so we
 // don't re-request when the user clicks more parts in the same view.
 const _footprintViewFetched = new Set();
+// How many times the GPU prefetch has retried for a given view (it needs the
+// SVG + 3D GLB loaded; while they're loading the id-buffer isn't available).
+// After a few tries we give up on the GPU and fall back to the server raster
+// so highlights ALWAYS get footprints -- never a silent no-highlight.
+const _fpPrefetchTries = new Map();
 function _fpViewKey(fid, vid) { return fid + '|' + vid; }
 
 // Group-mode silhouette cache: keyed by (fid, vid, sorted-index-tuple)
@@ -7792,20 +7797,33 @@ async function prefetchFootprintsForCurrentView() {
     const allIdx = (fe0 && fe0.parts ? fe0.parts.map(p => p.idx) : []);
     if (!allIdx.length) { _footprintViewFetched.add(vkey); return; }
     let polys = null;
-    try { polys = _gpuRasterFootprints(fid, vid, allIdx); } catch (e) { polys = null; }
+    _gpuReason = '';
+    try { polys = _gpuRasterFootprints(fid, vid, allIdx); } catch (e) { _gpuReason = 'exc:' + (e && e.message || e); }
     if (polys) {
       _footprintViewFetched.add(vkey);
+      let n = 0;
       for (const [idx, pl] of Object.entries(polys)) {
-        _setFootprint(fid, vid, parseInt(idx), pl);
+        _setFootprint(fid, vid, parseInt(idx), pl); n += pl.length;
       }
+      _gpuLog({ reason: 'prefetch', why: 'ok', parts: allIdx.length, polylines: n });
       applyHighlights();
       if (typeof renderPersistentSilhouettes === 'function') renderPersistentSilhouettes();
     } else {
-      // 3D not ready (no id-buffer yet) -> retry shortly so styled parts
-      // still get their fills once the GLB has loaded.
-      setTimeout(prefetchFootprintsForCurrentView, 400);
+      // GPU not ready yet (SVG/3D still loading).  Retry a few times; if it
+      // still can't run, FALL BACK to the server raster so highlights always
+      // get footprints (slower, but reliable -- never a silent no-highlight).
+      const tries = (_fpPrefetchTries.get(vkey) || 0) + 1;
+      _fpPrefetchTries.set(vkey, tries);
+      if (tries <= 6) {
+        setTimeout(prefetchFootprintsForCurrentView, 400);
+      } else {
+        _gpuLog({ reason: 'prefetch', why: 'gpu-failed:' + _gpuReason + ' -> server fallback', tries });
+        // fall through to the server prefetch below
+      }
     }
-    return;
+    // Return UNLESS we've exhausted GPU retries -- in that case fall through
+    // to the server prefetch below.
+    if (polys || (_fpPrefetchTries.get(vkey) || 0) <= 6) return;
   }
   const apiBase = API_BASE;
   // Resolve camera body (same logic as fetchTrueSilhouettes)

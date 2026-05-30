@@ -23,6 +23,13 @@ echo ""
 # Folders to transfer (NOT viewer.html -- that's app code, not user data)
 FOLDERS=(figures views projects sources imports)
 
+SSH_OPTS="-o StrictHostKeyChecking=no -o BatchMode=yes"
+
+# Create remote directories first
+echo "Creating remote directories..."
+ssh $SSH_OPTS "$RENDER_SSH" "mkdir -p $REMOTE_DATA/figures $REMOTE_DATA/views $REMOTE_DATA/projects $REMOTE_DATA/sources $REMOTE_DATA/imports"
+echo ""
+
 for folder in "${FOLDERS[@]}"; do
   local_path="$LOCAL_OUT/$folder"
   if [ ! -d "$local_path" ]; then
@@ -31,10 +38,8 @@ for folder in "${FOLDERS[@]}"; do
   fi
   count=$(find "$local_path" -type f | wc -l | tr -d ' ')
   echo "  uploading $folder/ ($count files)..."
-  rsync -avz --progress \
-    -e "ssh -o StrictHostKeyChecking=no" \
-    "$local_path/" \
-    "$RENDER_SSH:$REMOTE_DATA/$folder/"
+  scp -r $SSH_OPTS "$local_path/." "$RENDER_SSH:$REMOTE_DATA/$folder/"
+  echo "  done."
   echo ""
 done
 
