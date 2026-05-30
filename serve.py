@@ -793,8 +793,19 @@ def _load_source_into_memory(*, file_id: str, step_path: Path,
     Used by boot() for static sources AND the Onshape-import worker
     for dynamic sources.  Skips silently if the STEP is missing."""
     if not step_path.exists():
-        print(f"  skip {file_id}: {step_path} missing")
-        return False
+        # The stored step_path may be an absolute path from another machine
+        # (e.g. a Windows dev box: C:\...\out\imports\foo.step) that doesn't
+        # exist on this server.  Fall back to the canonical location on the
+        # data disk: <OUT>/imports/<filename>.  This makes imported sources
+        # portable across machines / a fresh Render disk.
+        alt = OUT / "imports" / Path(step_path).name
+        if alt.exists():
+            print(f"  {file_id}: using {alt} (stored path absent)", flush=True)
+            step_path = alt
+        else:
+            print(f"  skip {file_id}: {step_path} missing "
+                  f"(fallback {alt} also absent)", flush=True)
+            return False
     print(f"  {file_id:<28s} ", end="", flush=True)
     t0 = time.time()
     try:
