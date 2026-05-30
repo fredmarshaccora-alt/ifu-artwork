@@ -7926,10 +7926,19 @@ function _gpuRasterFootprints(fid, vid, partIndices) {
   // injectLiveSVG; the existing flow already keeps it current.
   if (!viewDir || viewDir.length !== 3) return null;
 
-  // Render target: 1500x1500 RGB ID buffer.  PixelType.UnsignedByte
-  // keeps the readback fast and is plenty of precision for IDs up to
-  // 16.7M parts.
-  const RES = 1500;
+  // Resolve the FOCAL point the SVG was HLR-rendered with: live views use
+  // the camera target, static views use the world origin.  The (u,v) origin
+  // is measured relative to this focal, so the offscreen camera MUST look at
+  // it -- otherwise live-view footprints land offset from the line-art.
+  let focal = [0, 0, 0];
+  const _lc = window.IFU_VIEWER?._getLiveCamCtx?.(fid);
+  if (vid === '__live__' && _lc && Array.isArray(_lc.target)) focal = _lc.target;
+
+  // Render target: RGB ID buffer.  GPU resolution is nearly free (the
+  // render is trivial; only the readback + JS contour-trace scale with
+  // RES^2), so we run higher than the server raster for smoother small
+  // features.  UnsignedByte keeps readback fast; IDs go up to 16.7M parts.
+  const RES = 2048;
   if (!_gpuRTarget || _gpuRTarget.width !== RES) {
     if (_gpuRTarget) _gpuRTarget.dispose();
     _gpuRTarget = new THREE.WebGLRenderTarget(RES, RES, {
@@ -7985,24 +7994,20 @@ function _gpuRasterFootprints(fid, vid, partIndices) {
   _gpuOffscreenCam.right  = bounds.u_max;
   _gpuOffscreenCam.top    = bounds.v_max;
   _gpuOffscreenCam.bottom = bounds.v_min;
-  // Place the camera along the view direction, looking at the bbox
-  // centre.  Distance is large because the ortho frustum has its own
-  // near/far.
-  const cu = (bounds.u_min + bounds.u_max) / 2;
-  const cv = (bounds.v_min + bounds.v_max) / 2;
-  // Reconstruct a 3D centre that, when projected onto x_axis/y_axis,
-  // lands at (cu, cv).  Since OCCT's HLR uses x_axis = up x view_dir
-  // (normalised) and y_axis = view_dir x x_axis, we'd need those
-  // axes here too.  Easier: use the bounds bbox centre in WORLD via
-  // the existing 'active' group's bbox + the projection axes.
-  // ... For first cut, target the world origin and let lookAt do the
-  // rotation; the ortho frustum is sized in (u, v), so framing is
-  // already correct.
-  const vd = new THREE.Vector3(viewDir[0], viewDir[1], viewDir[2])
-    .normalize();
-  _gpuOffscreenCam.position.copy(vd).multiplyScalar(1e4);
-  _gpuOffscreenCam.up.set(0, 0, 1);  // matches OCCT projector convention
-  _gpuOffscreenCam.lookAt(0, 0, 0);
+  // Match OCCT's projector frame EXACTLY (build_projector, t5_hlr_vector.py).
+  // OCCT: z = +view_dir (observer side), x_axis = up x view_dir,
+  //       y_axis = view_dir x x_axis, with up = (0,0,1) unless the view is
+  //       near-vertical (|vd.z| >= 0.95) in which case up = (0,1,0).
+  // three.js's lookAt(eye->target) with the SAME up reproduces those exact
+  // x/y axes, so we only need: (a) the matching up, and (b) the camera to
+  // look at FOCAL (not the origin) so the (u,v) origin lines up.  The ortho
+  // frustum is already sized in (u,v), so framing is correct.
+  const vd = new THREE.Vector3(viewDir[0], viewDir[1], viewDir[2]).normalize();
+  const focalV = new THREE.Vector3(focal[0], focal[1], focal[2]);
+  _gpuOffscreenCam.up.set(0, 0, 1);
+  if (Math.abs(vd.z) >= 0.95) _gpuOffscreenCam.up.set(0, 1, 0);
+  _gpuOffscreenCam.position.copy(vd).multiplyScalar(1e4).add(focalV);
+  _gpuOffscreenCam.lookAt(focalV);
   _gpuOffscreenCam.updateProjectionMatrix();
 
   // Render and read back.
@@ -8097,15 +8102,36 @@ function _traceContoursFromIdMask(ids, w, h, partIdx) {
       } while (!(cy * w + cx === start && dir === startDir));
       if (polyline.length >= 3) {
         polyline.push(polyline[0]);   // close
-        // Crude DP-style simplification: drop points whose
-        // perpendicular distance from the line through their neighbours
-        // is below 1 px.  Cheap; keeps the loop under ~200 points for
-        // a typical part footprint.
-        polys.push(_dpSimplifyPixel(polyline, 1.0));
+        // Smooth the 1-px raster staircase BEFORE simplifying (same idea
+        // as the server-side smoother) so circles come out round and
+        // straight edges clean, then a light DP to trim points.
+        const sm = _smoothPixelPolyline(polyline, 2);
+        polys.push(_dpSimplifyPixel(sm, 0.6));
       }
     }
   }
   return polys;
+}
+
+// (1,2,1)/4 moving-average smoothing of a closed pixel polyline -- removes
+// the 1-px contour staircase while keeping circles round (mirrors the
+// server-side _smooth_closed_polyline).
+function _smoothPixelPolyline(pl, iters) {
+  const n = pl.length;
+  if (n < 9) return pl;
+  let pts = pl.slice(0, n - 1);     // drop the duplicate closing point
+  const m = pts.length;
+  if (m < 8) return pl;
+  for (let it = 0; it < iters; it++) {
+    const next = new Array(m);
+    for (let i = 0; i < m; i++) {
+      const a = pts[(i - 1 + m) % m], b = pts[i], c = pts[(i + 1) % m];
+      next[i] = [(a[0] + 2 * b[0] + c[0]) / 4, (a[1] + 2 * b[1] + c[1]) / 4];
+    }
+    pts = next;
+  }
+  pts.push(pts[0]);                 // re-close
+  return pts;
 }
 
 function _dpSimplifyPixel(pl, tol) {
