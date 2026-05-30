@@ -30,31 +30,29 @@ cache means only changed layers rebuild). Watch it at the dashboard URL above.
 
 ## First-time setup checklist
 
-### 1. Upload your existing data ✅ needed once
+### 1. Upload your existing data ✅ DONE (2026-05-30)
 
-Your local `out/` folder has figures, views, projects, and sources that the
-cloud server doesn't have yet (its `/data` disk started empty).
+The local `out/` data (291 files: figures, views, projects, sources,
+imports) was seeded to the Render `/data` disk over HTTPS via the
+token-guarded `/api/admin/upload` endpoint, because **SSH/scp to Render
+is blocked on the Accora network** (port 22 intercepted by the corporate
+proxy).
 
+To re-seed in future (after more local work):
 ```bash
-# In Git Bash from the project root:
-bash upload_data_to_render.sh
+# 1. Set IFU_UPLOAD_TOKEN on the Render service (a random secret).
+# 2. Redeploy so the container picks it up.
+# 3. Locally:
+set IFU_UPLOAD_TOKEN=<that token>
+python upload_data_https.py
+# 4. Clear IFU_UPLOAD_TOKEN on Render + redeploy to disable the endpoint.
 ```
+The endpoint is **disabled by default** (403 unless the token env var is
+set), writes only under figures/views/projects/sources/imports, and has a
+path-traversal guard. `upload_data_https.py` uses `truststore` so TLS
+verification stays on through the corporate SSL-inspection proxy.
 
-Requires an SSH key added to Render (see step 2). Safe to re-run — rsync.
-
-### 2. Add your SSH key to Render ✅ needed for data upload + SSH access
-
-In the Render dashboard for the `ifu-api` service:
-
-**Settings → SSH Keys → Add SSH Public Key**
-
-Paste the contents of `~/.ssh/id_rsa.pub` (or `id_ed25519.pub`).
-If you don't have one: `ssh-keygen -t ed25519` in Git Bash.
-
-After adding it, `render ssh srv-d8d0b5ek1jcs738f9on0` or the scp in
-`upload_data_to_render.sh` will work.
-
-### 3. Set Onshape API secrets ✅ needed to import new Onshape documents
+### 2. Set Onshape API secrets ✅ needed to import new Onshape documents
 
 In the Render dashboard: **Environment → Add Secret File / Secret**
 
@@ -66,7 +64,7 @@ In the Render dashboard: **Environment → Add Secret File / Secret**
 Keys are in your Onshape account: **Account → API Keys**.
 Already-imported sources (your local STEP/figures) work without these.
 
-### 4. Auth / access control ✅ before sharing with the team
+### 3. Auth / access control ✅ before sharing with the team
 
 The app has no login. Put **Cloudflare Access** in front — see **`CLOUDFLARE.md`**
 for the step-by-step. Needs a custom domain (e.g. `ifu.accora.com`) and your
