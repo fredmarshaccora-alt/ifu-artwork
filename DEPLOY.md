@@ -64,12 +64,12 @@ In the Render dashboard: **Environment → Add Secret File / Secret**
 Keys are in your Onshape account: **Account → API Keys**.
 Already-imported sources (your local STEP/figures) work without these.
 
-### 3. Auth / access control ✅ before sharing with the team
+### 3. Auth / access control ✅ DONE — Supabase magic-link
 
-The app has no login. Put **Cloudflare Access** in front — see **`CLOUDFLARE.md`**
-for the step-by-step. Needs a custom domain (e.g. `ifu.accora.com`) and your
-IdP (Entra/Google) or email OTP. I'll make the one small app-side change once
-you pick the domain.
+The app is gated by **Supabase magic-link** auth: team members sign in with
+their `@accora.care` email (one-time link). Data endpoints (`/api/*`) 401
+without a valid session. Full details + how to add domains / providers in
+**`AUTH.md`**. (The Cloudflare route in `CLOUDFLARE.md` was not used.)
 
 ---
 

@@ -1,3 +1,7 @@
+> ⚠️ **Superseded — not in use.** We chose **Supabase magic-link** auth
+> instead (no custom domain / DNS / token needed). See **`AUTH.md`** for the
+> live setup. This file is kept only as a reference for the Cloudflare route.
+
 # Auth via Cloudflare Access (Zero Trust)
 
 The app has no login of its own. Cloudflare Access sits **in front** of
