@@ -7781,13 +7781,32 @@ async function prefetchFootprintsForCurrentView() {
   const vkey = _fpViewKey(fid, vid);
   if (_footprintViewFetched.has(vkey)) return;
   if (typeof API_BASE !== 'string') return;
-  // With the GPU rasteriser on, footprints are produced on-demand,
-  // client-side, per highlight (~100 ms).  Skipping the server pre-raster
-  // here is what lets the GPU path engage at all -- otherwise this fills
-  // the cache first and every highlight is a cache hit on the slow result.
-  // (The assembly-silhouette prefetch is skipped too; tracked as a
-  // follow-up to compute it from the GPU id-buffer.)
-  if (_GPU_RASTER_ON) { _footprintViewFetched.add(vkey); return; }
+  // With the GPU rasteriser on, do the prefetch on the GPU instead of the
+  // 30-60 s server raster: ONE offscreen id-buffer render covers the whole
+  // assembly, then we trace every part's contour from it (fast).  This
+  // populates footprints for ALL parts -- so the applied-preset (persistent)
+  // bold fills have data on load, not just the parts the user clicks, while
+  // keeping the speed win.  Needs the 3D GLB loaded; if it isn't yet, retry.
+  if (_GPU_RASTER_ON) {
+    const fe0 = CATALOGUE.find(x => x.file_id === fid);
+    const allIdx = (fe0 && fe0.parts ? fe0.parts.map(p => p.idx) : []);
+    if (!allIdx.length) { _footprintViewFetched.add(vkey); return; }
+    let polys = null;
+    try { polys = _gpuRasterFootprints(fid, vid, allIdx); } catch (e) { polys = null; }
+    if (polys) {
+      _footprintViewFetched.add(vkey);
+      for (const [idx, pl] of Object.entries(polys)) {
+        _setFootprint(fid, vid, parseInt(idx), pl);
+      }
+      applyHighlights();
+      if (typeof renderPersistentSilhouettes === 'function') renderPersistentSilhouettes();
+    } else {
+      // 3D not ready (no id-buffer yet) -> retry shortly so styled parts
+      // still get their fills once the GLB has loaded.
+      setTimeout(prefetchFootprintsForCurrentView, 400);
+    }
+    return;
+  }
   const apiBase = API_BASE;
   // Resolve camera body (same logic as fetchTrueSilhouettes)
   const fe = CATALOGUE.find(x => x.file_id === fid);
