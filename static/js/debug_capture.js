@@ -107,6 +107,16 @@
     captureNow('auto');
   }, 1500);
 
+  // One-shot capture after load + on route change, so a fresh navigation
+  // (including one driven server-side for debugging) pushes a current view
+  // even without a user interaction.
+  function _loadCapture() { setTimeout(function () { captureNow('load'); }, 3500); }
+  if (document.readyState === 'complete') _loadCapture();
+  else window.addEventListener('load', _loadCapture, { once: true });
+  window.addEventListener('hashchange', function () {
+    setTimeout(function () { captureNow('route'); }, 2800);
+  });
+
   // ---- manual triggers -----------------------------------------------------
   window.addEventListener('keydown', function (e) {
     if ((e.ctrlKey || e.metaKey) && e.shiftKey &&
