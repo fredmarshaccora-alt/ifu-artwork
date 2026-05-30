@@ -187,6 +187,14 @@ function init() {
   controls.target.set(0, 0, 0);
   controls.enableDamping = true;
   controls.dampingFactor = 0.08;
+  // Pan in the screen plane (drag moves the model with the cursor) instead
+  // of the default world-up plane, which feels wrong once the model has an
+  // up-axis rotation -- a big part of the "awful navigation".
+  controls.screenSpacePanning = true;
+  // Sensible speeds + don't let zoom blow past the model or flip over.
+  controls.rotateSpeed = 0.9;
+  controls.zoomSpeed = 0.9;
+  controls.panSpeed = 0.9;
   controls.update();
   // On-demand rendering: only re-render when something visible changed.
   // OrbitControls fires 'change' on every drag/zoom; damping then
@@ -478,9 +486,9 @@ function _buildEdgesInIdleChunks(meshes, file_id) {
         const lines = new THREE.LineSegments(
           edges,
           new THREE.LineBasicMaterial({
-            color: 0x3a4554,
+            color: 0x2a3340,
             transparent: true,
-            opacity: 0.22,
+            opacity: 0.55,
             linewidth: 1,
           })
         );
