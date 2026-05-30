@@ -1042,6 +1042,77 @@ window.IFU_VIEWER.capture3D = function () {
   } catch (e) { return null; }
 };
 window.IFU_VIEWER._scene = () => scene;
+
+// ---- GPU footprint id-buffer --------------------------------------------
+// The classic script's footprint rasteriser lives in viewer.classic.js, which
+// can't see THREE / renderer / active (they're module-scoped here -- the GPU
+// path used to throw "renderer is not defined").  Expose a function that does
+// the three.js part: render the active GLB into an offscreen ID-coloured
+// buffer (one flat colour per part_idx) using a camera matched to OCCT's
+// projector, read it back, and return a per-pixel Int32 id map.  The classic
+// side then traces contours from it.
+let _gpuRTarget = null, _gpuOffScene = null, _gpuOffCam = null, _gpuOffFid = null;
+function _encPartColor(idx) {
+  const v = idx + 1;
+  return ((v & 0xff) << 16) | (((v >> 8) & 0xff) << 8) | ((v >> 16) & 0xff);
+}
+window.IFU_VIEWER.gpuIdBuffer = function (bounds, viewDir, focal, RES) {
+  if (!renderer || !active) return null;
+  RES = RES || 2048;
+  if (!_gpuRTarget || _gpuRTarget.width !== RES) {
+    if (_gpuRTarget) _gpuRTarget.dispose();
+    _gpuRTarget = new THREE.WebGLRenderTarget(RES, RES, {
+      type: THREE.UnsignedByteType, format: THREE.RGBAFormat,
+      depthBuffer: true, stencilBuffer: false,
+    });
+  }
+  // (Re)build the id-coloured offscreen scene when the source changes.
+  const fid = window.IFU_VIEWER.getActiveFileId && window.IFU_VIEWER.getActiveFileId();
+  if (!_gpuOffScene || _gpuOffFid !== fid) {
+    if (_gpuOffScene) _gpuOffScene.traverse(o => { if (o.isMesh && o.material) o.material.dispose(); });
+    _gpuOffScene = new THREE.Scene();
+    _gpuOffScene.background = new THREE.Color(0x000000);
+    _gpuOffFid = fid;
+    active.updateMatrixWorld(true);
+    active.traverse(o => {
+      if (!o.isMesh) return;
+      const idx = _partIdxOf(o);
+      if (idx == null) return;
+      const mat = new THREE.MeshBasicMaterial({
+        color: new THREE.Color(_encPartColor(idx)),
+        side: THREE.DoubleSide, toneMapped: false,
+      });
+      const m = new THREE.Mesh(o.geometry, mat);
+      m.applyMatrix4(o.matrixWorld);
+      _gpuOffScene.add(m);
+    });
+  }
+  if (!_gpuOffCam) _gpuOffCam = new THREE.OrthographicCamera(-1, 1, 1, -1, -1e6, 1e6);
+  _gpuOffCam.left = bounds.u_min; _gpuOffCam.right = bounds.u_max;
+  _gpuOffCam.top = bounds.v_max;  _gpuOffCam.bottom = bounds.v_min;
+  // Match OCCT's projector (see build_projector): up=(0,0,1) unless the view
+  // is near-vertical, look at the focal so (u,v) origins line up.
+  const vd = new THREE.Vector3(viewDir[0], viewDir[1], viewDir[2]).normalize();
+  const fv = new THREE.Vector3(focal[0] || 0, focal[1] || 0, focal[2] || 0);
+  _gpuOffCam.up.set(0, 0, 1);
+  if (Math.abs(vd.z) >= 0.95) _gpuOffCam.up.set(0, 1, 0);
+  _gpuOffCam.position.copy(vd).multiplyScalar(1e4).add(fv);
+  _gpuOffCam.lookAt(fv);
+  _gpuOffCam.updateProjectionMatrix();
+  const prev = renderer.getRenderTarget();
+  renderer.setRenderTarget(_gpuRTarget);
+  renderer.clear();
+  renderer.render(_gpuOffScene, _gpuOffCam);
+  renderer.setRenderTarget(prev);
+  const buf = new Uint8Array(RES * RES * 4);
+  renderer.readRenderTargetPixels(_gpuRTarget, 0, 0, RES, RES, buf);
+  const ids = new Int32Array(RES * RES);
+  for (let i = 0, p = 0; i < ids.length; i++, p += 4) {
+    const v = (buf[p] << 16) | (buf[p + 1] << 8) | buf[p + 2];
+    ids[i] = v ? v - 1 : -1;
+  }
+  return { ids: ids, RES: RES };
+};
 window.IFU_VIEWER._camera = () => camera;
 window.IFU_VIEWER._renderer = () => renderer;
 window.IFU_VIEWER._active = () => active;

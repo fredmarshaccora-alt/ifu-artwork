@@ -7937,8 +7937,8 @@ function _gpuLog(o) {
 function _gpuRasterFootprints(fid, vid, partIndices) {
   // Returns null on any failure -> caller falls back to server path.
   if (!_GPU_RASTER_ON) return null;
-  if (!renderer || !active) {
-    _gpuReason = 'no-3d(r=' + !!renderer + ',a=' + !!active + ')';
+  if (!window.IFU_VIEWER || !window.IFU_VIEWER.gpuIdBuffer) {
+    _gpuReason = 'no-module';
     return null;
   }
   const bounds = _readViewBoxFromActiveSvg();
@@ -7965,97 +7965,14 @@ function _gpuRasterFootprints(fid, vid, partIndices) {
   const _lc = window.IFU_VIEWER?._getLiveCamCtx?.(fid);
   if (vid === '__live__' && _lc && Array.isArray(_lc.target)) focal = _lc.target;
 
-  // Render target: RGB ID buffer.  GPU resolution is nearly free (the
-  // render is trivial; only the readback + JS contour-trace scale with
-  // RES^2), so we run higher than the server raster for smoother small
-  // features.  UnsignedByte keeps readback fast; IDs go up to 16.7M parts.
+  // The three.js render + readback runs in viewer.module.js (where THREE,
+  // renderer and `active` live -- they're not in this classic script's
+  // scope, which is why this path used to throw "renderer is not defined").
+  // It returns a per-pixel Int32 id map matched to the (u,v) viewBox.
   const RES = 2048;
-  if (!_gpuRTarget || _gpuRTarget.width !== RES) {
-    if (_gpuRTarget) _gpuRTarget.dispose();
-    _gpuRTarget = new THREE.WebGLRenderTarget(RES, RES, {
-      type: THREE.UnsignedByteType,
-      format: THREE.RGBAFormat,
-      depthBuffer: true,
-      stencilBuffer: false,
-    });
-  }
-
-  // Build (or reuse) a parallel scene that holds id-coloured meshes
-  // for the active source.  We can't reuse 'scene' because we'd have
-  // to swap every material's color/material on every raster.  Clone
-  // the meshes' geometries (cheap) and give each its own BasicMaterial.
-  if (!_gpuOffscreenScene
-      || _gpuOffscreenScene.userData.file_id !== fid) {
-    if (_gpuOffscreenScene) {
-      _gpuOffscreenScene.traverse(o => {
-        if (o.isMesh) {
-          o.material.dispose();
-        }
-      });
-    }
-    _gpuOffscreenScene = new THREE.Scene();
-    _gpuOffscreenScene.background = new THREE.Color(0x000000);
-    _gpuOffscreenScene.userData.file_id = fid;
-    // Walk the active group and clone every mesh with a flat
-    // id-coloured BasicMaterial; preserve world transform.
-    active.updateMatrixWorld();
-    active.traverse(o => {
-      if (!o.isMesh) return;
-      const idx = _partIdxOf(o);
-      if (idx == null) return;
-      const color = new THREE.Color(_encodePartColor(idx));
-      const mat = new THREE.MeshBasicMaterial({
-        color, side: THREE.DoubleSide,
-        // No tone-mapping, no IBL: the colour MUST come out byte-
-        // identical to what we asked for.
-        toneMapped: false,
-      });
-      const m = new THREE.Mesh(o.geometry, mat);
-      m.applyMatrix4(o.matrixWorld);
-      _gpuOffscreenScene.add(m);
-    });
-  }
-
-  // Camera: OrthographicCamera matched to the SVG's viewBox so each
-  // rendered pixel is a known (u, v) sample.
-  if (!_gpuOffscreenCam) {
-    _gpuOffscreenCam = new THREE.OrthographicCamera(-1, 1, 1, -1, -1e6, 1e6);
-  }
-  _gpuOffscreenCam.left   = bounds.u_min;
-  _gpuOffscreenCam.right  = bounds.u_max;
-  _gpuOffscreenCam.top    = bounds.v_max;
-  _gpuOffscreenCam.bottom = bounds.v_min;
-  // Match OCCT's projector frame EXACTLY (build_projector, t5_hlr_vector.py).
-  // OCCT: z = +view_dir (observer side), x_axis = up x view_dir,
-  //       y_axis = view_dir x x_axis, with up = (0,0,1) unless the view is
-  //       near-vertical (|vd.z| >= 0.95) in which case up = (0,1,0).
-  // three.js's lookAt(eye->target) with the SAME up reproduces those exact
-  // x/y axes, so we only need: (a) the matching up, and (b) the camera to
-  // look at FOCAL (not the origin) so the (u,v) origin lines up.  The ortho
-  // frustum is already sized in (u,v), so framing is correct.
-  const vd = new THREE.Vector3(viewDir[0], viewDir[1], viewDir[2]).normalize();
-  const focalV = new THREE.Vector3(focal[0], focal[1], focal[2]);
-  _gpuOffscreenCam.up.set(0, 0, 1);
-  if (Math.abs(vd.z) >= 0.95) _gpuOffscreenCam.up.set(0, 1, 0);
-  _gpuOffscreenCam.position.copy(vd).multiplyScalar(1e4).add(focalV);
-  _gpuOffscreenCam.lookAt(focalV);
-  _gpuOffscreenCam.updateProjectionMatrix();
-
-  // Render and read back.
-  const prevTarget = renderer.getRenderTarget();
-  renderer.setRenderTarget(_gpuRTarget);
-  renderer.clear();
-  renderer.render(_gpuOffscreenScene, _gpuOffscreenCam);
-  renderer.setRenderTarget(prevTarget);
-
-  const buf = new Uint8Array(RES * RES * 4);
-  renderer.readRenderTargetPixels(_gpuRTarget, 0, 0, RES, RES, buf);
-
-  // Build a Uint32 id map (per pixel) for fast lookup.
-  const ids = new Int32Array(RES * RES);
-  for (let i = 0, p = 0; i < ids.length; i++, p += 4) {
-    ids[i] = _decodePartIdFromRgb(buf[p], buf[p + 1], buf[p + 2]);
-  }
+  const idbuf = window.IFU_VIEWER.gpuIdBuffer(bounds, viewDir, focal, RES);
+  if (!idbuf || !idbuf.ids) { _gpuReason = 'no-idbuffer'; return null; }
+  const ids = idbuf.ids;
 
   // For each requested part_idx, trace closed contour(s) of its mask.
   const px_per_mm_u = (RES - 2) / (bounds.u_max - bounds.u_min);
