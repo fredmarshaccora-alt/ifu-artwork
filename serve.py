@@ -846,6 +846,50 @@ def favicon():
     return resp
 
 
+@app.route("/api/admin/upload", methods=["PUT", "POST"])
+def admin_upload():
+    """Token-guarded data upload (HTTPS) for seeding the persistent disk.
+
+    SSH/scp to Render is blocked on locked-down corporate networks
+    (port 22 intercepted), so this lets us push the local out/ data
+    (figures, views, projects, sources, imports) over HTTPS instead.
+
+    DISABLED unless IFU_UPLOAD_TOKEN is set in the environment.  Clear
+    that env var (and redeploy) to turn the endpoint off again after the
+    one-time seed.
+
+    Request: header  X-Upload-Token: <token>
+             header  X-Rel-Path: figures/<id>.json   (relative to OUT)
+             body    raw file bytes
+    """
+    token = os.environ.get("IFU_UPLOAD_TOKEN", "")
+    if not token:
+        return jsonify(error="upload endpoint disabled"), 403
+    if request.headers.get("X-Upload-Token", "") != token:
+        return jsonify(error="bad token"), 403
+
+    rel = request.headers.get("X-Rel-Path", "").strip().replace("\\", "/")
+    if not rel:
+        return jsonify(error="missing X-Rel-Path"), 400
+
+    # Path-traversal guard: resolve and confirm the target stays under OUT.
+    base = OUT.resolve()
+    target = (base / rel).resolve()
+    try:
+        target.relative_to(base)
+    except ValueError:
+        return jsonify(error="path escapes data dir"), 400
+    # Only allow the known data sub-trees.
+    allowed = ("figures/", "views/", "projects/", "sources/", "imports/")
+    if not any(rel.startswith(a) for a in allowed):
+        return jsonify(error=f"path must be under one of {allowed}"), 400
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    data = request.get_data()
+    target.write_bytes(data)
+    return jsonify(ok=True, path=rel, bytes=len(data))
+
+
 @app.route("/")
 def index():
     """Serve the bundled viewer.  After a rebuild Chrome's memory cache
