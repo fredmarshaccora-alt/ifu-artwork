@@ -796,11 +796,16 @@ def _load_source_into_memory(*, file_id: str, step_path: Path,
         # The stored step_path may be an absolute path from another machine
         # (e.g. a Windows dev box: C:\...\out\imports\foo.step) that doesn't
         # exist on this server.  Fall back to the canonical location on the
-        # data disk: <OUT>/imports/<filename>.  This makes imported sources
-        # portable across machines / a fresh Render disk.
-        alt = OUT / "imports" / Path(step_path).name
+        # data disk: <OUT>/imports/<filename>.  ntpath.basename handles BOTH
+        # Windows ('\\') and POSIX ('/') separators regardless of the OS we
+        # run on -- a plain Path(...).name on Linux would NOT strip a Windows
+        # directory.  Makes imported sources portable across machines / disks.
+        import ntpath
+        base = ntpath.basename(str(step_path))
+        alt = OUT / "imports" / base
         if alt.exists():
-            print(f"  {file_id}: using {alt} (stored path absent)", flush=True)
+            print(f"  {file_id}: using {alt} (stored path '{step_path}' absent)",
+                  flush=True)
             step_path = alt
         else:
             print(f"  skip {file_id}: {step_path} missing "
