@@ -7766,6 +7766,13 @@ async function prefetchFootprintsForCurrentView() {
   const vkey = _fpViewKey(fid, vid);
   if (_footprintViewFetched.has(vkey)) return;
   if (typeof API_BASE !== 'string') return;
+  // With the GPU rasteriser on, footprints are produced on-demand,
+  // client-side, per highlight (~100 ms).  Skipping the server pre-raster
+  // here is what lets the GPU path engage at all -- otherwise this fills
+  // the cache first and every highlight is a cache hit on the slow result.
+  // (The assembly-silhouette prefetch is skipped too; tracked as a
+  // follow-up to compute it from the GPU id-buffer.)
+  if (_GPU_RASTER_ON) { _footprintViewFetched.add(vkey); return; }
   const apiBase = API_BASE;
   // Resolve camera body (same logic as fetchTrueSilhouettes)
   const fe = CATALOGUE.find(x => x.file_id === fid);
@@ -7876,8 +7883,11 @@ function injectHitFillLayer(_fid, _vid) { /* no-op (reverted) */ }
 //     known (u, v) sample.
 //   * Camera position = focal - view_dir * far_offset; camera.lookAt(focal)
 //     so the depth axis matches OCCT's projector frame.
+// On by default now (the offscreen camera matches OCCT's projector); the
+// server raster remains the automatic fallback on any failure.  Disable
+// explicitly with ?gpu_raster=0.
 const _GPU_RASTER_ON =
-    (new URLSearchParams(location.search)).get('gpu_raster') === '1';
+    (new URLSearchParams(location.search)).get('gpu_raster') !== '0';
 let _gpuRTarget = null;
 let _gpuOffscreenScene = null;
 let _gpuOffscreenCam = null;
