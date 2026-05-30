@@ -17,5 +17,8 @@ requests==2.32.5
 requests-oauthlib==2.0.0
 requests-toolbelt==1.0.0
 python-dotenv==1.0.0
+# Supabase magic-link auth: verify user JWTs against the project's public
+# JWKS (ES256).  [crypto] pulls `cryptography` for asymmetric verification.
+PyJWT[crypto]==2.9.0
 # Production WSGI server (replaces Flask's dev server).
 gunicorn==23.0.0

@@ -152,6 +152,11 @@ HTML_TEMPLATE = r"""<!doctype html>
      same-origin (local / single-host).  On Vercel, point it at the
      Render API.  Loads first so API_BASE resolves correctly. -->
 <script src="/static/config.js"></script>
+<!-- Supabase magic-link auth gate. Loads before the app so it can mirror the
+     session token into a cookie + show the login overlay. No-op when
+     IFU_SUPABASE_URL is empty (local dev). -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="/static/js/auth.js"></script>
 </head>
 <body>
 <header>

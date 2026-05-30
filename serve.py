@@ -191,6 +191,77 @@ HERE = Path(__file__).parent
 app = Flask(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Authentication (Supabase magic-link).  OPT-IN via IFU_REQUIRE_AUTH=1 so
+# local dev stays open.  The front-end (static/js/auth.js) signs the user in
+# with Supabase and mirrors the short-lived access token into an `ifu_token`
+# cookie; we verify that JWT here against Supabase's public JWKS (ES256 --
+# no shared secret to hold) and enforce the allowed e-mail domain(s).
+# Cookie rather than header because the app loads thumbnails via <img src>,
+# which cannot send an Authorization header -- a cookie rides along with both
+# fetch() and <img> requests on the same origin.
+# ---------------------------------------------------------------------------
+_AUTH_REQUIRED = os.environ.get("IFU_REQUIRE_AUTH") == "1"
+_AUTH_JWKS_URL = os.environ.get("SUPABASE_JWKS_URL", "")
+_AUTH_DOMAINS = tuple(
+    d.strip().lower()
+    for d in os.environ.get("IFU_ALLOWED_EMAIL_DOMAINS", "").split(",")
+    if d.strip()
+)
+_jwk_client = None
+if _AUTH_REQUIRED and _AUTH_JWKS_URL:
+    try:
+        import jwt
+        from jwt import PyJWKClient
+        _jwk_client = PyJWKClient(_AUTH_JWKS_URL)
+        print(f"  (auth: ENABLED; domains={_AUTH_DOMAINS or 'any'})", flush=True)
+    except Exception as _exc:
+        print(f"  (auth: PyJWT/JWKS unavailable: {_exc}; auth DISABLED)",
+              flush=True)
+        _AUTH_REQUIRED = False
+
+# Reachable without a session: the HTML shell + static assets (they hold no
+# data -- the front-end shows the login overlay over them), the health check.
+# Everything else under /api/* requires a valid token.
+_AUTH_PUBLIC_PATHS = {"/", "/viewer.html", "/favicon.ico", "/api/healthz"}
+
+
+def _auth_token_from_request():
+    h = request.headers.get("Authorization", "")
+    if h.startswith("Bearer "):
+        return h[7:].strip()
+    return request.cookies.get("ifu_token")
+
+
+@app.before_request
+def _require_auth():
+    if not _AUTH_REQUIRED:
+        return
+    if request.method == "OPTIONS":
+        return
+    p = request.path
+    if p in _AUTH_PUBLIC_PATHS or p.startswith("/static/"):
+        return
+    if not p.startswith("/api/"):
+        return
+    token = _auth_token_from_request()
+    if not token:
+        return jsonify(error="authentication required"), 401
+    try:
+        signing_key = _jwk_client.get_signing_key_from_jwt(token).key
+        claims = jwt.decode(
+            token, signing_key, algorithms=["ES256"],
+            audience="authenticated",
+            options={"require": ["exp"], "verify_aud": True},
+        )
+    except Exception:
+        return jsonify(error="invalid or expired session"), 401
+    email = (claims.get("email") or "").lower()
+    if _AUTH_DOMAINS and not any(email.endswith("@" + d) for d in _AUTH_DOMAINS):
+        return jsonify(error="email domain not permitted"), 403
+    request.environ["ifu_user_email"] = email
+
+
 @app.before_request
 def _log_start():
     """Stamp the start time + log a request-start event.  Stored on
