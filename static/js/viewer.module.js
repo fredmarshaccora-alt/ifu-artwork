@@ -1237,6 +1237,12 @@ const _ARROW_TEAL = 0x00836a;
 function _applyPendingAnnot() {
   if (!_pendingAnnotState || !active) return;
   const st = _pendingAnnotState;
+  // Consume the pending state BEFORE applying.  setExplodeOffsets() ->
+  // _buildPartNodeIndex() re-calls _applyPendingAnnot() (so a figure
+  // restore can wait for the 3D nodes to exist); without clearing first
+  // that re-entry recurses forever -> "Maximum call stack size exceeded"
+  // and the editor hangs on load.
+  _pendingAnnotState = null;
   if (st.explode) setExplodeOffsets(st.explode);
   if (st.arrows) setArrows(st.arrows);
 }
