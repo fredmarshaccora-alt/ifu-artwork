@@ -7720,6 +7720,11 @@ async function fetchSelectedFootprints() {
         console.log(`[footprint] GPU raster ${missing.length} parts in `
                     + `${dt.toFixed(0)}ms, ${n} polylines`);
         applyHighlights();
+        // The bold APPLIED-preset layer (renderPersistentSilhouettes) also
+        // needs these footprints; applyHighlights only redraws the transient
+        // selection layer.  Without this, applying a preset before the
+        // footprint arrived left the bold fill empty.
+        if (typeof renderPersistentSilhouettes === 'function') renderPersistentSilhouettes();
         return;
       }
     } catch (e) {
@@ -7765,6 +7770,7 @@ async function fetchSelectedFootprints() {
                 + _empty + ' empty.  Stats: '
                 + JSON.stringify(data.stats || {}));
     applyHighlights();   // re-render bold edge with the new footprints
+    if (typeof renderPersistentSilhouettes === 'function') renderPersistentSilhouettes();
   } catch (e) {
     console.warn('[footprint] fetch failed:', e.message || e);
   }
@@ -7819,6 +7825,7 @@ async function prefetchFootprintsForCurrentView() {
     }
     injectHitFillLayer(fid, vid);
     applyHighlights();   // re-render bold stroke using footprints
+    if (typeof renderPersistentSilhouettes === 'function') renderPersistentSilhouettes();
   } catch (e) {
     console.warn('[footprint] prefetch failed:', e.message || e);
     _footprintViewFetched.delete(vkey);
