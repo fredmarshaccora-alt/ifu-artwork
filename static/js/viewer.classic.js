@@ -7715,6 +7715,7 @@ async function fetchSelectedFootprints() {
         return;
       }
     } catch (e) {
+      _gpuLog({ reason: 'exception', err: String((e && e.stack) || (e && e.message) || e).slice(0, 300) });
       console.warn('[footprint] GPU raster failed, falling back:', e);
     }
   }
