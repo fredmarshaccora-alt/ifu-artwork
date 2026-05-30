@@ -305,10 +305,12 @@ function handleCanvasClick(e) {
     if (rawHits.length) _placeArrowFromHit(rawHits[0]);
     return;
   }
-  // Explode mode: click attaches the translate gizmo to the picked part.
+  // Explode mode: click toggles the picked part in the explode selection
+  // (SolidWorks/Onshape-style multi-select); the triad attaches to the
+  // selection centroid so dragging moves them all together.
   if (_annotMode === 'explode' && rawHits.length) {
     const pidx = _partIdxOf(rawHits[0].object);
-    if (pidx != null) { attachExplodeGizmo(pidx); return; }
+    if (pidx != null) { toggleExplodeSelection(pidx); return; }
   }
 
   const hits = [];
@@ -1244,7 +1246,10 @@ window.IFU_VIEWER.applyPartStyles3D = (stylesByIdx) => {
 let _annotMode = 'none';        // 'none' | 'explode' | 'arrow-straight' | 'arrow-rotation'
 let _partNodeByIdx = new Map(); // idx -> top-most part_NNN Object3D
 let _gizmo = null;              // TransformControls for manual explode drag
-let _gizmoTarget = null;        // currently gizmo-attached part node
+let _gizmoTarget = null;        // currently gizmo-attached part node / pivot
+let _explodeSel = new Set();    // part idxs selected for explode (multi-select)
+let _explodePivot = null;       // Object3D the triad attaches to (child of active)
+let _pivotLast = null;          // pivot.position (active-local) at last change
 let _arrowDefs = [];            // model-frame arrow defs (sent to server)
 let _arrowGroup = null;         // THREE.Group holding the 3D arrow previews
 let _currentPresetId = null;    // line-style preset id for the render POST
@@ -1328,7 +1333,10 @@ function clearExplode() {
   _partNodeByIdx.forEach(node => {
     if (node.userData._basePos) node.position.copy(node.userData._basePos);
   });
+  _explodeSel.forEach(idx => _setExplodeSelGlow(idx, false));
+  _explodeSel.clear();
   _detachGizmo();
+  _emitExplodeChanged();
   requestRender();
 }
 
@@ -1346,6 +1354,8 @@ function _ensureGizmo() {
   });
   _gizmo.addEventListener('change', requestRender);
   _gizmo.addEventListener('objectChange', requestRender);
+  // Multi-part explode: when the pivot moves, drag all selected parts with it.
+  _gizmo.addEventListener('objectChange', _onExplodePivotChange);
   // three r160: TransformControls is an Object3D and is added to the scene.
   const helper = _gizmo.getHelper ? _gizmo.getHelper() : _gizmo;
   helper.userData._helper = true;
@@ -1398,6 +1408,134 @@ function setExplodeOffsets(offsets) {
         node.userData._basePos.z + off[2]);
     }
   }
+  requestRender();
+  _emitExplodeChanged();   // refresh the panel's exploded-parts list on restore
+}
+
+// ---- Multi-part explode selection + triad (SolidWorks/Onshape style) -------
+// Click parts to build a selection; a translate triad sits at the selection
+// centroid (axes in the model frame).  Dragging an axis -- or the axis
+// buttons + distance field in the panel -- moves every selected part together.
+// The result is read back through getExplodeOffsets() exactly as before, so
+// figure save/load + the 2D HLR render are unchanged.
+
+function _emitExplodeChanged() {
+  try {
+    window.dispatchEvent(new CustomEvent('ifu:explode-changed', {
+      detail: { selection: [..._explodeSel], offsets: getExplodeOffsets() },
+    }));
+  } catch (e) { /* no-op */ }
+}
+
+function _setExplodeSelGlow(idx, on) {
+  const node = _partNodeByIdx.get(idx);
+  if (!node) return;
+  node.traverse(o => {
+    if (!o.isMesh || !o.material || !o.material.emissive) return;
+    if (on) {
+      if (o.userData._emSaved === undefined)
+        o.userData._emSaved = o.material.emissive.getHex();
+      o.material.emissive.setHex(0x14507a);
+    } else if (o.userData._emSaved !== undefined) {
+      o.material.emissive.setHex(o.userData._emSaved);
+      delete o.userData._emSaved;
+    }
+  });
+}
+
+function getExplodeSelection() { return [..._explodeSel]; }
+
+function toggleExplodeSelection(idx) {
+  if (!active) return;
+  _buildPartNodeIndex();
+  if (_explodeSel.has(idx)) { _explodeSel.delete(idx); _setExplodeSelGlow(idx, false); }
+  else { _explodeSel.add(idx); _setExplodeSelGlow(idx, true); }
+  _refreshExplodeTriad();
+  _emitExplodeChanged();
+  requestRender();
+}
+
+function clearExplodeSelection() {
+  _explodeSel.forEach(idx => _setExplodeSelGlow(idx, false));
+  _explodeSel.clear();
+  _detachGizmo();
+  _emitExplodeChanged();
+  requestRender();
+}
+
+function _selCentroidLocal() {
+  const c = new THREE.Vector3(); let n = 0;
+  _explodeSel.forEach(idx => {
+    const node = _partNodeByIdx.get(idx);
+    if (node) { c.add(node.position); n++; }   // node.position is active-local
+  });
+  if (n) c.multiplyScalar(1 / n);
+  return c;
+}
+
+function _ensureExplodePivot() {
+  if (!_explodePivot) {
+    _explodePivot = new THREE.Object3D();
+    _explodePivot.name = '__explode_pivot__';
+    _explodePivot.userData._helper = true;
+  }
+  if (_explodePivot.parent !== active) active.add(_explodePivot);
+  return _explodePivot;
+}
+
+function _refreshExplodeTriad() {
+  if (!_explodeSel.size || !active) { _detachGizmo(); return; }
+  const piv = _ensureExplodePivot();
+  piv.position.copy(_selCentroidLocal());
+  piv.quaternion.identity();
+  piv.updateMatrixWorld(true);
+  const g = _ensureGizmo();
+  if (g.setSpace) g.setSpace('local');   // axes align to the model frame
+  g.attach(piv);
+  _gizmoTarget = piv;
+  _pivotLast = piv.position.clone();
+  requestRender();
+}
+
+// Called on every gizmo objectChange; when the pivot is the target, apply its
+// local-frame delta to all selected parts.
+function _onExplodePivotChange() {
+  if (!_explodePivot || _gizmoTarget !== _explodePivot || !_pivotLast) return;
+  const d = _explodePivot.position.clone().sub(_pivotLast);
+  if (d.lengthSq() === 0) return;
+  _buildPartNodeIndex();
+  _explodeSel.forEach(idx => {
+    const node = _partNodeByIdx.get(idx);
+    if (node && node.userData._basePos) node.position.add(d);
+  });
+  _pivotLast = _explodePivot.position.clone();
+  _emitExplodeChanged();
+}
+
+// Axis nudge from the panel: move the selected parts by `dist` mm along a
+// model-frame axis ('x'|'y'|'z').  Additive, like dragging the triad arrow.
+function explodeNudge(axis, dist) {
+  if (!_explodeSel.size || !active) return;
+  _buildPartNodeIndex();
+  const v = new THREE.Vector3(
+    axis === 'x' ? dist : 0, axis === 'y' ? dist : 0, axis === 'z' ? dist : 0);
+  _explodeSel.forEach(idx => {
+    const node = _partNodeByIdx.get(idx);
+    if (node && node.userData._basePos) node.position.add(v);
+  });
+  _refreshExplodeTriad();
+  _emitExplodeChanged();
+  requestRender();
+}
+
+// Return a single selected part to its assembled position (and deselect it).
+function resetExplodePart(idx) {
+  _buildPartNodeIndex();
+  const node = _partNodeByIdx.get(idx);
+  if (node && node.userData._basePos) node.position.copy(node.userData._basePos);
+  if (_explodeSel.has(idx)) { _explodeSel.delete(idx); _setExplodeSelGlow(idx, false); }
+  _refreshExplodeTriad();
+  _emitExplodeChanged();
   requestRender();
 }
 
@@ -1576,8 +1714,14 @@ function setArrows(defs) {
 
 function setAnnotMode(mode) {
   _annotMode = mode || 'none';
-  if (_annotMode !== 'explode') _detachGizmo();
-  canvas.style.cursor = (_annotMode.startsWith('arrow')) ? 'crosshair' : '';
+  if (_annotMode === 'explode') {
+    // Re-show the triad for any existing selection.
+    _refreshExplodeTriad();
+  } else {
+    _detachGizmo();
+  }
+  canvas.style.cursor = (_annotMode.startsWith('arrow')) ? 'crosshair'
+    : (_annotMode === 'explode' ? 'pointer' : '');
   window.dispatchEvent(new CustomEvent('ifu:annot-mode', { detail: _annotMode }));
 }
 function getAnnotMode() { return _annotMode; }
@@ -1599,6 +1743,9 @@ function _decorateRenderBody(body) {
 Object.assign(window.IFU_VIEWER, {
   setExplodeFactor, clearExplode, attachExplodeGizmo,
   getExplodeOffsets, setExplodeOffsets,
+  // Multi-part explode (SolidWorks/Onshape style)
+  toggleExplodeSelection, clearExplodeSelection, getExplodeSelection,
+  explodeNudge, resetExplodePart,
   setAnnotMode, getAnnotMode,
   clearArrows, removeArrow, getArrows, setArrows,
   setPresetId, getPresetId,

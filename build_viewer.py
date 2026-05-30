@@ -331,10 +331,27 @@ HTML_TEMPLATE = r"""<!doctype html>
       <div id="annot-body">
         <section class="annot-sec">
           <h3>Exploded view</h3>
-          <label class="annot-row">Spread
+          <div class="annot-btnrow">
+            <button id="explode-select" class="annot-btn" title="Then click parts in the 3D view to add/remove them from the selection">⊕ Select parts</button>
+            <button id="explode-deselect" class="annot-btn" title="Clear the current selection">Deselect</button>
+          </div>
+          <div id="explode-selinfo" class="annot-hint">Click “Select parts”, then click parts in the 3D view.</div>
+          <label class="annot-row">Move
+            <input type="number" id="explode-dist" value="50" step="5" style="width:58px"> mm along
+          </label>
+          <div class="annot-btnrow">
+            <button class="annot-btn explode-axis" data-axis="x" data-sign="1">+X</button>
+            <button class="annot-btn explode-axis" data-axis="x" data-sign="-1">−X</button>
+            <button class="annot-btn explode-axis" data-axis="y" data-sign="1">+Y</button>
+            <button class="annot-btn explode-axis" data-axis="y" data-sign="-1">−Y</button>
+            <button class="annot-btn explode-axis" data-axis="z" data-sign="1">+Z</button>
+            <button class="annot-btn explode-axis" data-axis="z" data-sign="-1">−Z</button>
+          </div>
+          <div class="annot-hint">…or drag the triad arrows in the 3D view.</div>
+          <label class="annot-row">Auto spread
             <input type="range" id="explode-range" min="0" max="100" value="0">
           </label>
-          <div class="annot-hint">Click a part in 3D to nudge it along an axis.</div>
+          <div id="explode-list" class="annot-list"></div>
           <button id="explode-clear" class="annot-btn">Reset explode</button>
         </section>
         <section class="annot-sec">

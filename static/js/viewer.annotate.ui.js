@@ -40,10 +40,61 @@ $('explode-clear')?.addEventListener('click', () => {
   V().clearExplode?.();
 });
 
+// SolidWorks/Onshape-style multi-select + triad.
+$('explode-select')?.addEventListener('click', () => {
+  const on = !$('explode-select').classList.contains('active');
+  setMode(on ? 'explode' : 'none', on ? 'explode-select' : null);
+});
+$('explode-deselect')?.addEventListener('click', () => V().clearExplodeSelection?.());
+document.querySelectorAll('.explode-axis').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    const dist = parseFloat($('explode-dist')?.value || '50') || 0;
+    const sign = parseFloat(btn.dataset.sign || '1');
+    V().explodeNudge?.(btn.dataset.axis, sign * dist);
+  });
+});
+
+function refreshExplodeList(detail) {
+  const info = $('explode-selinfo');
+  const list = $('explode-list');
+  const sel = (detail && detail.selection) || V().getExplodeSelection?.() || [];
+  const offsets = (detail && detail.offsets) || V().getExplodeOffsets?.() || {};
+  if (info) {
+    info.textContent = sel.length
+      ? `${sel.length} part${sel.length > 1 ? 's' : ''} selected — drag the triad or use the axis buttons.`
+      : 'Click “Select parts”, then click parts in the 3D view.';
+  }
+  if (list) {
+    const idxs = Object.keys(offsets);
+    list.innerHTML = '';
+    if (!idxs.length) {
+      list.innerHTML = '<div class="annot-hint">No parts exploded yet.</div>';
+    } else {
+      idxs.forEach((k) => {
+        const o = offsets[k];
+        const mag = Math.round(Math.hypot(o[0], o[1], o[2]));
+        const row = document.createElement('div');
+        row.className = 'annot-list-row';
+        row.innerHTML = `<span>part ${k} · ${mag} mm</span>`;
+        const rm = document.createElement('button');
+        rm.className = 'annot-btn';
+        rm.textContent = '✕';
+        rm.title = 'Return this part to its assembled position';
+        rm.style.cssText = 'padding:0 7px;margin-left:auto';
+        rm.addEventListener('click', () => V().resetExplodePart?.(parseInt(k, 10)));
+        row.appendChild(rm);
+        list.appendChild(row);
+      });
+    }
+  }
+}
+window.addEventListener('ifu:explode-changed', (e) => refreshExplodeList(e.detail));
+refreshExplodeList();
+
 // ---- arrows ----
 function setMode(mode, activeBtnId) {
   V().setAnnotMode?.(mode);
-  for (const id of ['arrow-straight', 'arrow-rotation', 'arrow-select']) {
+  for (const id of ['arrow-straight', 'arrow-rotation', 'arrow-select', 'explode-select']) {
     $(id)?.classList.toggle('active', id === activeBtnId);
   }
 }
@@ -75,6 +126,7 @@ refreshArrowList();
 // When leaving arrow mode (e.g. annotation mode reset elsewhere), un-press btns.
 window.addEventListener('ifu:annot-mode', (e) => {
   const mode = e.detail;
+  if (mode !== 'explode') $('explode-select')?.classList.remove('active');
   if (mode === 'none') {
     for (const id of ['arrow-straight', 'arrow-rotation'])
       $(id)?.classList.remove('active');
