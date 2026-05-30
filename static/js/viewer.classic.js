@@ -4270,7 +4270,12 @@ function _resolvePartClick(svg, ev) {
 }
 
 function attachInteractivity(pane) {
-  const svg = pane.querySelector('svg');
+  const svg = pane && pane.querySelector('svg');
+  // The pane's <svg> may not be injected yet (attachInteractivity can fire
+  // during a figure load before the live SVG lands).  Guard so we don't throw
+  // "Cannot read properties of null (reading 'dataset')" -- an unhandled
+  // rejection there was aborting the rest of the load/highlight pipeline.
+  if (!svg) return;
   if (svg.dataset.attached) return;
   svg.dataset.attached = '1';
 
