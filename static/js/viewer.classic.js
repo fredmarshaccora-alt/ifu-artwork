@@ -7698,24 +7698,27 @@ async function fetchSelectedFootprints() {
   // assumptions miss), returns null and falls through to the server
   // path so the bold edge still draws -- just more slowly.
   if (_GPU_RASTER_ON) {
-    _gpuLog({ reason: 'attempt', n: missing.length });
     try {
+      _gpuReason = '';
       const t0 = performance.now();
       const polys = _gpuRasterFootprints(fid, vid, missing);
+      const dt = performance.now() - t0;
+      // One reliable log per attempt (a module var, not racing fetches).
+      _gpuLog({ reason: 'gpu', why: (_gpuReason || (polys ? 'ok' : 'null')),
+                n: missing.length, ms: Math.round(dt) });
       if (polys) {
         let n = 0;
         for (const [idx, pl] of Object.entries(polys)) {
           _setFootprint(fid, vid, parseInt(idx), pl);
           n += pl.length;
         }
-        const dt = performance.now() - t0;
         console.log(`[footprint] GPU raster ${missing.length} parts in `
                     + `${dt.toFixed(0)}ms, ${n} polylines`);
         applyHighlights();
         return;
       }
     } catch (e) {
-      _gpuLog({ reason: 'exception', err: String((e && e.stack) || (e && e.message) || e).slice(0, 300) });
+      _gpuLog({ reason: 'gpu', why: 'exc:' + String((e && e.message) || e).slice(0, 220) });
       console.warn('[footprint] GPU raster failed, falling back:', e);
     }
   }
@@ -7889,6 +7892,7 @@ function injectHitFillLayer(_fid, _vid) { /* no-op (reverted) */ }
 // explicitly with ?gpu_raster=0.
 const _GPU_RASTER_ON =
     (new URLSearchParams(location.search)).get('gpu_raster') !== '0';
+let _gpuReason = '';   // why the last GPU raster attempt succeeded/bailed
 let _gpuRTarget = null;
 let _gpuOffscreenScene = null;
 let _gpuOffscreenCam = null;
@@ -7934,11 +7938,11 @@ function _gpuRasterFootprints(fid, vid, partIndices) {
   // Returns null on any failure -> caller falls back to server path.
   if (!_GPU_RASTER_ON) return null;
   if (!renderer || !active) {
-    _gpuLog({ reason: 'no-3d', hasRenderer: !!renderer, hasActive: !!active });
+    _gpuReason = 'no-3d(r=' + !!renderer + ',a=' + !!active + ')';
     return null;
   }
   const bounds = _readViewBoxFromActiveSvg();
-  if (!bounds) { _gpuLog({ reason: 'no-viewbox' }); return null; }
+  if (!bounds) { _gpuReason = 'no-viewbox'; return null; }
   const vidx = new Set(partIndices);
   if (!vidx.size) return {};
 
@@ -7949,7 +7953,7 @@ function _gpuRasterFootprints(fid, vid, partIndices) {
   // For live SVGs the catalogue carries the latest direction set by
   // injectLiveSVG; the existing flow already keeps it current.
   if (!viewDir || viewDir.length !== 3) {
-    _gpuLog({ reason: 'no-viewdir', vid: String(vid) });
+    _gpuReason = 'no-viewdir(vid=' + String(vid) + ')';
     return null;
   }
 
@@ -8069,7 +8073,7 @@ function _gpuRasterFootprints(fid, vid, partIndices) {
     );
     result[idx] = uvPolys;
   }
-  _gpuLog({ reason: 'ok', parts: partIndices.length, res: RES });
+  _gpuReason = 'ok';
   return result;
 }
 
