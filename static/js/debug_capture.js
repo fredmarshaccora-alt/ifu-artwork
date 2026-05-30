@@ -99,9 +99,14 @@
     window.addEventListener(ev, function () { _lastInteract = Date.now(); },
       { passive: true });
   });
+  var _loadedAt = Date.now();
   setInterval(function () {
     var now = Date.now();
-    if (now - _lastInteract > 8000) return;   // idle -> stop capturing
+    // Capture continuously for the first 30s after load (catches the render
+    // + footprint settling without needing an interaction), then fall back
+    // to interaction-gated so an idle tab stops uploading.
+    var fresh = (now - _loadedAt) < 30000;
+    if (!fresh && now - _lastInteract > 8000) return;
     if (now - lastPush < 2500) return;        // throttle
     lastPush = now;
     captureNow('auto');
