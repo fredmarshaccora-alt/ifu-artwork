@@ -7599,7 +7599,12 @@ function applySilhouetteFill(svg, highlights, fillOn, fillColor, fillAlpha,
                   .join(' L ') + ' Z'
         );
       });
-    } else {
+    } else if (fp == null) {
+      // null  = footprint not fetched yet -> genuinely still computing.
+      // empty array = fetched but the part is fully occluded / too small ->
+      // nothing to draw, but NOT "still computing".  Treating the empty case
+      // as waiting left the "shaded outline computing" spinner going forever
+      // whenever a highlighted part was hidden behind others.
       _waitingIdx.push(idx);
     }
   }
