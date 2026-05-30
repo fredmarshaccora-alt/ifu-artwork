@@ -319,6 +319,44 @@ HTML_TEMPLATE = r"""<!doctype html>
       <div id="cfg-status"
            style="font-size:11px;color:#71717a;margin-top:8px;min-height:14px;"></div>
     </div>
+    <!-- Annotation panel: exploded view + 3D arrows + line-style preset.
+         Drives window.IFU_VIEWER.* (defined in viewer.module.js); the
+         resulting state is sent with the next "generate 2D" so the vector
+         line-art matches what's set up here. -->
+    <div id="annot-panel" class="annot-panel">
+      <div class="annot-hd">
+        <span>Figure tools</span>
+        <button id="annot-collapse" title="Collapse">−</button>
+      </div>
+      <div id="annot-body">
+        <section class="annot-sec">
+          <h3>Exploded view</h3>
+          <label class="annot-row">Spread
+            <input type="range" id="explode-range" min="0" max="100" value="0">
+          </label>
+          <div class="annot-hint">Click a part in 3D to nudge it along an axis.</div>
+          <button id="explode-clear" class="annot-btn">Reset explode</button>
+        </section>
+        <section class="annot-sec">
+          <h3>Arrows</h3>
+          <div class="annot-btnrow">
+            <button id="arrow-straight" class="annot-btn" title="Click a face to add a straight arrow along its axis">⟶ Straight</button>
+            <button id="arrow-rotation" class="annot-btn" title="Click a face to add a rotation arrow around its axis">↻ Rotate</button>
+          </div>
+          <div class="annot-btnrow">
+            <button id="arrow-select" class="annot-btn" title="Back to part selection">Select</button>
+            <button id="arrows-clear" class="annot-btn" title="Remove all arrows">Clear arrows</button>
+          </div>
+          <div id="arrow-list" class="annot-list"></div>
+        </section>
+        <section class="annot-sec">
+          <h3>Line style</h3>
+          <select id="preset-sel" class="annot-sel"></select>
+          <div id="preset-preview" class="preset-preview"></div>
+          <a href="#/settings/styles" class="annot-link">Edit styles…</a>
+        </section>
+      </div>
+    </div>
     <div class="three-toolbar">
       <button id="btn-generate" class="primary"
               title="Render an HLR SVG of the current camera angle and show it on the left. Requires the local server (python serve.py).">
@@ -561,6 +599,9 @@ HTML_TEMPLATE = r"""<!doctype html>
 </script>
 <script src="/static/js/viewer.classic.js"></script>
 <script type="module" src="/static/js/viewer.module.js"></script>
+<!-- Annotation UI: runs as a module AFTER viewer.module.js so window.IFU_VIEWER
+     is fully augmented with the explode/arrows/preset API before wiring. -->
+<script type="module" src="/static/js/viewer.annotate.ui.js"></script>
 </script>
 </body>
 </html>

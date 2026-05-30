@@ -74,6 +74,13 @@ def new_figure(name: str, source_id: str,
         },
         "detail": "normal",
         "annotations": [],
+        # Exploded view + 3D annotation arrows + chosen line-style preset.
+        # explode: {"<part_idx>": [dx,dy,dz]} in model frame; arrows: list of
+        # straight/rotation arrow defs; preset_id: line-style preset id.  All
+        # optional and round-trip untouched (permissive schema).
+        "explode": {},
+        "arrows": [],
+        "preset_id": None,
         "notes": "",
         "created_at": _now_iso(),
         "updated_at": _now_iso(),

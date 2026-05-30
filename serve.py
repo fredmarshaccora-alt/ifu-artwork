@@ -39,11 +39,13 @@ from t5_hlr_vector import (
     run_hlr_per_solid, write_svg_parts, rotate_shape,
     run_part_silhouettes, run_group_silhouette,
     compute_visible_footprints, run_hlr_in_region,
-    split_solids,
+    split_solids, build_projector,
 )
+from ifu.arrows import render_arrows_svg
 from ifu import (figures_store, projects_store, revisions_store,
                   settings_store, sources_store, onshape_fetch,
                   views_store)
+from ifu import presets as presets_store
 from ifu.config import SOURCES
 import threading
 import functools
@@ -189,6 +191,11 @@ def _log_event(**fields) -> None:
 
 HERE = Path(__file__).parent
 app = Flask(__name__)
+# In dev (IFU_DEV=1) don't let the browser cache static JS/CSS, so edits to
+# viewer.classic.js / viewer.module.js / viewer.css are picked up on reload
+# without a hard cache-bust.  Production keeps Flask's default caching.
+if os.environ.get("IFU_DEV", "").strip() in ("1", "true", "yes", "on"):
+    app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 
 
 # ---------------------------------------------------------------------------
@@ -564,6 +571,70 @@ def _view_keys(view_dir, focal):
     vd_key = tuple(round(x, _VD_PRECISION) for x in view_dir)
     focal_key = tuple(round(x, _FOCAL_PRECISION) for x in focal)
     return vd_key, focal_key
+
+
+def _parse_explode(raw):
+    """Normalise an explode payload to {int part_idx: (dx, dy, dz)} or None.
+
+    Accepts the on-the-wire form {"<idx>": [dx, dy, dz], ...} (JSON object keys
+    are strings) and drops any zero / malformed offsets so the cache key and
+    the HLR fast-path treat "no real displacement" as un-exploded.
+    """
+    if not isinstance(raw, dict) or not raw:
+        return None
+    out = {}
+    for k, v in raw.items():
+        try:
+            idx = int(k)
+            off = (float(v[0]), float(v[1]), float(v[2]))
+        except (TypeError, ValueError, IndexError):
+            continue
+        if any(abs(c) > 1e-9 for c in off):
+            out[idx] = off
+    return out or None
+
+
+def _explode_key(explode):
+    """Order-independent, rounded cache key for an explode dict (or ())."""
+    if not explode:
+        return ()
+    return tuple(sorted(
+        (idx, round(o[0], 2), round(o[1], 2), round(o[2], 2))
+        for idx, o in explode.items()
+    ))
+
+
+def _arrows_key(arrows):
+    """Stable cache key for an arrows list (or ()).  Serialise the salient,
+    rounded fields so identical arrow sets hit the cache."""
+    if not arrows:
+        return ()
+    def _r(v):
+        try:
+            return round(float(v), 2)
+        except (TypeError, ValueError):
+            return v
+    out = []
+    for a in arrows:
+        if not isinstance(a, dict):
+            continue
+        out.append(tuple(sorted(
+            (k, tuple(_r(x) for x in v) if isinstance(v, (list, tuple))
+             else _r(v) if isinstance(v, (int, float)) else v)
+            for k, v in a.items()
+        )))
+    return tuple(out)
+
+
+def _style_key(style_override):
+    """Stable cache key for a resolved per-category styles override (or ())."""
+    if not style_override:
+        return ()
+    return tuple(sorted(
+        (cat, st.get("stroke"), round(float(st.get("width", 0)), 3),
+         st.get("dash"))
+        for cat, st in style_override.items()
+    ))
 
 # Per-part silhouette cache: (file_id, vd_key, focal_key, up_axis_key, idx)
 # -> list of polylines in (u,v).  Each entry is one PolyAlgo on a single
@@ -1032,6 +1103,18 @@ def render():
     view_dir = body.get("view_dir")
     focal = body.get("focal")
     up_axis = body.get("up_axis")    # {"axis": [x,y,z], "angle": deg} or None
+    # Exploded view: {part_idx: [dx,dy,dz]} in model frame, or None.  Parsed
+    # into {int: (float,float,float)} and folded into the cache key so an
+    # exploded render never collides with the assembled one.
+    explode = _parse_explode(body.get("explode"))
+    # Annotation arrows: list of straight/rotation arrow dicts (model frame),
+    # rendered as an SVG overlay on top of the line-art.
+    arrows = body.get("arrows") if isinstance(body.get("arrows"), list) else None
+    # Line-style preset ("shading"): resolve to a per-category styles override
+    # passed to write_svg_parts.  Inline {styles:{...}} wins over preset_id.
+    preset_id = body.get("preset_id")
+    inline_styles = body.get("styles") if isinstance(body.get("styles"), dict) else None
+    style_override = inline_styles or presets_store.resolve_styles(preset_id)
 
     if not _ensure_source_loaded(file_id):
         _log_event(level="err", op="render", source_id=file_id,
@@ -1100,10 +1183,15 @@ def render():
         except Exception as exc:
             return jsonify({"error": f"bad up_axis: {exc}"}), 400
 
-    # Cache check: identical (source, view, focal, up_axis) -> instant.
+    # Cache check: identical (source, view, focal, up_axis, explode, arrows)
+    # -> instant.
     vd_key, focal_key = _view_keys(view_dir, focal)
+    explode_key = _explode_key(explode)
+    arrows_key = _arrows_key(arrows)
+    style_key = _style_key(style_override)
     cache_key = (file_id, vd_key, focal_key, up_axis_key,
-                 round(hlr_kw.get("mesh_defl", 1.5), 3))
+                 round(hlr_kw.get("mesh_defl", 1.5), 3),
+                 explode_key, arrows_key, style_key)
     cached = _cache_get(_RENDER_CACHE, cache_key)
     if cached is not None:
         print(f"  /api/render {file_id:<10s} dir={vd_key}{extra_rot_str}  "
@@ -1120,7 +1208,8 @@ def render():
                 mesh_defl=hlr_kw.get("mesh_defl"))
     t_hlr0 = time.time()
     try:
-        parts = run_hlr_per_solid(shape, view_dir, focal=focal, **hlr_kw)
+        parts = run_hlr_per_solid(shape, view_dir, focal=focal,
+                                  explode=explode, **hlr_kw)
     except Exception as exc:
         _log_event(level="err", op="render.hlr",
                     source_id=file_id,
@@ -1159,6 +1248,23 @@ def render():
     t_mir = 0.0
 
     t_svg0 = time.time()
+
+    # Annotation-arrow overlay: project the model-space arrows into the same
+    # (u, v) plane as the line-art (build_projector axes), applying the same
+    # up_axis view rotation the shape got, so arrows land exactly on the
+    # drawing.  Empty fragment when there are no arrows.
+    arrows_svg, arrows_bbox = "", None
+    if arrows:
+        try:
+            _proj, x_axis, y_axis, _focal_pt = build_projector(view_dir, focal)
+            arrows_svg, arrows_bbox = render_arrows_svg(
+                arrows, x_axis, y_axis, up_axis=up_axis)
+        except Exception as exc:
+            _log_event(level="warn", op="render.arrows",
+                        source_id=file_id,
+                        error=f"{type(exc).__name__}: {exc}")
+            arrows_svg, arrows_bbox = "", None
+
     # Persist the scratch SVG only when the request opts in via
     # ?save=1 (or IFU_PERSIST_LIVE_SVG=1) -- otherwise write to a
     # temp file and unlink after reading.  Used to leave one
@@ -1170,7 +1276,8 @@ def render():
     )
     if persist_disk:
         out_path = OUT / f"_live_{file_id}.svg"
-        write_svg_parts(parts, out_path, precision=1)
+        write_svg_parts(parts, out_path, precision=1, styles=style_override,
+                        arrows_svg=arrows_svg, arrows_bbox=arrows_bbox)
         svg = out_path.read_text(encoding="utf-8")
     else:
         import tempfile
@@ -1179,7 +1286,8 @@ def render():
                 encoding="utf-8") as _tmp:
             tmp_path = Path(_tmp.name)
         try:
-            write_svg_parts(parts, tmp_path, precision=1)
+            write_svg_parts(parts, tmp_path, precision=1, styles=style_override,
+                            arrows_svg=arrows_svg, arrows_bbox=arrows_bbox)
             svg = tmp_path.read_text(encoding="utf-8")
         finally:
             try:
@@ -1245,6 +1353,49 @@ def settings_update():
 def settings_reset():
     """Replace settings.json with DEFAULT_SETTINGS.  Returns fresh dict."""
     return jsonify(settings_store.reset())
+
+
+# ----- Line-style presets ("shading") --------------------------------
+
+@app.route("/api/presets", methods=["GET"])
+def presets_list():
+    """List built-in + user line-style presets."""
+    return jsonify({"presets": presets_store.list_all(),
+                    "default_id": presets_store.DEFAULT_PRESET_ID})
+
+
+@app.route("/api/presets", methods=["POST"])
+def presets_create():
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return jsonify({"error": "body must be an object"}), 400
+    return jsonify(presets_store.create(body)), 201
+
+
+@app.route("/api/presets/<preset_id>", methods=["PUT", "PATCH"])
+def presets_update(preset_id):
+    body = request.get_json(silent=True) or {}
+    updated = presets_store.update(preset_id, body)
+    if updated is None:
+        return jsonify({"error": f"unknown preset: {preset_id!r}"}), 404
+    return jsonify(updated)
+
+
+@app.route("/api/presets/<preset_id>", methods=["DELETE"])
+def presets_delete(preset_id):
+    if presets_store.delete(preset_id):
+        return jsonify({"ok": True})
+    return jsonify({"error": "preset not found or is a built-in"}), 400
+
+
+@app.route("/api/presets/<preset_id>/preview.svg", methods=["GET"])
+def presets_preview(preset_id):
+    """Instant line-art swatch for a preset (no model meshing required)."""
+    if presets_store.get(preset_id) is None:
+        return jsonify({"error": f"unknown preset: {preset_id!r}"}), 404
+    svg = presets_store.preview_svg(preset_id)
+    return Response(svg, mimetype="image/svg+xml",
+                    headers={"Cache-Control": "no-cache"})
 
 
 # ----- Sources + Revisions (Phase C) ---------------------------------
@@ -1853,7 +2004,9 @@ def figures_create():
     extra = {k: v for k, v in body.items()
              if k in ("camera", "selection", "styles_per_part",
                        "layers_on", "detail", "annotations", "notes",
-                       "configuration")}
+                       "configuration",
+                       # exploded view + 3D arrows + line-style preset
+                       "explode", "arrows", "preset_id")}
     fig = figures_store.new_figure(name=name, source_id=source_id,
                                     view_id=view_id, **extra)
     figures_store.save(fig)

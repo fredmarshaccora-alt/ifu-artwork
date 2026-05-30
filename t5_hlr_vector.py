@@ -117,6 +117,45 @@ def rotate_shape(shape, axis_dir, angle_deg, origin=(0, 0, 0)):
     return BRepBuilderAPI_Transform(shape, trsf, True).Shape()
 
 
+def translate_solid(solid, offset):
+    """Translate a single TopoDS solid by ``offset`` (dx, dy, dz) in model frame."""
+    trsf = gp_Trsf()
+    trsf.SetTranslation(gp_Vec(*offset))
+    return BRepBuilderAPI_Transform(solid, trsf, True).Shape()
+
+
+def apply_explode(solids, explode):
+    """Return (compound, solids) with each solid moved by its explode offset.
+
+    ``solids`` is the list of ``(idx, label, solid)`` tuples from
+    ``split_solids``.  ``explode`` maps part index -> (dx, dy, dz) in the MODEL
+    frame (the same frame the 3D pane's GLB lives in, before any up_axis view
+    rotation).  Offsets are applied here, in model space; the caller applies the
+    up_axis rotation to the whole returned compound afterwards, so the offset
+    vectors rotate with the model and the SVG matches the 3D editor.
+
+    Solids without an entry (or a zero offset) are passed through untouched so
+    the per-solid HLR extraction keeps using the same ``idx``/``label`` keys.
+    Returns (new_compound, new_solids); ``new_solids`` preserves order + keys.
+    """
+    if not explode:
+        return None, solids
+    new_solids = []
+    for idx, label, solid in solids:
+        off = explode.get(idx)
+        if off is None:
+            off = explode.get(str(idx))
+        if off and any(abs(float(c)) > 1e-9 for c in off):
+            solid = translate_solid(solid, tuple(float(c) for c in off))
+        new_solids.append((idx, label, solid))
+    compound = TopoDS_Compound()
+    builder = BRep_Builder()
+    builder.MakeCompound(compound)
+    for _idx, _label, solid in new_solids:
+        builder.Add(compound, solid)
+    return compound, new_solids
+
+
 def build_projector(view_dir, focal=(0, 0, 0)):
     """Build an HLR projector that matches three.js's camera convention.
 
@@ -900,6 +939,7 @@ def _build_full_hlr(shape, solids, proj, mesh_defl):
 def run_hlr_per_solid(shape, view_dir, focal=(0, 0, 0),
                        mesh_defl=0.4, sample_defl=0.3,
                        exact=False, max_solids=None,
+                       explode=None,
                        progress=True):
     """Assembly-wide HLR with per-solid tagging.
 
@@ -909,6 +949,13 @@ def run_hlr_per_solid(shape, view_dir, focal=(0, 0, 0),
     to extract only THAT solid's visible/hidden edges, correctly occluded by
     all the others.
 
+    ``explode`` (optional) maps part index -> (dx, dy, dz) in the MODEL frame.
+    When given, each solid is translated by its offset BEFORE the combined HLR
+    is built, so occlusion is computed on the exploded arrangement and the
+    output reads as a proper exploded view.  Offsets are model-space; any
+    up_axis view rotation must be applied by the caller to ``shape`` upstream
+    so it also rotates the explode directions.
+
     Returns:
       parts: list of dicts with {idx, label, polys: {category: [polyline]}}
     """
@@ -916,6 +963,10 @@ def run_hlr_per_solid(shape, view_dir, focal=(0, 0, 0),
     solids = split_solids(shape)
     if max_solids:
         solids = solids[:max_solids]
+    if explode:
+        exploded_compound, solids = apply_explode(solids, explode)
+        if exploded_compound is not None:
+            shape = exploded_compound
     if progress:
         print(f"  assembly-wide HLR over {len(solids)} solids...",
               flush=True)
@@ -1318,7 +1369,8 @@ def write_svg_parts(parts, out_path: Path,
                      styles=None, pad_frac=0.04,
                      extra_attrs="",
                      precision=1,
-                     skip_categories=()):
+                     skip_categories=(),
+                     arrows_svg="", arrows_bbox=None):
     """Part-aware SVG: every visible category becomes a layer; inside each
     layer, polylines are grouped by part with data-part and class hooks for
     interactive highlighting.
@@ -1326,10 +1378,20 @@ def write_svg_parts(parts, out_path: Path,
     Layers are ordered (back to front):
       hidden_outline -> hidden_sharp -> smooth_v -> sharp_v -> outline_v
     So the heavy silhouette always sits on top.
+
+    ``arrows_svg`` (optional) is a fragment of SVG elements already authored in
+    the (u, v) projection plane (see ``ifu.arrows.render_arrows_svg``); it is
+    drawn last so annotation arrows sit on top of the line-art.  ``arrows_bbox``
+    is the (u0, v0, u1, v1) extent of those arrows, unioned into the viewBox so
+    arrows that stick out past the part silhouettes are not clipped.
     """
     styles = {**DEFAULT_STYLES, **(styles or {})}
     active_cats = [c for c in categories if c not in skip_categories]
     x0, y0, x1, y1 = parts_bbox(parts, active_cats)
+    if arrows_bbox is not None:
+        ax0, ay0, ax1, ay1 = arrows_bbox
+        x0, y0 = min(x0, ax0), min(y0, ay0)
+        x1, y1 = max(x1, ax1), max(y1, ay1)
     w_mm = x1 - x0; h_mm = y1 - y0
     pad = max(w_mm, h_mm) * pad_frac
     x0 -= pad; y0 -= pad; x1 += pad; y1 += pad
@@ -1402,6 +1464,10 @@ def write_svg_parts(parts, out_path: Path,
             f'<path d="{d}"/></g>'
         )
     lines.append('</g>')
+
+    # Annotation arrows: drawn last (on top), already in (u, v) space.
+    if arrows_svg:
+        lines.append(arrows_svg)
 
     lines.append('</g></svg>')
     out_path.write_text("\n".join(lines), encoding="utf-8")

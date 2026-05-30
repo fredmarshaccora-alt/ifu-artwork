@@ -2712,6 +2712,18 @@ async function SettingsScreen(container) {
     patchSettings({ default_fill_alpha: parseFloat(fillAlpha.value) }));
   container.appendChild(fieldRow('Default fill alpha (0–1)', fillAlpha));
 
+  // ---- Line styles ----
+  container.appendChild(h('div.section-title', 'Line styles'));
+  container.appendChild(h('div', { style: { fontSize: '13px',
+      marginBottom: '12px', display: 'flex', alignItems: 'center',
+      gap: '12px' } }, [
+    h('span', { style: { color: '#71717a' } },
+      'Create and edit line-style presets (stroke colour, weight, dash) '
+      + 'with a live preview.'),
+    h('a', { href: '#/settings/styles', style: { color: 'var(--accora-teal,'
+      + '#00836a)', fontWeight: '500' } }, 'Edit line styles \\u2192'),
+  ]));
+
   // ---- Sources ----
   container.appendChild(h('div.section-title', 'Sources'));
   const srcList = h('div', { style: { marginBottom: '24px' } });
@@ -2832,6 +2844,194 @@ async function SettingsScreen(container) {
 
 registerRoute(/^#\/settings$/, SettingsScreen);
 // ===== end F.6 Settings screen =====
+
+
+// =====================================================================
+// Line-style presets editor (#/settings/styles)
+// Lists built-in + user presets as cards with a live preview swatch.
+// User presets get per-edge-category controls (stroke colour / width /
+// dash); built-ins are read-only but can be duplicated to edit.  Backs
+// onto /api/presets (see ifu/presets.py).
+// =====================================================================
+const _STYLE_CATS = [
+  ['outline_v',      'Silhouette'],
+  ['sharp_v',        'Sharp edges'],
+  ['smooth_v',       'Smooth / tangent'],
+  ['hidden_sharp',   'Hidden sharp'],
+  ['hidden_outline', 'Hidden outline'],
+];
+
+async function StylesSettingsScreen(container) {
+  _ensureDesignStyles();
+  container.className = 'app-shell';
+  container.appendChild(_topBar({
+    crumbs: [{ label: 'Home', href: '#/' },
+             { label: 'Settings', href: '#/settings' },
+             { label: 'Line styles' }],
+  }));
+  const mainEl = h('div.app-main');
+  container.appendChild(mainEl);
+
+  let data = { presets: [], default_id: null };
+  try {
+    const r = await fetch(API_BASE + '/api/presets');
+    if (r.ok) data = await r.json();
+  } catch (_e) {}
+
+  mainEl.appendChild(h('div.section-title', 'Line-style presets'));
+  mainEl.appendChild(h('p', { style: { color: '#71717a', fontSize: '13px',
+      maxWidth: '640px', marginTop: '-4px' } },
+    'Presets control the stroke colour, weight (mm) and dash of each edge '
+    + 'category in the 2D line-art. Pick one in the figure tools panel; '
+    + 'edit or create your own here. Built-in presets are read-only — '
+    + 'duplicate one to make it yours.'));
+
+  const grid = h('div', { style: { display: 'flex', flexWrap: 'wrap',
+      gap: '16px', marginTop: '12px' } });
+  mainEl.appendChild(grid);
+
+  function previewImg(id) {
+    return h('img', { src: API_BASE + '/api/presets/' + encodeURIComponent(id)
+      + '/preview.svg?t=' + Date.now(),
+      style: { width: '160px', height: '120px', objectFit: 'contain',
+               border: '1px solid var(--c-line, #ececec)', borderRadius: '6px',
+               background: '#fff' } });
+  }
+
+  // Debounced PATCH that refreshes the card's swatch after save.
+  function makeSaver(id, getImg) {
+    let timer = null;
+    return (styles) => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(async () => {
+        try {
+          const r = await fetch(API_BASE + '/api/presets/'
+            + encodeURIComponent(id), {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ styles }),
+          });
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          const img = getImg();
+          if (img) img.src = API_BASE + '/api/presets/'
+            + encodeURIComponent(id) + '/preview.svg?t=' + Date.now();
+          window.IFU_ANNOT?.reloadPresets?.(id);
+          toast('Style saved', 'success');
+        } catch (e) { toast('Save failed: ' + (e.message || e), 'error'); }
+      }, 350);
+    };
+  }
+
+  function card(preset) {
+    const isBuiltin = !!preset.builtin;
+    const imgEl = previewImg(preset.id);
+    const save = makeSaver(preset.id, () => imgEl);
+    const styles = JSON.parse(JSON.stringify(preset.styles || {}));
+
+    const controls = h('div', { style: { display: 'flex',
+        flexDirection: 'column', gap: '6px', flex: 1, minWidth: '260px' } });
+    for (const [cat, label] of _STYLE_CATS) {
+      const st = styles[cat] || { stroke: '#000000', width: 0.3, dash: null };
+      styles[cat] = st;
+      const color = h('input', { type: 'color', value: st.stroke || '#000000',
+        disabled: isBuiltin, style: { width: '34px', height: '26px',
+        padding: '0', border: '1px solid #d4d4d8', borderRadius: '4px' } });
+      const width = h('input', { type: 'number', step: '0.05', min: '0.05',
+        max: '5', value: st.width ?? 0.3, disabled: isBuiltin,
+        style: { width: '64px' } });
+      const dash = h('input', { type: 'text', value: st.dash || '',
+        placeholder: 'solid', disabled: isBuiltin,
+        style: { width: '70px' } });
+      const onChange = () => {
+        st.stroke = color.value;
+        st.width = parseFloat(width.value) || 0.3;
+        st.dash = dash.value.trim() || null;
+        save(styles);
+      };
+      color.addEventListener('change', onChange);
+      width.addEventListener('change', onChange);
+      dash.addEventListener('change', onChange);
+      controls.appendChild(h('div', { style: { display: 'flex',
+          alignItems: 'center', gap: '8px', fontSize: '12px' } }, [
+        h('span', { style: { width: '110px', color: '#52525b' } }, label),
+        color, width,
+        h('span', { style: { color: '#a1a1aa', fontSize: '11px' } }, 'mm'),
+        dash,
+      ]));
+    }
+
+    const actions = h('div', { style: { display: 'flex', gap: '8px',
+        marginTop: '8px' } });
+    const dupBtn = h('button.btn', { style: { padding: '4px 10px',
+        fontSize: '12px', cursor: 'pointer' } }, 'Duplicate');
+    dupBtn.addEventListener('click', async () => {
+      try {
+        const r = await fetch(API_BASE + '/api/presets', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: preset.name + ' copy',
+            styles: preset.styles }) });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        window.IFU_ANNOT?.reloadPresets?.();
+        renderRoute();
+      } catch (e) { toast('Duplicate failed: ' + (e.message || e), 'error'); }
+    });
+    actions.appendChild(dupBtn);
+    if (!isBuiltin) {
+      const delBtn = h('button', { style: { padding: '4px 10px',
+          fontSize: '12px', border: '1px solid #c44', color: '#c44',
+          background: '#fff', cursor: 'pointer', borderRadius: '4px' } },
+        'Delete');
+      delBtn.addEventListener('click', async () => {
+        if (!confirm('Delete preset "' + preset.name + '"?')) return;
+        try {
+          const r = await fetch(API_BASE + '/api/presets/'
+            + encodeURIComponent(preset.id), { method: 'DELETE' });
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          window.IFU_ANNOT?.reloadPresets?.();
+          renderRoute();
+        } catch (e) { toast('Delete failed: ' + (e.message || e), 'error'); }
+      });
+      actions.appendChild(delBtn);
+    }
+
+    return h('div', { style: { border: '1px solid var(--c-line, #e4e4e7)',
+        borderRadius: '8px', padding: '14px', width: '480px',
+        display: 'flex', flexDirection: 'column', gap: '10px',
+        background: '#fff' } }, [
+      h('div', { style: { display: 'flex', alignItems: 'center',
+          justifyContent: 'space-between' } }, [
+        h('strong', preset.name),
+        isBuiltin ? h('span', { style: { fontSize: '11px', color: '#a1a1aa' } },
+          'built-in') : h('span', { style: { fontSize: '11px',
+          color: '#0a8' } }, 'custom'),
+      ]),
+      h('div', { style: { display: 'flex', gap: '14px',
+          alignItems: 'flex-start' } }, [imgEl, controls]),
+      actions,
+    ]);
+  }
+
+  for (const p of data.presets) grid.appendChild(card(p));
+
+  // New blank preset
+  const newBtn = h('button.btn.primary', { style: { marginTop: '16px',
+      padding: '8px 14px', cursor: 'pointer' } }, '+ New preset');
+  newBtn.addEventListener('click', async () => {
+    const name = prompt('Name for the new preset?', 'My style');
+    if (!name) return;
+    try {
+      const r = await fetch(API_BASE + '/api/presets', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }) });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      window.IFU_ANNOT?.reloadPresets?.();
+      renderRoute();
+    } catch (e) { toast('Create failed: ' + (e.message || e), 'error'); }
+  });
+  mainEl.appendChild(newBtn);
+}
+
+registerRoute(/^#\/settings\/styles$/, StylesSettingsScreen);
 
 
 // =====================================================================
@@ -3116,6 +3316,7 @@ registerRoute(/^#\/project\/([^/]+)\/view\/([^/]+)\/figure\/([^/]+)$/,
               (container, params) => EditorScreen(container,
                 [params[0], params[2], { viewId: params[1] }]));
 registerRoute(/^#\/project\/([^/]+)\/figure\/([^/]+)$/, EditorScreen);
+registerRoute(/^#\/settings\/styles$/, StylesSettingsScreen);
 registerRoute(/^#\/settings$/, SettingsScreen);
 
 // Fire the router on first load.  Wait for `load` (not just DOM
@@ -5551,6 +5752,15 @@ function _gatherCurrentState(opts) {
     layers_on: layersOn,
     detail: parseFloat($('sty-width').value) >= 5 ? "fine" : "normal",
     annotations: (st.annotations || []),
+    // Exploded view + 3D arrows + line-style preset (from the 3D editor).
+    ...(() => {
+      const a = window.IFU_VIEWER?.getAnnotationState?.() || {};
+      return {
+        explode: a.explode || {},
+        arrows: a.arrows || [],
+        preset_id: a.preset_id || null,
+      };
+    })(),
   };
 }
 
@@ -5750,6 +5960,17 @@ function _loadFigureIntoEditor(fig, opts) {
   // Refresh everything that responds to those changes
   applyStyleSheet();
   applyHighlights();
+
+  // Restore exploded view + 3D arrows + line-style preset.  The preset
+  // applies immediately (affects the next 2D render); explode/arrows are
+  // stashed and re-applied when the 3D source's parts finish indexing.
+  window.IFU_VIEWER?.restoreAnnotationState?.({
+    explode: fig.explode || {},
+    arrows: fig.arrows || [],
+    preset_id: fig.preset_id || null,
+  });
+  // Reflect the restored preset in the figure-tools panel dropdown.
+  if (fig.preset_id) window.IFU_ANNOT?.reloadPresets?.(fig.preset_id);
 
   // Auto-render the 2D base view for figures that came from a View
   // (i.e. they carry a camera).  Without this the user lands in the
@@ -6169,6 +6390,9 @@ function _stateSig() {
       styles:    s.styles_per_part || {},
       layers:    s.layers_on || {},
       annot:     (s.annotations || []).length,
+      explode:   s.explode || {},
+      arrows:    (s.arrows || []).length,
+      preset_id: s.preset_id || null,
     });
   } catch (_e) { return ''; }
 }

@@ -10,6 +10,7 @@ import * as THREE from 'three';
 // Expose for debugging + tests (the ES-module scope is otherwise sealed)
 window.THREE = THREE;
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { TransformControls } from 'three/addons/controls/TransformControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { ViewHelper } from 'three/addons/helpers/ViewHelper.js';
 // Onshape-quality look: room IBL + SSAO + tone mapping.  Without these
@@ -289,6 +290,19 @@ function handleCanvasClick(e) {
   // through DIFFERENT parts, not different faces of the same part.
   const rawHits = raycaster.intersectObjects([active], true)
     .filter(h => h.object && h.object.isMesh);
+
+  // Arrow-placement mode: the next click drops an arrow on the hit point
+  // instead of selecting a part.
+  if (_annotMode === 'arrow-straight' || _annotMode === 'arrow-rotation') {
+    if (rawHits.length) _placeArrowFromHit(rawHits[0]);
+    return;
+  }
+  // Explode mode: click attaches the translate gizmo to the picked part.
+  if (_annotMode === 'explode' && rawHits.length) {
+    const pidx = _partIdxOf(rawHits[0].object);
+    if (pidx != null) { attachExplodeGizmo(pidx); return; }
+  }
+
   const hits = [];
   let lastIdx = null;
   for (const h of rawHits) {
@@ -784,6 +798,9 @@ function indexParts(grp) {
     if (child.name) partByName.set(child.name, child);
     child.traverse(o => { if (o.name) partByName.set(o.name, o); });
   });
+  // Rebuild the explode part-node index (idx -> movable part_NNN node) and
+  // cache base positions for the new active group.
+  if (typeof _buildPartNodeIndex === 'function') _buildPartNodeIndex();
 }
 
 function frame(grp) {
@@ -1193,6 +1210,390 @@ window.IFU_VIEWER.applyPartStyles3D = (stylesByIdx) => {
   requestRender();
 };
 
+// ============================================================================
+// Annotation engine: exploded views + 3D-aligned arrows + line-style preset.
+// All state here is per-source and feeds the /api/render POST body so the
+// server's 2D line-art reflects exactly what the user set up in 3D.
+//
+// Frames: an explode offset is read as (node.position - basePos) in the
+// `active` group's LOCAL frame, which IS the model frame the server explodes
+// in (server applies offsets pre-up_axis-rotation).  Arrows are converted to
+// model-frame at placement time via active.worldToLocal so they survive an
+// up-axis override.  When `active` has no rotation, local == world.
+// ============================================================================
+
+let _annotMode = 'none';        // 'none' | 'explode' | 'arrow-straight' | 'arrow-rotation'
+let _partNodeByIdx = new Map(); // idx -> top-most part_NNN Object3D
+let _gizmo = null;              // TransformControls for manual explode drag
+let _gizmoTarget = null;        // currently gizmo-attached part node
+let _arrowDefs = [];            // model-frame arrow defs (sent to server)
+let _arrowGroup = null;         // THREE.Group holding the 3D arrow previews
+let _currentPresetId = null;    // line-style preset id for the render POST
+let _pendingAnnotState = null;  // figure state awaiting the 3D source to load
+const _ARROW_TEAL = 0x00836a;
+
+// Re-apply a restored figure's explode/arrows once `active`'s part nodes
+// exist (3D loads lazily, so restore can land before the model is ready).
+function _applyPendingAnnot() {
+  if (!_pendingAnnotState || !active) return;
+  const st = _pendingAnnotState;
+  if (st.explode) setExplodeOffsets(st.explode);
+  if (st.arrows) setArrows(st.arrows);
+}
+
+function _buildPartNodeIndex() {
+  _partNodeByIdx = new Map();
+  if (!active) return;
+  active.traverse(o => {
+    const m = o.name && o.name.match(/^part_(\d+)$/);
+    if (m) {
+      const idx = parseInt(m[1]);
+      if (!_partNodeByIdx.has(idx)) _partNodeByIdx.set(idx, o);
+    }
+  });
+  _partNodeByIdx.forEach(node => {
+    if (!node.userData._basePos) node.userData._basePos = node.position.clone();
+  });
+  // A figure restore may be waiting for these nodes to exist.
+  if (_pendingAnnotState && active) _applyPendingAnnot();
+}
+
+function _ensureArrowGroup() {
+  if (!_arrowGroup) {
+    _arrowGroup = new THREE.Group();
+    _arrowGroup.name = '__annotation_arrows__';
+    _arrowGroup.userData._helper = true;   // excluded from part picking/colour
+    scene.add(_arrowGroup);
+  }
+  return _arrowGroup;
+}
+
+// ---- Explode ---------------------------------------------------------------
+
+function _assemblyCenterLocal() {
+  // bbox centre of `active` expressed in active-local coords (== model frame).
+  const box = new THREE.Box3().setFromObject(active);
+  const c = box.getCenter(new THREE.Vector3());
+  return active.worldToLocal(c.clone());
+}
+
+// Auto-spread: every part is pushed radially away from the assembly centre by
+// `factor` * its distance from centre (so outer parts travel further -- the
+// familiar Onshape "explode" feel).  factor 0 == assembled.
+function setExplodeFactor(factor) {
+  if (!active) return;
+  _buildPartNodeIndex();
+  const centre = _assemblyCenterLocal();
+  _partNodeByIdx.forEach(node => {
+    const base = node.userData._basePos || node.position.clone();
+    // part centre in active-local frame
+    const pc = new THREE.Box3().setFromObject(node)
+      .getCenter(new THREE.Vector3());
+    const pcLocal = active.worldToLocal(pc.clone());
+    const dir = pcLocal.sub(centre);
+    if (dir.lengthSq() < 1e-6) dir.set(0, 0, 1);
+    node.position.copy(base.clone().add(dir.multiplyScalar(factor)));
+  });
+  requestRender();
+}
+
+function clearExplode() {
+  if (!active) return;
+  _buildPartNodeIndex();
+  _partNodeByIdx.forEach(node => {
+    if (node.userData._basePos) node.position.copy(node.userData._basePos);
+  });
+  _detachGizmo();
+  requestRender();
+}
+
+// Manual per-part nudge via a translate gizmo.  Attaching the gizmo to a part
+// lets the user drag it along X/Y/Z; the offset is read back from the node's
+// position relative to its cached base.
+function _ensureGizmo() {
+  if (_gizmo) return _gizmo;
+  _gizmo = new TransformControls(camera, renderer.domElement);
+  _gizmo.setMode('translate');
+  _gizmo.setSize(0.8);
+  // Freeze orbit while dragging the gizmo, and keep rendering.
+  _gizmo.addEventListener('dragging-changed', (e) => {
+    controls.enabled = !e.value;
+  });
+  _gizmo.addEventListener('change', requestRender);
+  _gizmo.addEventListener('objectChange', requestRender);
+  // three r160: TransformControls is an Object3D and is added to the scene.
+  const helper = _gizmo.getHelper ? _gizmo.getHelper() : _gizmo;
+  helper.userData._helper = true;
+  scene.add(helper);
+  return _gizmo;
+}
+
+function attachExplodeGizmo(idx) {
+  if (!active) return;
+  _buildPartNodeIndex();
+  const node = _partNodeByIdx.get(idx);
+  if (!node) return;
+  if (!node.userData._basePos) node.userData._basePos = node.position.clone();
+  _ensureGizmo().attach(node);
+  _gizmoTarget = node;
+  requestRender();
+}
+
+function _detachGizmo() {
+  if (_gizmo) { _gizmo.detach(); _gizmoTarget = null; requestRender(); }
+}
+
+// Read the current explode as {idx: [dx,dy,dz]} in model frame.
+function getExplodeOffsets() {
+  const out = {};
+  _partNodeByIdx.forEach((node, idx) => {
+    const base = node.userData._basePos;
+    if (!base) return;
+    const dx = node.position.x - base.x;
+    const dy = node.position.y - base.y;
+    const dz = node.position.z - base.z;
+    if (Math.hypot(dx, dy, dz) > 1e-6) out[idx] = [dx, dy, dz];
+  });
+  return out;
+}
+
+// Restore an explode from saved figure state ({idx:[dx,dy,dz]} model frame).
+function setExplodeOffsets(offsets) {
+  if (!active || !offsets) return;
+  _buildPartNodeIndex();
+  _partNodeByIdx.forEach(node => {
+    if (node.userData._basePos) node.position.copy(node.userData._basePos);
+  });
+  for (const [k, off] of Object.entries(offsets)) {
+    const node = _partNodeByIdx.get(parseInt(k));
+    if (node && node.userData._basePos && off) {
+      node.position.set(
+        node.userData._basePos.x + off[0],
+        node.userData._basePos.y + off[1],
+        node.userData._basePos.z + off[2]);
+    }
+  }
+  requestRender();
+}
+
+// ---- Arrows ----------------------------------------------------------------
+
+function _snapToWorldAxis(v) {
+  // Snap a world-space direction to the nearest signed major axis.
+  const ax = Math.abs(v.x), ay = Math.abs(v.y), az = Math.abs(v.z);
+  if (ax >= ay && ax >= az) return new THREE.Vector3(Math.sign(v.x) || 1, 0, 0);
+  if (ay >= ax && ay >= az) return new THREE.Vector3(0, Math.sign(v.y) || 1, 0);
+  return new THREE.Vector3(0, 0, Math.sign(v.z) || 1);
+}
+
+function _modelLen() {
+  const box = new THREE.Box3().setFromObject(active);
+  const s = box.getSize(new THREE.Vector3());
+  return Math.max(s.x, s.y, s.z) || 100;
+}
+
+// Build a straight-arrow preview (shaft + head) in WORLD space.
+function _buildStraightArrowMesh(anchorW, dirW, length) {
+  const g = new THREE.Group();
+  g.userData._helper = true;
+  const mat = new THREE.MeshStandardMaterial({
+    color: _ARROW_TEAL, metalness: 0.0, roughness: 0.6,
+    emissive: _ARROW_TEAL, emissiveIntensity: 0.25,
+  });
+  const shaftR = Math.max(0.6, length * 0.018);
+  const headLen = Math.max(4, length * 0.22);
+  const headR = shaftR * 3.0;
+  const shaftLen = Math.max(0.001, length - headLen);
+  const shaft = new THREE.Mesh(
+    new THREE.CylinderGeometry(shaftR, shaftR, shaftLen, 16), mat);
+  shaft.position.y = shaftLen / 2;
+  const head = new THREE.Mesh(
+    new THREE.ConeGeometry(headR, headLen, 20), mat);
+  head.position.y = shaftLen + headLen / 2;
+  g.add(shaft); g.add(head);
+  // orient +Y -> dirW, place at anchor
+  const q = new THREE.Quaternion().setFromUnitVectors(
+    new THREE.Vector3(0, 1, 0), dirW.clone().normalize());
+  g.quaternion.copy(q);
+  g.position.copy(anchorW);
+  return g;
+}
+
+// Build a rotation-arrow preview (torus arc + head) in WORLD space.
+function _buildRotationArrowMesh(centreW, axisW, radius, sweepDeg) {
+  const g = new THREE.Group();
+  g.userData._helper = true;
+  const mat = new THREE.MeshStandardMaterial({
+    color: _ARROW_TEAL, metalness: 0.0, roughness: 0.6,
+    emissive: _ARROW_TEAL, emissiveIntensity: 0.25,
+  });
+  const tubeR = Math.max(0.6, radius * 0.05);
+  const sweep = THREE.MathUtils.degToRad(sweepDeg);
+  const torus = new THREE.Mesh(
+    new THREE.TorusGeometry(radius, tubeR, 12, 48, sweep), mat);
+  // arrowhead at the sweep end, tangent to the arc (torus lies in local XY,
+  // starts at +X; end point at angle=sweep)
+  const headLen = Math.max(4, radius * 0.4);
+  const headR = tubeR * 3.0;
+  const head = new THREE.Mesh(new THREE.ConeGeometry(headR, headLen, 16), mat);
+  const endX = radius * Math.cos(sweep), endY = radius * Math.sin(sweep);
+  head.position.set(endX, endY, 0);
+  // cone +Y -> tangent (-sin, cos) at the end
+  const tan = new THREE.Vector3(-Math.sin(sweep), Math.cos(sweep), 0);
+  head.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), tan);
+  g.add(torus); g.add(head);
+  // orient local +Z -> axisW, place at centre
+  const q = new THREE.Quaternion().setFromUnitVectors(
+    new THREE.Vector3(0, 0, 1), axisW.clone().normalize());
+  g.quaternion.copy(q);
+  g.position.copy(centreW);
+  return g;
+}
+
+// Convert a world point/vector into active-local (model) frame.
+function _worldPointToModel(pW) { return active.worldToLocal(pW.clone()); }
+function _worldDirToModel(dW) {
+  const inv = active.getWorldQuaternion(new THREE.Quaternion()).invert();
+  return dW.clone().applyQuaternion(inv).normalize();
+}
+
+// Place an arrow from a raycast hit (called by handleCanvasClick in arrow mode).
+function _placeArrowFromHit(hit) {
+  const anchorW = hit.point.clone();
+  const normalW = hit.face
+    ? hit.face.normal.clone().transformDirection(hit.object.matrixWorld)
+    : new THREE.Vector3(0, 0, 1);
+  const len = _modelLen() * 0.28;
+  let def, mesh;
+  if (_annotMode === 'arrow-straight') {
+    const dirW = _snapToWorldAxis(normalW);
+    mesh = _buildStraightArrowMesh(anchorW, dirW, len);
+    def = {
+      type: 'straight',
+      anchor: _worldPointToModel(anchorW).toArray(),
+      dir: _worldDirToModel(dirW).toArray(),
+      length: len,
+    };
+  } else {
+    const axisW = _snapToWorldAxis(normalW);
+    const radius = len * 0.5;
+    mesh = _buildRotationArrowMesh(anchorW, axisW, radius, 270);
+    def = {
+      type: 'rotation',
+      center: _worldPointToModel(anchorW).toArray(),
+      axis: _worldDirToModel(axisW).toArray(),
+      radius: radius,
+      sweep: 270,
+    };
+  }
+  def._id = 'arrow_' + (_arrowDefs.length + 1) + '_' + Math.floor(performance.now());
+  mesh.userData._arrowId = def._id;
+  _ensureArrowGroup().add(mesh);
+  _arrowDefs.push(def);
+  requestRender();
+  window.dispatchEvent(new CustomEvent('ifu:arrows-changed'));
+}
+
+function clearArrows() {
+  _arrowDefs = [];
+  if (_arrowGroup) {
+    while (_arrowGroup.children.length) _arrowGroup.remove(_arrowGroup.children[0]);
+  }
+  requestRender();
+  window.dispatchEvent(new CustomEvent('ifu:arrows-changed'));
+}
+
+function removeArrow(id) {
+  _arrowDefs = _arrowDefs.filter(a => a._id !== id);
+  if (_arrowGroup) {
+    const m = _arrowGroup.children.find(c => c.userData._arrowId === id);
+    if (m) _arrowGroup.remove(m);
+  }
+  requestRender();
+  window.dispatchEvent(new CustomEvent('ifu:arrows-changed'));
+}
+
+// Arrows sent to the server are stripped of preview-only keys.
+function getArrows() {
+  return _arrowDefs.map(a => {
+    const { _id, ...rest } = a;
+    return rest;
+  });
+}
+
+function setArrows(defs) {
+  clearArrows();
+  if (!active || !Array.isArray(defs)) return;
+  for (const d of defs) {
+    // rebuild preview in WORLD space from model-frame def
+    let mesh;
+    if (d.type === 'rotation') {
+      const cW = active.localToWorld(new THREE.Vector3().fromArray(d.center));
+      const aW = new THREE.Vector3().fromArray(d.axis)
+        .applyQuaternion(active.getWorldQuaternion(new THREE.Quaternion()));
+      mesh = _buildRotationArrowMesh(cW, aW, d.radius || 20, d.sweep || 270);
+    } else {
+      const aW = active.localToWorld(new THREE.Vector3().fromArray(d.anchor));
+      const dW = new THREE.Vector3().fromArray(d.dir)
+        .applyQuaternion(active.getWorldQuaternion(new THREE.Quaternion()));
+      mesh = _buildStraightArrowMesh(aW, dW, d.length || 50);
+    }
+    const def = { ...d, _id: d._id || ('arrow_' + Math.random().toString(36).slice(2)) };
+    mesh.userData._arrowId = def._id;
+    _ensureArrowGroup().add(mesh);
+    _arrowDefs.push(def);
+  }
+  requestRender();
+  window.dispatchEvent(new CustomEvent('ifu:arrows-changed'));
+}
+
+// ---- Mode + preset ---------------------------------------------------------
+
+function setAnnotMode(mode) {
+  _annotMode = mode || 'none';
+  if (_annotMode !== 'explode') _detachGizmo();
+  canvas.style.cursor = (_annotMode.startsWith('arrow')) ? 'crosshair' : '';
+  window.dispatchEvent(new CustomEvent('ifu:annot-mode', { detail: _annotMode }));
+}
+function getAnnotMode() { return _annotMode; }
+function setPresetId(id) { _currentPresetId = id || null; }
+function getPresetId() { return _currentPresetId; }
+
+// Decorate the render POST body with the current annotation state.  Called by
+// generateLiveSVG / generateLiveSVGForCamera before they fetch.
+function _decorateRenderBody(body) {
+  const exp = getExplodeOffsets();
+  if (Object.keys(exp).length) body.explode = exp;
+  const arr = getArrows();
+  if (arr.length) body.arrows = arr;
+  if (_currentPresetId) body.preset_id = _currentPresetId;
+  return body;
+}
+
+// Expose the annotation API to the classic script / settings UI.
+Object.assign(window.IFU_VIEWER, {
+  setExplodeFactor, clearExplode, attachExplodeGizmo,
+  getExplodeOffsets, setExplodeOffsets,
+  setAnnotMode, getAnnotMode,
+  clearArrows, removeArrow, getArrows, setArrows,
+  setPresetId, getPresetId,
+  getAnnotationState: () => ({
+    explode: getExplodeOffsets(),
+    arrows: getArrows(),
+    preset_id: _currentPresetId,
+  }),
+  restoreAnnotationState: (st) => {
+    if (!st) return;
+    // Preset id is independent of the 3D model -- apply immediately so the
+    // next render uses it.  Explode/arrows need `active`'s part nodes, which
+    // may not be loaded yet (3D is lazy) -- stash them and apply on the next
+    // part-index build (see _buildPartNodeIndex), and also try now.
+    setPresetId(st.preset_id || null);
+    _pendingAnnotState = { explode: st.explode || {}, arrows: st.arrows || [] };
+    _applyPendingAnnot();
+  },
+});
+
 // --- Generate-from-3D: button in the 3D toolbar -----------------------------
 // Calls the local server's /api/render with the current camera direction,
 // then injects the returned SVG as a special "live" view in the 2D pane.
@@ -1258,6 +1659,7 @@ async function generateLiveSVG() {
   if (upRot && upRot.angle && upRot.angle !== 0) {
     body.up_axis = { axis: upRot.axis, angle: upRot.angle };
   }
+  _decorateRenderBody(body);   // explode + arrows + preset
 
   const orig = btnGen.innerHTML;
   btnGen.disabled = true;
@@ -1350,6 +1752,7 @@ async function generateLiveSVGForCamera(camInfo) {
   if (upRot && upRot.angle && upRot.angle !== 0) {
     body.up_axis = { axis: upRot.axis, angle: upRot.angle };
   }
+  _decorateRenderBody(body);   // explode + arrows + preset
   // Visual feedback on the (button) so the user sees the render in
   // flight even though they didn't click it.
   const orig = btnGen ? btnGen.innerHTML : '';
