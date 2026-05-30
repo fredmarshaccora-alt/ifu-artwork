@@ -576,7 +576,12 @@ def _trace_mask_to_polylines(mask, px_per_mm, u_min, v_min,
               for [[px, py]] in cnt]
         pl.append(pl[0])
         polys.append(pl)
-    dp_tol = max(0.5, 1.0 / px_per_mm)
+    # Keep most of the traced contour points so small circular features
+    # (bolt holes etc.) stay round.  The old max(0.5, 1.0/px_per_mm) tol
+    # collapsed a ~30-point hole contour down to a 6-8 sided polygon --
+    # the "spiky circles".  ~0.35 px tol preserves the curve while still
+    # dropping collinear points along straight edges.
+    dp_tol = max(0.15, 0.35 / px_per_mm)
     polys = [_dp_simplify(pl, dp_tol) for pl in polys]
     polys = [pl for pl in polys if len(pl) >= 3]
     return polys

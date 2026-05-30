@@ -677,7 +677,7 @@ def _kick_footprint_raster(file_id: str, shape, view_dir,
             # /api/render request landing now runs in parallel.
             t_raster0 = time.time()
             full = _rasterise_visible_footprints(
-                tri_data, all_indices, resolution=1500)
+                tri_data, all_indices, resolution=1800)
             t_raster = time.time() - t_raster0
 
             # Pull the raster handle BEFORE writing into _FOOT_CACHE
