@@ -575,13 +575,15 @@ def _trace_mask_to_polylines(mask, px_per_mm, u_min, v_min,
                (float(py) + 0.5) / px_per_mm + v_min)
               for [[px, py]] in cnt]
         pl.append(pl[0])
+        # Smooth out the 1-px raster staircase BEFORE simplifying.  This is
+        # what keeps circles round AND straight edges clean -- a single DP
+        # tolerance can't do both (small tol keeps the wavy staircase, large
+        # tol facets the circles).
+        pl = _smooth_closed_polyline(pl, iterations=2)
         polys.append(pl)
-    # Keep most of the traced contour points so small circular features
-    # (bolt holes etc.) stay round.  The old max(0.5, 1.0/px_per_mm) tol
-    # collapsed a ~30-point hole contour down to a 6-8 sided polygon --
-    # the "spiky circles".  ~0.35 px tol preserves the curve while still
-    # dropping collinear points along straight edges.
-    dp_tol = max(0.15, 0.35 / px_per_mm)
+    # The curve is already smooth, so a moderate DP just trims redundant
+    # points without re-introducing facets.
+    dp_tol = max(0.25, 0.6 / px_per_mm)
     polys = [_dp_simplify(pl, dp_tol) for pl in polys]
     polys = [pl for pl in polys if len(pl) >= 3]
     return polys
@@ -1095,6 +1097,35 @@ def _dp_simplify(pl, tol):
             stack.append((i0, max_i))
             stack.append((max_i, i1))
     return [pl[i] for i, k in enumerate(keep) if k]
+
+
+def _smooth_closed_polyline(pl, iterations=2):
+    """Gentle moving-average smoothing of a closed polyline.
+
+    Removes the 1-px raster staircase that makes traced footprint contours
+    look wavy, while preserving the overall shape: circles stay round and
+    pixel-stepped straight edges flatten to clean lines.  Sharp corners
+    soften only slightly at 2 iterations (the precise edge is still shown
+    by the underlying vector base line).  Uses a (1,2,1)/4 weighted average
+    so points barely move per pass but high-frequency pixel noise decays.
+    """
+    import numpy as np
+    if pl is None or len(pl) < 8:
+        return pl
+    pts = np.asarray(pl, dtype=float)
+    closed = bool(np.allclose(pts[0], pts[-1]))
+    if closed:
+        pts = pts[:-1]
+    if len(pts) < 8:
+        return pl
+    for _ in range(max(1, iterations)):
+        prev = np.roll(pts, 1, axis=0)
+        nxt = np.roll(pts, -1, axis=0)
+        pts = (prev + 2.0 * pts + nxt) / 4.0
+    out = [(float(x), float(y)) for x, y in pts]
+    if closed:
+        out.append(out[0])
+    return out
 
 
 def _simplify_polylines_in_place(parts, tol):
